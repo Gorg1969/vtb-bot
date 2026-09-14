@@ -17,7 +17,9 @@ import urllib3
 import threading
 import json
 import requests
+import base64
 from functools import wraps
+from datetime import datetime
 
 from flask import (
     Flask, request, jsonify, render_template_string,
@@ -115,9 +117,11 @@ class APIClient:
             return False
 
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
+        """Загрузка фото/видео в MAX. Возвращает token."""
         if not self.token:
             return None
         try:
+            logger.info(f'📤 Загрузка {file_type} {filename} ({len(file_bytes)} байт)')
             r = requests.post(
                 f"{self.base_url}/uploads",
                 headers={"Authorization": self.token},
@@ -125,27 +129,186 @@ class APIClient:
                 timeout=30, verify=False,
             )
             if r.status_code != 200:
+                logger.error(f'❌ /uploads: {r.status_code} - {r.text[:200]}')
                 return None
-            upload_url = r.json().get('url')
+            data = r.json()
+            upload_url = data.get('url')
             if not upload_url:
+                logger.error(f'❌ Нет url в ответе: {data}')
                 return None
-            ur = requests.post(upload_url, files={'data': (filename, file_bytes)},
-                               timeout=180, verify=False)
+
+            # Загружаем файл
+            ur = requests.post(
+                upload_url,
+                files={'data': (filename, file_bytes)},
+                timeout=180, verify=False,
+            )
             if ur.status_code != 200:
+                logger.error(f'❌ upload: {ur.status_code} - {ur.text[:200]}')
                 return None
+
             result = ur.json()
             token = result.get('token')
             if not token and 'data' in result:
                 token = result['data'].get('token')
+            if token:
+                logger.info(f'✅ Токен получен: {token[:20]}...')
             return token
         except Exception as e:
-            logger.error(f"❌ upload_file: {e}")
+            logger.exception(f"❌ upload_file: {e}")
             return None
+
+    def send_post(self, chat_id, text, media_tokens):
+        """Отправляет пост с медиа в группу MAX. Возвращает (success, post_link)."""
+        if not self.token:
+            return False, None
+
+        try:
+            # Формируем attachments
+            attachments = []
+            for token in media_tokens[:10]:
+                attachments.append({
+                    "type": "image",
+                    "payload": {"token": token},
+                })
+
+            payload = {
+                "text": text,
+                "format": "markdown",
+            }
+            if attachments:
+                payload["attachments"] = attachments
+
+            chat_id_str = str(chat_id)
+            chat_id_for_api = chat_id_str if chat_id_str.startswith('-') else f"-{chat_id_str}"
+
+            logger.info(f'📤 Отправка в {chat_id_for_api}, медиа: {len(attachments)}')
+
+            r = requests.post(
+                f"{self.base_url}/messages",
+                headers={
+                    "Authorization": self.token,
+                    "Content-Type": "application/json",
+                },
+                params={"chat_id": chat_id_for_api},
+                json=payload,
+                timeout=60, verify=False,
+            )
+
+            logger.info(f'📨 Ответ: {r.status_code}')
+            if r.status_code != 200:
+                logger.error(f'❌ send_post: {r.status_code} - {r.text[:300]}')
+                return False, None
+
+            # Пытаемся получить seq → ссылку на пост
+            post_link = None
+            try:
+                result = r.json()
+                logger.info(f'📨 JSON: {json.dumps(result, ensure_ascii=False)[:300]}')
+                seq = None
+                if isinstance(result, dict):
+                    if 'message' in result and isinstance(result['message'], dict):
+                        msg = result['message']
+                        if 'body' in msg and isinstance(msg['body'], dict):
+                            seq = msg['body'].get('seq')
+                    if not seq and 'seq' in result:
+                        seq = result['seq']
+
+                if seq:
+                    # base64-encoded seq
+                    seq_bytes = int(seq).to_bytes(8, byteorder='big')
+                    encoded = base64.urlsafe_b64encode(seq_bytes).decode('utf-8').rstrip('=')
+                    post_link = f"https://max.ru/c/{chat_id_str}/{encoded}"
+                    logger.info(f'🔗 Ссылка: {post_link}')
+            except Exception as e:
+                logger.warning(f'⚠️ Не удалось извлечь ссылку: {e}')
+
+            return True, post_link
+
+        except Exception as e:
+            logger.exception(f'❌ send_post: {e}')
+            return False, None
 
 
 api = APIClient()
 publisher = Publisher(api, fm, db)
 report_gen = ReportGenerator(fm, db)
+
+
+# ============================================================
+# Публикация одного объявления
+# ============================================================
+
+def publish_one_ad(ad: dict) -> tuple:
+    """
+    Публикует одно объявление из очереди.
+    Возвращает (success: bool, message: str, post_link: str|None).
+    """
+    ad_id = ad['id']
+    folder_name = ad.get('folder_name')
+    chat_id = ad.get('chat_id')
+    media_path = ad.get('media_path')
+
+    if not folder_name or not media_path:
+        return False, 'Нет папки или медиа', None
+
+    if not os.path.exists(media_path):
+        return False, f'Папка не найдена: {media_path}', None
+
+    # Читаем info.txt
+    info_path = os.path.join(media_path, 'info.txt')
+    if not os.path.exists(info_path):
+        return False, 'Нет info.txt', None
+
+    with open(info_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    # Загружаем фото
+    media_tokens = []
+    photo_files = sorted([
+        f for f in os.listdir(media_path)
+        if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+    ])
+    logger.info(f'📷 Найдено фото: {len(photo_files)}')
+
+    for photo_file in photo_files[:10]:
+        file_path = os.path.join(media_path, photo_file)
+        try:
+            with open(file_path, 'rb') as f:
+                file_bytes = f.read()
+            token = api.upload_file(file_bytes, photo_file, 'image')
+            if token:
+                media_tokens.append(token)
+            time.sleep(0.5)  # пауза между загрузками
+        except Exception as e:
+            logger.error(f'❌ Ошибка загрузки {photo_file}: {e}')
+
+    if not media_tokens:
+        return False, 'Не удалось загрузить ни одно фото', None
+
+    # Отправляем пост
+    success, post_link = api.send_post(chat_id, text, media_tokens)
+    if not success:
+        return False, 'Ошибка отправки поста в MAX', None
+
+    # Пишем в publications (для админки)
+    bot_db.add_publication({
+        'user_id': 0,
+        'folder_name': ad.get('source_url'),
+        'group_id': chat_id,
+        'max_post_url': post_link,
+        'title': ad.get('title'),
+        'code': ad.get('code'),
+        'city': ad.get('city'),
+        'price': ad.get('price'),
+        'category': ad.get('category'),
+        'status': 'success',
+    })
+
+    # Помечаем в parsed_ads
+    bot_db.mark_ad_published(ad_id, post_link)
+
+    return True, 'Опубликовано', post_link
 
 
 # ============================================================
@@ -160,6 +323,7 @@ BASE_STYLE = """
     a { color: #007bff; text-decoration: none; }
     .btn { display: inline-block; padding: 10px 20px; background: #007bff; color: white; border-radius: 5px; margin-right: 10px; margin-bottom: 10px; border: none; cursor: pointer; font-size: 14px; }
     .btn-green { background: #28a745; }
+    .btn-orange { background: #fd7e14; }
     .btn-red { background: #dc3545; }
     .btn-gray { background: #6c757d; }
     .btn:hover { opacity: 0.9; }
@@ -188,18 +352,16 @@ def index():
     if request.method == 'POST':
         return webhook()
     stats = bot_db.count_by_status()
-    admin_ids_status = ', '.join(str(x) for x in ALLOWED_ADMIN_IDS) if ALLOWED_ADMIN_IDS else 'все (не защищено)'
-    warn = '' if ALLOWED_ADMIN_IDS else '<div class="warn">⚠️ ADMIN_IDS не задан — бот отвечает всем.</div>'
+    admin_ids_status = ', '.join(str(x) for x in ALLOWED_ADMIN_IDS) if ALLOWED_ADMIN_IDS else 'все'
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🤖 VTB Bot</h1>
         <p>Токен MAX: {'✅' if TOKEN else '❌'}</p>
         <p>Бот отвечает: <b>{admin_ids_status}</b></p>
         <p>Дедуп: <b>✅ всегда включён</b></p>
-        {warn}
     </div>
     <div class="card">
-        <h2>📊 Очередь парсинга</h2>
+        <h2>📊 Очередь</h2>
         <div class="stats">
             <div class="stat"><div>В очереди</div><div class="num">{stats.get('pending', 0)}</div></div>
             <div class="stat"><div>Опубликовано</div><div class="num">{stats.get('published', 0)}</div></div>
@@ -222,7 +384,7 @@ def health():
 
 @app.route('/status')
 def status():
-    return {"status": "running", "token_set": bool(TOKEN), "queue": bot_db.count_by_status()}
+    return {"status": "running", "queue": bot_db.count_by_status()}
 
 
 # ============================================================
@@ -250,7 +412,6 @@ def setup_webhook():
                         params={"url": old_url},
                         timeout=30, verify=False,
                     )
-                    logger.info(f'🗑️ Удалена подписка: {old_url}')
     except Exception as e:
         logger.warning(f'⚠️ {e}')
 
@@ -278,11 +439,9 @@ def ingest_ads():
         data = request.get_json()
         if not data:
             return jsonify({'success': False, 'error': 'No data'}), 400
-
         ads = data.get('ads', [])
         if not ads:
             return jsonify({'success': False, 'error': 'Empty ads'}), 400
-
         added = skipped = 0
         for ad in ads:
             try:
@@ -293,14 +452,13 @@ def ingest_ads():
             except Exception as e:
                 logger.error(f'❌ {e}')
                 skipped += 1
-
-        return jsonify({'success': True, 'added': added, 'skipped': skipped, 'total': len(ads)})
+        return jsonify({'success': True, 'added': added, 'skipped': skipped})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
 # ============================================================
-# Админка
+# АДМИНКА
 # ============================================================
 
 @app.route('/admin')
@@ -326,21 +484,34 @@ def admin_page():
         f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in stats.items()
     ) or "<tr><td colspan='2'>Пусто</td></tr>"
 
+    pending = stats.get('pending', 0)
+
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🛠 Админка</h1>
         <a href="/" class="btn">← На главную</a>
         <a href="/admin/settings" class="btn">⚙️ Настройки</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
-        <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Тест парсера (5)</a>
-        <a href="/admin/run_parser?limit=50" class="btn btn-green">🚀 Парсер (50)</a>
-        <a href="/admin/run_parser?limit=300" class="btn btn-green">🚀 Парсер (300)</a>
         <a href="/setup_webhook" class="btn btn-gray">🔄 Перерегистрировать вебхук</a>
     </div>
 
     <div class="card">
+        <h2>🚀 Парсинг</h2>
+        <a href="/admin/run_parser?limit=5" class="btn btn-green">Тест (5)</a>
+        <a href="/admin/run_parser?limit=50" class="btn btn-green">50</a>
+        <a href="/admin/run_parser?limit=300" class="btn btn-green">300</a>
+    </div>
+
+    <div class="card">
+        <h2>📤 Публикация в MAX</h2>
+        <p>В очереди: <b>{pending}</b></p>
+        <a href="/admin/publish_one" class="btn btn-orange" onclick="return confirm('Опубликовать 1 объявление?')">📤 Опубликовать 1</a>
+        <a href="/admin/publish_all" class="btn btn-orange" onclick="return confirm('Опубликовать ВСЕ из очереди? Это займёт время.')">📤 Опубликовать все</a>
+    </div>
+
+    <div class="card">
         <h2>⚙️ Разделы и группы MAX</h2>
-        <p class="hint">Редактировать chat_id → на странице <a href="/admin/settings">Настройки</a></p>
+        <p class="hint">Редактировать chat_id → <a href="/admin/settings">Настройки</a></p>
         <table>
             <tr><th>Категория</th><th>URL</th><th>Ключ</th><th>chat_id</th><th>Вкл</th></tr>
             {rows}
@@ -366,24 +537,20 @@ def admin_page():
 @require_admin
 def admin_settings():
     saved = False
-
     if request.method == 'POST':
         for s in SECTIONS:
             key = f"chat_id_{s['name']}"
             value = (request.form.get(key) or '').strip()
             bot_db.set_setting(key, value)
             logger.info(f'💾 Сохранено {key} = {value}')
-
         bot_db.set_setting('schedule_start', (request.form.get('schedule_start') or '06:00').strip())
         bot_db.set_setting('schedule_end', (request.form.get('schedule_end') or '20:00').strip())
-
         daily_limit = (request.form.get('daily_limit') or '150').strip()
         try:
             int(daily_limit)
         except ValueError:
             daily_limit = '150'
         bot_db.set_setting('daily_limit', daily_limit)
-
         saved = True
 
     sections = get_sections_from_db(bot_db)
@@ -395,7 +562,6 @@ def admin_settings():
         <div class="form-row">
             <label>{s.get('title', s['name'])}:</label>
             <input type="text" name="chat_id_{s['name']}" value="{s['chat_id']}" placeholder="-00000000000000">
-            <div class="hint">chat_id группы MAX для «{s.get('title', s['name'])}»</div>
         </div>
         """
 
@@ -404,34 +570,21 @@ def admin_settings():
     return BASE_STYLE + f"""
     <div class="card">
         <h1>⚙️ Настройки</h1>
-        <a href="/admin" class="btn">← Назад в админку</a>
+        <a href="/admin" class="btn">← Назад</a>
     </div>
-
     <form method="POST">
         <div class="card">
             <h2>📢 chat_id групп MAX</h2>
-            <p class="hint">Введи тестовые ID, проверь — потом замени на боевые.</p>
+            <p class="hint">Тестовые ID → заменить на боевые.</p>
             {chat_fields}
         </div>
-
         <div class="card">
-            <h2>⏰ Расписание публикаций (МСК)</h2>
-            <div class="form-row">
-                <label>Начало:</label>
-                <input type="text" name="schedule_start" value="{schedule['start']}" placeholder="06:00">
-            </div>
-            <div class="form-row">
-                <label>Конец:</label>
-                <input type="text" name="schedule_end" value="{schedule['end']}" placeholder="20:00">
-            </div>
-            <div class="form-row">
-                <label>Лимит публикаций в день:</label>
-                <input type="text" name="daily_limit" value="{schedule['daily_limit']}" placeholder="150">
-            </div>
+            <h2>⏰ Расписание (МСК)</h2>
+            <div class="form-row"><label>Начало:</label><input type="text" name="schedule_start" value="{schedule['start']}"></div>
+            <div class="form-row"><label>Конец:</label><input type="text" name="schedule_end" value="{schedule['end']}"></div>
+            <div class="form-row"><label>Лимит/день:</label><input type="text" name="daily_limit" value="{schedule['daily_limit']}"></div>
         </div>
-
         {saved_msg}
-
         <div class="card">
             <button type="submit" class="btn btn-green">💾 Сохранить</button>
             <a href="/admin" class="btn btn-gray">Отмена</a>
@@ -465,12 +618,9 @@ def admin_today():
     return BASE_STYLE + f"""
     <div class="card">
         <h1>📅 Опубликовано сегодня ({len(pubs)})</h1>
-        <a href="/admin" class="btn">← Назад в админку</a>
+        <a href="/admin" class="btn">← Назад</a>
         <table>
-            <tr>
-                <th>#</th><th>Время</th><th>Категория</th><th>Название</th>
-                <th>Код</th><th>MAX</th><th>Источник</th>
-            </tr>
+            <tr><th>#</th><th>Время</th><th>Категория</th><th>Название</th><th>Код</th><th>MAX</th><th>Источник</th></tr>
             {rows}
         </table>
     </div>
@@ -489,9 +639,79 @@ def admin_run_parser():
             logger.exception(f'❌ Парсер упал: {e}')
 
     threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'success': True, 'message': f'Парсер запущен (лимит={limit})'})
+
+
+# ============================================================
+# Публикация
+# ============================================================
+
+@app.route('/admin/publish_one')
+@require_admin
+def admin_publish_one():
+    """Опубликовать 1 объявление из очереди."""
+    ads = bot_db.get_pending_ads(limit=1)
+    if not ads:
+        return jsonify({'success': False, 'message': 'Очередь пуста'})
+
+    ad = ads[0]
+    logger.info(f'📤 Публикация: {ad.get("folder_name")} → {ad.get("chat_id")}')
+
+    try:
+        ok, message, post_link = publish_one_ad(ad)
+        if ok:
+            return jsonify({
+                'success': True,
+                'message': message,
+                'post_link': post_link,
+                'title': ad.get('title'),
+                'chat_id': ad.get('chat_id'),
+            })
+        else:
+            bot_db.mark_ad_failed(ad['id'], message)
+            return jsonify({'success': False, 'message': message})
+    except Exception as e:
+        logger.exception(f'❌ Ошибка публикации: {e}')
+        bot_db.mark_ad_failed(ad['id'], str(e))
+        return jsonify({'success': False, 'message': str(e)})
+
+
+@app.route('/admin/publish_all')
+@require_admin
+def admin_publish_all():
+    """Опубликовать все из очереди (в фоне, с паузой)."""
+    def _run():
+        pause = 30  # пауза между постами (сек)
+        published = 0
+        failed = 0
+        while True:
+            ads = bot_db.get_pending_ads(limit=1)
+            if not ads:
+                break
+            ad = ads[0]
+            logger.info(f'📤 [{published+failed+1}] {ad.get("folder_name")}')
+            try:
+                ok, message, post_link = publish_one_ad(ad)
+                if ok:
+                    published += 1
+                    logger.info(f'  ✅ {message} {post_link or ""}')
+                else:
+                    failed += 1
+                    bot_db.mark_ad_failed(ad['id'], message)
+                    logger.warning(f'  ❌ {message}')
+            except Exception as e:
+                failed += 1
+                bot_db.mark_ad_failed(ad['id'], str(e))
+                logger.exception(f'  ❌ {e}')
+            if ads and bot_db.get_pending_ads(limit=1):
+                logger.info(f'  ⏸ Пауза {pause} сек...')
+                time.sleep(pause)
+        logger.info(f'🏁 Публикация завершена: ✅ {published}, ❌ {failed}')
+
+    threading.Thread(target=_run, daemon=True).start()
     return jsonify({
         'success': True,
-        'message': f'Парсер запущен (лимит={limit}, дедуп ВКЛ)',
+        'message': 'Публикация запущена в фоне. Следи в логах Bothost.',
     })
 
 
@@ -527,7 +747,8 @@ def webhook():
                     f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
                     f"📅 **Опубликовано сегодня:**\n{PUBLIC_URL}/admin/today\n\n"
                     f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
-                    f"🚀 **Запустить парсер:**\n{PUBLIC_URL}/admin/run_parser?limit=50\n\n"
+                    f"🚀 **Парсинг:**\n{PUBLIC_URL}/admin/run_parser?limit=50\n\n"
+                    f"📤 **Публикация:**\n{PUBLIC_URL}/admin/publish_all\n\n"
                     "🔒 Пароль спросит браузер."
                 )
                 return jsonify({"ok": True}), 200
@@ -547,6 +768,20 @@ def webhook():
                 api.send_message(user_id, f"Твой user_id: `{user_id}`")
                 return jsonify({"ok": True}), 200
 
+            if user_id and text == '/publish':
+                ads = bot_db.get_pending_ads(limit=1)
+                if not ads:
+                    api.send_message(user_id, "⚠️ Очередь пуста")
+                else:
+                    ad = ads[0]
+                    ok, message, post_link = publish_one_ad(ad)
+                    if ok:
+                        api.send_message(user_id, f"✅ Опубликовано: {ad.get('title')}\n{post_link or ''}")
+                    else:
+                        bot_db.mark_ad_failed(ad['id'], message)
+                        api.send_message(user_id, f"❌ Ошибка: {message}")
+                return jsonify({"ok": True}), 200
+
         return jsonify({"ok": True}), 200
     except Exception as e:
         logger.exception(f'❌ webhook: {e}')
@@ -563,5 +798,4 @@ if __name__ == '__main__':
     logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
     logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌ (админка открыта!)"}')
     logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌ (все)"}')
-    logger.info(f'   PUBLIC_URL: {PUBLIC_URL}')
     app.run(host='0.0.0.0', port=PORT, threaded=True)
