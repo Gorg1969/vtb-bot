@@ -849,9 +849,9 @@ def webhook():
             user_id = sender.get('user_id')
             text = (body.get('text') or '').strip()
 
-                        logger.info(f'📨 user_id={user_id}, text={text[:100]}')
-
-            if user_id and not is_allowed_user(user_id):
+        logger.info(f'📨 user_id={user_id}, text={text[:100]}')
+                                    
+                if user_id and not is_allowed_user(user_id):
                 logger.warning(f'⛔ Игнорируем user_id={user_id}')
                 return jsonify({"ok": True}), 200
 
