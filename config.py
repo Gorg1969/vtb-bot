@@ -60,6 +60,10 @@ INITIAL_LIMIT = 300
 MAX_PHOTOS_PER_AD = 5
 MAX_PAGES = 200
 
+# === Фильтры объявлений ===
+MIN_PRICE = 2_500_000     # минимальная цена (₽), меньше — пропускаем
+MAX_PRICE = 0             # максимальная цена (0 = без ограничения)
+
 # === Флаги (CSS-классы на карточке VTB) ===
 FLAG_IN_STOCK = 't-in_stock'
 FLAG_LEASING = 't-leasing'
