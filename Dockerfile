@@ -57,7 +57,7 @@ RUN playwright install chromium
 COPY . .
 
 # === Создаём папки для данных ===
-RUN mkdir -p /app/data /app/VTB_Объявления /app/logs
+RUN mkdir -p /app/data /app/data/VTB_Объявления /app/logs
 
 # === Открываем порт ===
 EXPOSE 3000
