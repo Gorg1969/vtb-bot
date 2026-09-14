@@ -1,7 +1,8 @@
 # vtb_parser.py
 # ============================================================
 # Парсер VTB-лизинга
-# Дедуп ВСЕГДА включён (Google Sheets + локальная БД)
+# - Дедуп ВСЕГДА включён (Google Sheets + БД)
+# - Сжатие фото: max 1080px, JPEG quality=85
 # ============================================================
 
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
 import requests
+from PIL import Image
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
 
 from config import (
@@ -32,6 +34,10 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Настройки сжатия фото
+MAX_IMAGE_SIZE = 1080       # максимум по большей стороне (пиксели)
+JPEG_QUALITY = 85           # качество JPEG (1-100)
 
 
 # ============================================================
@@ -61,6 +67,60 @@ def detect_category(title: str, section: dict) -> Optional[dict]:
     if key_norm in title_norm:
         return section
     return None
+
+
+def compress_image(input_path: str,
+                    max_size: int = MAX_IMAGE_SIZE,
+                    quality: int = JPEG_QUALITY) -> str:
+    """
+    Сжимает фото:
+    - ресайз до max_size по большей стороне
+    - сохраняет как JPEG с заданным качеством
+    - удаляет исходник, если это был не .jpg
+    Возвращает путь к сжатому файлу.
+    """
+    try:
+        img = Image.open(input_path)
+
+        # Конвертируем в RGB (JPEG не поддерживает RGBA/P)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # Для прозрачности — белый фон
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # Ресайз до max_size по большей стороне
+        w, h = img.size
+        if max(w, h) > max_size:
+            if w > h:
+                new_w = max_size
+                new_h = int(h * max_size / w)
+            else:
+                new_h = max_size
+                new_w = int(w * max_size / h)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            logger.info(f'  📐 Ресайз {w}x{h} → {new_w}x{new_h}')
+
+        # Сохраняем как JPEG
+        jpeg_path = input_path.rsplit('.', 1)[0] + '.jpg'
+        img.save(jpeg_path, 'JPEG', quality=quality, optimize=True)
+
+        # Удаляем исходник, если это не тот же файл
+        if jpeg_path != input_path and os.path.exists(input_path):
+            os.remove(input_path)
+
+        new_size = os.path.getsize(jpeg_path)
+        logger.info(f'  🗜️ Сжато → {jpeg_path.split("/")[-1]} ({new_size // 1024} КБ)')
+
+        return jpeg_path
+
+    except Exception as e:
+        logger.warning(f'⚠️ Ошибка сжатия {input_path}: {e}')
+        return input_path
 
 
 # ============================================================
@@ -135,7 +195,7 @@ class VTBParser:
             page.goto(url, wait_until='networkidle', timeout=PAGE_TIMEOUT)
             page.wait_for_timeout(2000)
 
-            # Название (класс на div, а не на h1)
+            # Название
             title = ''
             for sel in ['div.t-auto-card-title h1',
                         'h1.t-auto-card-title',
@@ -146,7 +206,7 @@ class VTBParser:
                     if title:
                         break
 
-            # Код предложения (span или div)
+            # Код
             code_el = (page.query_selector('span.js-auto-card-title-code-text')
                        or page.query_selector('div.js-auto-card-title-code-text')
                        or page.query_selector('.js-auto-card-title-code-text'))
@@ -226,7 +286,7 @@ class VTBParser:
             return None
 
     # --------------------------------------------------------
-    # Правило публикации
+    # Флаги
     # --------------------------------------------------------
     @staticmethod
     def check_flags(flags: List[str]) -> Tuple[bool, str]:
@@ -239,7 +299,7 @@ class VTBParser:
         return True, 'OK'
 
     # --------------------------------------------------------
-    # Сохранение медиа
+    # Сохранение медиа (с сжатием)
     # --------------------------------------------------------
     def save_ad_media(self, ad: Dict, index: int, section: dict) -> Optional[str]:
         cat_clean = section['name'].replace('truck_', '')
@@ -257,15 +317,31 @@ class VTBParser:
 
         downloaded = 0
         for i, photo_url in enumerate(ad['photos'], 1):
-            ext = Path(photo_url).suffix or '.jpg'
+            # Скачиваем во временный файл с оригинальным расширением
+            ext = Path(photo_url).suffix or '.webp'
             if '?' in ext:
                 ext = ext.split('?')[0]
             if not ext or len(ext) > 5:
-                ext = '.jpg'
+                ext = '.webp'
 
-            filepath = os.path.join(folder_path, f'photo_{i}{ext}')
-            if self._download_file(photo_url, filepath, min_size=50000):
+            temp_path = os.path.join(folder_path, f'photo_{i}_temp{ext}')
+
+            if self._download_file(photo_url, temp_path, min_size=10000):
+                # Сжимаем → получаем .jpg
+                jpeg_path = compress_image(temp_path)
+                # Переименовываем в photo_N.jpg
+                final_path = os.path.join(folder_path, f'photo_{i}.jpg')
+                if jpeg_path != final_path:
+                    if os.path.exists(final_path):
+                        os.remove(final_path)
+                    os.rename(jpeg_path, final_path)
                 downloaded += 1
+            else:
+                # Удаляем битый файл
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                logger.warning(f'  ⚠️ Фото {i} не скачалось')
+
             time.sleep(0.3)
 
         if downloaded == 0:
@@ -328,11 +404,10 @@ class VTBParser:
     def run(self, limit: int = INITIAL_LIMIT):
         logger.info('=' * 60)
         logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
+        logger.info(f'   Сжатие фото: max {MAX_IMAGE_SIZE}px, JPEG q={JPEG_QUALITY}')
         logger.info('=' * 60)
 
-        # Дедуп ВСЕГДА включён
         self.sheets.get_all_urls()
-
         sections = get_sections_from_db(self.db)
         saved_count = 0
 
@@ -374,7 +449,7 @@ class VTBParser:
                         logger.info(f'\n[{i}/{len(urls)}] {url}')
 
                         if self.is_duplicate(url):
-                            logger.info('  ⏭️ Дубль (Google Sheets или БД)')
+                            logger.info('  ⏭️ Дубль')
                             self.skipped_dup += 1
                             continue
 
@@ -400,9 +475,7 @@ class VTBParser:
 
                         ad['category'] = detected['name']
                         ad['chat_id'] = detected['chat_id']
-                        logger.info(
-                            f'  📂 {detected["name"]} → {detected["chat_id"]}'
-                        )
+                        logger.info(f'  📂 {detected["name"]} → {detected["chat_id"]}')
 
                         self.processed += 1
                         folder = self.save_ad_media(ad, self.processed, detected)
@@ -429,29 +502,27 @@ class VTBParser:
         logger.info('📊 ИТОГИ ПАРСИНГА:')
         logger.info(f'  ✅ Обработано: {self.processed}')
         logger.info(f'  ⏭️ Дублей: {self.skipped_dup}')
-        logger.info(f'  🚫 Флаги не прошли: {self.skipped_flags}')
-        logger.info(f'  📂 Не в категории: {self.skipped_category}')
+        logger.info(f'  🚫 Флаги: {self.skipped_flags}')
+        logger.info(f'  📂 Категория: {self.skipped_category}')
         logger.info(f'  ❌ Ошибок: {self.errors}')
-        logger.info(f'  💾 В очередь БД: {saved_count}')
+        logger.info(f'  💾 В очередь: {saved_count}')
         logger.info('=' * 60)
 
         stats = self.db.count_by_status()
-        logger.info(f'📊 Состояние очереди: {stats}')
+        logger.info(f'📊 Очередь: {stats}')
 
         return saved_count
 
 
 # ============================================================
-# Точка входа (CLI)
+# CLI
 # ============================================================
 
 def main():
     ap = argparse.ArgumentParser(description='VTB Parser')
-    ap.add_argument('--limit', type=int, default=INITIAL_LIMIT,
-                    help='Сколько новых объявлений набрать')
+    ap.add_argument('--limit', type=int, default=INITIAL_LIMIT)
     args = ap.parse_args()
 
-    # Дедуп всегда включён
     sheets = SheetsClient(url=SHEETS_URL)
 
     from config import DB_PATH
@@ -459,7 +530,7 @@ def main():
 
     parser = VTBParser(sheets, db, OUTPUT_DIR)
     saved = parser.run(limit=args.limit)
-    logger.info(f'🎯 Готово. Новых в очереди: {saved}')
+    logger.info(f'🎯 Готово. Новых: {saved}')
 
 
 if __name__ == '__main__':
