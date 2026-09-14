@@ -849,4 +849,68 @@ def webhook():
             user_id = sender.get('user_id')
             text = (body.get('text') or '').strip()
 
-            logger.info(f'📨 user_id
+                        logger.info(f'📨 user_id={user_id}, text={text[:100]}')
+
+            if user_id and not is_allowed_user(user_id):
+                logger.warning(f'⛔ Игнорируем user_id={user_id}')
+                return jsonify({"ok": True}), 200
+
+            if user_id and text == '/start':
+                api.send_message(
+                    user_id,
+                    "🏠 **VTB Bot**\n\n"
+                    f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
+                    f"📅 **Опубликовано сегодня:**\n{PUBLIC_URL}/admin/today\n\n"
+                    f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
+                    f"🚀 **Парсинг:**\n{PUBLIC_URL}/admin/run_parser?limit=50\n\n"
+                    f"📤 **Публикация:**\n{PUBLIC_URL}/admin/publish_all\n\n"
+                    "🔒 Пароль спросит браузер."
+                )
+                return jsonify({"ok": True}), 200
+
+            if user_id and text == '/status':
+                stats = bot_db.count_by_status()
+                api.send_message(
+                    user_id,
+                    f"📊 **Статус:**\n"
+                    f"⏳ В очереди: {stats.get('pending', 0)}\n"
+                    f"✅ Опубликовано: {stats.get('published', 0)}\n"
+                    f"❌ Ошибок: {stats.get('failed', 0)}"
+                )
+                return jsonify({"ok": True}), 200
+
+            if user_id and text == '/myid':
+                api.send_message(user_id, f"Твой user_id: `{user_id}`")
+                return jsonify({"ok": True}), 200
+
+            if user_id and text == '/publish':
+                ads = bot_db.get_pending_ads(limit=1)
+                if not ads:
+                    api.send_message(user_id, "⚠️ Очередь пуста")
+                else:
+                    ad = ads[0]
+                    ok, message, post_link = publish_one_ad(ad)
+                    if ok:
+                        api.send_message(user_id, f"✅ Опубликовано: {ad.get('title')}\n{post_link or ''}")
+                    else:
+                        bot_db.mark_ad_failed(ad['id'], message)
+                        api.send_message(user_id, f"❌ Ошибка: {message}")
+                return jsonify({"ok": True}), 200
+
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        logger.exception(f'❌ webhook: {e}')
+        return jsonify({"ok": False}), 500
+
+
+# ============================================================
+# Запуск
+# ============================================================
+
+if __name__ == '__main__':
+    logger.info(f'🚀 Запуск vtb-bot на порту {PORT}')
+    logger.info(f'   TOKEN: {"✅" if TOKEN else "❌"}')
+    logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
+    logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌ (админка открыта!)"}')
+    logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌ (все)"}')
+    app.run(host='0.0.0.0', port=PORT, threaded=True)
