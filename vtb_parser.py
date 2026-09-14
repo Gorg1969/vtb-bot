@@ -3,6 +3,9 @@
 # Парсер VTB-лизинга
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
+# - Парсинг кода предложения из span.js-auto-card-title-code
+# - info.txt = только для публикации (обрезан по #изъятая)
+# - report.txt = полные данные для отчёта
 # ============================================================
 
 import os
@@ -35,9 +38,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Настройки сжатия фото
-MAX_IMAGE_SIZE = 1080       # максимум по большей стороне (пиксели)
-JPEG_QUALITY = 85           # качество JPEG (1-100)
+MAX_IMAGE_SIZE = 1080
+JPEG_QUALITY = 85
 
 
 # ============================================================
@@ -72,28 +74,20 @@ def detect_category(title: str, section: dict) -> Optional[dict]:
 def compress_image(input_path: str,
                     max_size: int = MAX_IMAGE_SIZE,
                     quality: int = JPEG_QUALITY) -> str:
-    """
-    Сжимает фото:
-    - ресайз до max_size по большей стороне
-    - сохраняет как JPEG с заданным качеством
-    - удаляет исходник, если это был не .jpg
-    Возвращает путь к сжатому файлу.
-    """
+    """Ресайз + JPEG. Возвращает путь к сжатому файлу."""
     try:
         img = Image.open(input_path)
 
-        # Конвертируем в RGB (JPEG не поддерживает RGBA/P)
         if img.mode in ('RGBA', 'LA', 'P'):
-            # Для прозрачности — белый фон
             background = Image.new('RGB', img.size, (255, 255, 255))
             if img.mode == 'P':
                 img = img.convert('RGBA')
-            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            if img.mode == 'RGBA':
+                background.paste(img, mask=img.split()[-1])
             img = background
         elif img.mode != 'RGB':
             img = img.convert('RGB')
 
-        # Ресайз до max_size по большей стороне
         w, h = img.size
         if max(w, h) > max_size:
             if w > h:
@@ -105,17 +99,14 @@ def compress_image(input_path: str,
             img = img.resize((new_w, new_h), Image.LANCZOS)
             logger.info(f'  📐 Ресайз {w}x{h} → {new_w}x{new_h}')
 
-        # Сохраняем как JPEG
         jpeg_path = input_path.rsplit('.', 1)[0] + '.jpg'
         img.save(jpeg_path, 'JPEG', quality=quality, optimize=True)
 
-        # Удаляем исходник, если это не тот же файл
         if jpeg_path != input_path and os.path.exists(input_path):
             os.remove(input_path)
 
         new_size = os.path.getsize(jpeg_path)
-        logger.info(f'  🗜️ Сжато → {jpeg_path.split("/")[-1]} ({new_size // 1024} КБ)')
-
+        logger.info(f'  🗜️ Сжато → {os.path.basename(jpeg_path)} ({new_size // 1024} КБ)')
         return jpeg_path
 
     except Exception as e:
@@ -140,9 +131,6 @@ class VTBParser:
         self.skipped_category = 0
         self.errors = 0
 
-    # --------------------------------------------------------
-    # Обход ленты
-    # --------------------------------------------------------
     def collect_urls_from_section(self, page: Page, section: dict,
                                    limit: int) -> List[str]:
         urls = []
@@ -154,15 +142,14 @@ class VTBParser:
             logger.info(f'📄 Страница {pagen}')
 
             try:
-                page.goto(page_url, wait_until='networkidle',
-                          timeout=PAGE_TIMEOUT)
+                page.goto(page_url, wait_until='networkidle', timeout=PAGE_TIMEOUT)
             except PlaywrightTimeout:
                 logger.warning(f'⚠️ Таймаут на стр. {pagen}')
                 break
 
             cards = page.query_selector_all('a.t-market-item-slider-item')
             if not cards:
-                logger.info(f'⏹️ Стр. {pagen} пустая — конец раздела')
+                logger.info(f'⏹️ Стр. {pagen} пустая')
                 break
 
             for card in cards:
@@ -177,9 +164,6 @@ class VTBParser:
 
         return urls
 
-    # --------------------------------------------------------
-    # Дедуп
-    # --------------------------------------------------------
     def is_duplicate(self, url: str) -> bool:
         if self.sheets.is_duplicate(url):
             return True
@@ -187,37 +171,37 @@ class VTBParser:
             return True
         return False
 
-    # --------------------------------------------------------
-    # Парсинг карточки
-    # --------------------------------------------------------
     def parse_card(self, page: Page, url: str) -> Optional[Dict]:
         try:
             page.goto(url, wait_until='networkidle', timeout=PAGE_TIMEOUT)
             page.wait_for_timeout(2000)
 
-            # Название
+            # --- Название ---
             title = ''
-            for sel in ['div.t-auto-card-title h1',
-                        'h1.t-auto-card-title',
-                        'h1']:
+            for sel in ['div.t-auto-card-title h1', 'h1.t-auto-card-title', 'h1']:
                 el = page.query_selector(sel)
                 if el:
                     title = normalize_text(el.inner_text())
                     if title:
                         break
 
-            # Код
-            code_el = (page.query_selector('span.js-auto-card-title-code-text')
-                       or page.query_selector('div.js-auto-card-title-code-text')
-                       or page.query_selector('.js-auto-card-title-code-text'))
-            code = normalize_text(code_el.inner_text()) if code_el else ''
+            # --- Код предложения (span с классом БЕЗ -text) ---
+            code = ''
+            for sel in ['.js-auto-card-title-code',
+                        'span.js-auto-card-title-code',
+                        'span[class*="js-auto-card-title-code"]']:
+                el = page.query_selector(sel)
+                if el:
+                    code = normalize_text(el.inner_text())
+                    if code:
+                        break
 
-            # Цена
+            # --- Цена ---
             price_el = page.query_selector('div.t-auto-card-price')
             price_raw = normalize_text(price_el.inner_text()) if price_el else ''
             price = format_price(price_raw)
 
-            # Характеристики
+            # --- Характеристики ---
             city = year = mileage = ''
             items = page.query_selector_all(
                 'div.t-tab-content.active div.t-tab-content-column-item'
@@ -240,7 +224,7 @@ class VTBParser:
                 except Exception:
                     continue
 
-            # Флаги
+            # --- Флаги ---
             flags = set()
             for el in page.query_selector_all('div.t-market-item-flags-item'):
                 cls = el.get_attribute('class') or ''
@@ -253,7 +237,7 @@ class VTBParser:
                 if FLAG_REPAIR in cls:
                     flags.add('repair')
 
-            # Фото
+            # --- Фото ---
             photos = []
             for slider in page.query_selector_all('div.t-main-slider-slide[data-images]'):
                 data_images = slider.get_attribute('data-images')
@@ -285,9 +269,6 @@ class VTBParser:
             logger.error(f'❌ Ошибка парсинга {url}: {e}')
             return None
 
-    # --------------------------------------------------------
-    # Флаги
-    # --------------------------------------------------------
     @staticmethod
     def check_flags(flags: List[str]) -> Tuple[bool, str]:
         if 'repair' in flags:
@@ -298,9 +279,6 @@ class VTBParser:
             return False, 'нет "в наличии"'
         return True, 'OK'
 
-    # --------------------------------------------------------
-    # Сохранение медиа (с сжатием)
-    # --------------------------------------------------------
     def save_ad_media(self, ad: Dict, index: int, section: dict) -> Optional[str]:
         cat_clean = section['name'].replace('truck_', '')
         folder_name = f'{index}_{cat_clean}'
@@ -312,12 +290,16 @@ class VTBParser:
             counter += 1
         os.makedirs(folder_path, exist_ok=True)
 
+        # info.txt — для публикации в MAX
         with open(os.path.join(folder_path, 'info.txt'), 'w', encoding='utf-8') as f:
             f.write(self._build_info_text(ad))
 
+        # report.txt — полные данные для отчёта
+        with open(os.path.join(folder_path, 'report.txt'), 'w', encoding='utf-8') as f:
+            f.write(self._build_report_text(ad))
+
         downloaded = 0
         for i, photo_url in enumerate(ad['photos'], 1):
-            # Скачиваем во временный файл с оригинальным расширением
             ext = Path(photo_url).suffix or '.webp'
             if '?' in ext:
                 ext = ext.split('?')[0]
@@ -327,9 +309,7 @@ class VTBParser:
             temp_path = os.path.join(folder_path, f'photo_{i}_temp{ext}')
 
             if self._download_file(photo_url, temp_path, min_size=10000):
-                # Сжимаем → получаем .jpg
                 jpeg_path = compress_image(temp_path)
-                # Переименовываем в photo_N.jpg
                 final_path = os.path.join(folder_path, f'photo_{i}.jpg')
                 if jpeg_path != final_path:
                     if os.path.exists(final_path):
@@ -337,7 +317,6 @@ class VTBParser:
                     os.rename(jpeg_path, final_path)
                 downloaded += 1
             else:
-                # Удаляем битый файл
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
                 logger.warning(f'  ⚠️ Фото {i} не скачалось')
@@ -355,8 +334,7 @@ class VTBParser:
     def _download_file(self, url: str, filepath: str, min_size: int = 0) -> bool:
         try:
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                              'AppleWebKit/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Referer': 'https://www.vtb-leasing.ru/',
             }
             resp = requests.get(url, headers=headers, timeout=60,
@@ -376,6 +354,7 @@ class VTBParser:
             return False
 
     def _build_info_text(self, ad: Dict) -> str:
+        """Текст для публикации в MAX. Обрезан на #изъятая — без служебных данных."""
         return f"""**{ad['title']}**
 
 **Цена в лизинг: {ad['price']} руб с НДС**
@@ -392,19 +371,22 @@ class VTBParser:
 
 *ПОМОЖЕМ В ПОДБОРЕ ПО ВАШИМ ПОЖЕЛАНИЯМ*
 
-#изъятая #изъятка #конфискат
+#изъятая #изъятка #конфискат"""
 
-Название: {ad['title']}
+    def _build_report_text(self, ad: Dict) -> str:
+        """Полные данные для отчёта."""
+        return f"""Название: {ad['title']}
 Ссылка: {ad['source_url']}
-Код предложения: {ad['code']}"""
+Код предложения: {ad['code']}
+Город: {ad['city']}
+Год: {ad['year']}
+Пробег: {ad['mileage']}
+Цена: {ad['price']} руб"""
 
-    # --------------------------------------------------------
-    # Главный метод
-    # --------------------------------------------------------
     def run(self, limit: int = INITIAL_LIMIT):
         logger.info('=' * 60)
         logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
-        logger.info(f'   Сжатие фото: max {MAX_IMAGE_SIZE}px, JPEG q={JPEG_QUALITY}')
+        logger.info(f'   Сжатие: max {MAX_IMAGE_SIZE}px, JPEG q={JPEG_QUALITY}')
         logger.info('=' * 60)
 
         self.sheets.get_all_urls()
@@ -419,8 +401,7 @@ class VTBParser:
             )
             context = browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                           'AppleWebKit/537.36'
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             )
             page = context.new_page()
 
@@ -436,9 +417,7 @@ class VTBParser:
                     logger.info(f'{"=" * 60}')
 
                     remaining = limit - saved_count
-                    urls = self.collect_urls_from_section(
-                        page, section, remaining
-                    )
+                    urls = self.collect_urls_from_section(page, section, remaining)
                     logger.info(f'📋 Собрано {len(urls)} ссылок')
 
                     for i, url in enumerate(urls, 1):
@@ -466,6 +445,7 @@ class VTBParser:
                         logger.info(f'  ✅ Флаги ОК: {ad["flags"]}')
 
                         logger.info(f'  📝 Название: "{ad["title"][:80]}"')
+                        logger.info(f'  📋 Код: "{ad["code"]}"')
 
                         detected = detect_category(ad['title'], section)
                         if not detected:
@@ -510,7 +490,6 @@ class VTBParser:
 
         stats = self.db.count_by_status()
         logger.info(f'📊 Очередь: {stats}')
-
         return saved_count
 
 
@@ -524,7 +503,6 @@ def main():
     args = ap.parse_args()
 
     sheets = SheetsClient(url=SHEETS_URL)
-
     from config import DB_PATH
     db = BotDB(DB_PATH)
 
