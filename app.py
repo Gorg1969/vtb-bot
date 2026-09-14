@@ -1,9 +1,6 @@
 # app.py
 # ============================================================
-# vtb-bot — Flask-сервер
-#  - Бот MAX (webhook)
-#  - Админка (chat_id, расписание, публикация, диагностика)
-#  - Парсер + публикатор + удаление после публикации
+# vtb-bot — Flask-сервер (часть 1/2)
 # ============================================================
 
 import os
@@ -83,7 +80,6 @@ def is_allowed_user(user_id):
     return int(user_id) in ALLOWED_ADMIN_IDS
 
 
-# === Модули ===
 db = Database()
 db.fix_publication_times()
 fm = FileManager(DATA_DIR)
@@ -113,8 +109,6 @@ class APIClient:
                 params={"user_id": user_id},
                 json=payload, timeout=30, verify=False,
             )
-            if response.status_code != 200:
-                logger.error(f"❌ send_message: {response.status_code} - {response.text[:200]}")
             return response.status_code == 200
         except Exception as e:
             logger.error(f"❌ send_message: {e}")
@@ -195,7 +189,6 @@ class APIClient:
             post_link = None
             try:
                 result = r.json()
-                logger.info(f'📨 JSON: {json.dumps(result, ensure_ascii=False)[:300]}')
                 seq = None
                 if isinstance(result, dict):
                     if 'message' in result and isinstance(result['message'], dict):
@@ -225,7 +218,7 @@ report_gen = ReportGenerator(fm, db)
 
 
 # ============================================================
-# Публикация одного объявления + удаление папки
+# Публикация одного объявления
 # ============================================================
 
 def publish_one_ad(ad: dict) -> tuple:
@@ -234,13 +227,12 @@ def publish_one_ad(ad: dict) -> tuple:
     chat_id = ad.get('chat_id')
     media_path = ad.get('media_path')
 
-    logger.info(f'🔍 Проверка путей: folder_name={folder_name!r}, media_path={media_path!r}')
+    logger.info(f'🔍 Проверка: folder={folder_name!r}, path={media_path!r}')
 
     if not media_path:
-        return False, f'Нет media_path в БД', None
+        return False, 'Нет media_path', None
 
     if not os.path.exists(media_path):
-        # Попробуем альтернативные варианты
         alternatives = [
             os.path.join('/app/VTB_Объявления', folder_name or ''),
             os.path.join('/app/data/VTB_Объявления', folder_name or ''),
@@ -250,11 +242,9 @@ def publish_one_ad(ad: dict) -> tuple:
         for alt in alternatives:
             if alt and os.path.exists(alt):
                 found = alt
-                logger.info(f'🔄 Найден альтернативный путь: {alt}')
                 break
-
         if not found:
-            return False, f'Папка не найдена: {media_path}. Проверено также: {alternatives}', None
+            return False, f'Папка не найдена: {media_path}', None
         media_path = found
 
     info_path = os.path.join(media_path, 'info.txt')
@@ -269,8 +259,7 @@ def publish_one_ad(ad: dict) -> tuple:
         f for f in os.listdir(media_path)
         if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))
     ])
-    logger.info(f'📷 Фото: {len(photo_files)} → {photo_files}')
-    logger.info(f'📝 Текст: {text[:100]}...')
+    logger.info(f'📷 Фото: {len(photo_files)}')
 
     for photo_file in photo_files[:10]:
         file_path = os.path.join(media_path, photo_file)
@@ -310,7 +299,7 @@ def publish_one_ad(ad: dict) -> tuple:
         shutil.rmtree(media_path)
         logger.info(f'🗑️ Папка удалена: {media_path}')
     except Exception as e:
-        logger.warning(f'⚠️ Не удалось удалить {media_path}: {e}')
+        logger.warning(f'⚠️ Не удалить {media_path}: {e}')
 
     return True, 'Опубликовано', post_link
 
@@ -356,12 +345,10 @@ def index():
     if request.method == 'POST':
         return webhook()
     stats = bot_db.count_by_status()
-    admin_ids_status = ', '.join(str(x) for x in ALLOWED_ADMIN_IDS) if ALLOWED_ADMIN_IDS else 'все'
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🤖 VTB Bot</h1>
         <p>Токен MAX: {'✅' if TOKEN else '❌'}</p>
-        <p>Бот отвечает: <b>{admin_ids_status}</b></p>
         <p>OUTPUT_DIR: <code>{OUTPUT_DIR}</code></p>
     </div>
     <div class="card">
@@ -377,7 +364,7 @@ def index():
         <a href="/admin" class="btn">🛠 Админка</a>
         <a href="/admin/queue" class="btn">📋 Очередь</a>
         <a href="/admin/check_paths" class="btn">🔍 Проверить пути</a>
-        <a href="/admin/list_folders" class="btn">📁 Папки на диске</a>
+        <a href="/admin/list_folders" class="btn">📁 Папки</a>
     </div>
     """
 
@@ -486,9 +473,9 @@ def admin_page():
         <a href="/" class="btn">← На главную</a>
         <a href="/admin/settings" class="btn">⚙️ Настройки</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
-        <a href="/admin/queue" class="btn">📋 Очередь (с путями)</a>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
         <a href="/admin/check_paths" class="btn">🔍 Проверить пути</a>
-        <a href="/admin/list_folders" class="btn">📁 Папки на диске</a>
+        <a href="/admin/list_folders" class="btn">📁 Папки</a>
         <a href="/setup_webhook" class="btn btn-gray">🔄 Вебхук</a>
     </div>
 
@@ -502,8 +489,8 @@ def admin_page():
     <div class="card">
         <h2>📤 Публикация в MAX</h2>
         <p>В очереди: <b>{pending}</b></p>
-        <a href="/admin/publish_one" class="btn btn-orange" onclick="return confirm('Опубликовать 1 объявление?')">📤 Опубликовать 1</a>
-        <a href="/admin/publish_all" class="btn btn-orange" onclick="return confirm('Опубликовать ВСЕ? Это займёт время.')">📤 Опубликовать все</a>
+        <a href="/admin/publish_one" class="btn btn-orange" onclick="return confirm('Опубликовать 1?')">📤 Опубликовать 1</a>
+        <a href="/admin/publish_all" class="btn btn-orange" onclick="return confirm('Опубликовать ВСЕ?')">📤 Опубликовать все</a>
     </div>
 
     <div class="card">
@@ -528,8 +515,7 @@ def admin_page():
         </table>
     </div>
     """
-
-
+    
 @app.route('/admin/settings', methods=['GET', 'POST'])
 @require_admin
 def admin_settings():
@@ -539,7 +525,6 @@ def admin_settings():
             key = f"chat_id_{s['name']}"
             value = (request.form.get(key) or '').strip()
             bot_db.set_setting(key, value)
-            logger.info(f'💾 {key} = {value}')
         bot_db.set_setting('schedule_start', (request.form.get('schedule_start') or '06:00').strip())
         bot_db.set_setting('schedule_end', (request.form.get('schedule_end') or '20:00').strip())
         daily_limit = (request.form.get('daily_limit') or '150').strip()
@@ -665,7 +650,6 @@ def admin_queue():
     <div class="card">
         <h1>📋 Очередь парсинга ({len(rows)})</h1>
         <a href="/admin" class="btn">← Назад</a>
-        <p class="hint">Проверь пути <b>media_path</b>. Если ❌ — файлы пропали.</p>
         <table>
             <tr>
                 <th>ID</th><th>Папка</th><th>media_path</th>
@@ -713,17 +697,12 @@ def admin_list_folders():
         files = sorted(os.listdir(OUTPUT_DIR))
     except Exception as e:
         return jsonify({'error': str(e), 'files': []})
-    return jsonify({
-        'output_dir': OUTPUT_DIR,
-        'files': files,
-        'count': len(files),
-    })
+    return jsonify({'output_dir': OUTPUT_DIR, 'files': files, 'count': len(files)})
 
 
 @app.route('/admin/cleanup_orphans')
 @require_admin
 def admin_cleanup_orphans():
-    """Удаляет записи из parsed_ads, у которых папка не найдена на диске."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -741,7 +720,6 @@ def admin_cleanup_orphans():
             conn.commit()
             conn.close()
             deleted += 1
-            logger.info(f'🗑️ Удалена запись id={r["id"]} ({r.get("folder_name")})')
 
     return jsonify({'success': True, 'deleted': deleted, 'total': len(rows)})
 
@@ -761,10 +739,6 @@ def admin_run_parser():
     return jsonify({'success': True, 'message': f'Парсер запущен (лимит={limit})'})
 
 
-# ============================================================
-# Публикация
-# ============================================================
-
 @app.route('/admin/publish_one')
 @require_admin
 def admin_publish_one():
@@ -773,7 +747,7 @@ def admin_publish_one():
         return jsonify({'success': False, 'message': 'Очередь пуста'})
 
     ad = ads[0]
-    logger.info(f'📤 Публикация: {ad.get("folder_name")} → {ad.get("chat_id")}')
+    logger.info(f'📤 Публикация: {ad.get("folder_name")}')
     logger.info(f'   media_path={ad.get("media_path")}')
 
     try:
@@ -822,12 +796,11 @@ def admin_publish_all():
                 bot_db.mark_ad_failed(ad['id'], str(e))
                 logger.exception(f'  ❌ {e}')
             if bot_db.get_pending_ads(limit=1):
-                logger.info(f'  ⏸ Пауза {pause} сек...')
                 time.sleep(pause)
         logger.info(f'🏁 Публикация завершена: ✅ {published}, ❌ {failed}')
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({'success': True, 'message': 'Публикация запущена в фоне. Следи в логах.'})
+    return jsonify({'success': True, 'message': 'Публикация запущена в фоне'})
 
 
 # ============================================================
@@ -849,10 +822,10 @@ def webhook():
             user_id = sender.get('user_id')
             text = (body.get('text') or '').strip()
 
-        logger.info(f'📨 user_id={user_id}, text={text[:100]}')
-                                    
-                if user_id and not is_allowed_user(user_id):
-                logger.warning(f'⛔ Игнорируем user_id={user_id}')
+            logger.info(f'📨 user_id={user_id}, text={text[:100]}')
+
+            if user_id and not is_allowed_user(user_id):
+                logger.warning(f'⛔ Игнор user_id={user_id}')
                 return jsonify({"ok": True}), 200
 
             if user_id and text == '/start':
@@ -860,10 +833,9 @@ def webhook():
                     user_id,
                     "🏠 **VTB Bot**\n\n"
                     f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
-                    f"📅 **Опубликовано сегодня:**\n{PUBLIC_URL}/admin/today\n\n"
+                    f"📅 **Опубликовано:**\n{PUBLIC_URL}/admin/today\n\n"
                     f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
-                    f"🚀 **Парсинг:**\n{PUBLIC_URL}/admin/run_parser?limit=50\n\n"
-                    f"📤 **Публикация:**\n{PUBLIC_URL}/admin/publish_all\n\n"
+                    f"📋 **Очередь:**\n{PUBLIC_URL}/admin/queue\n\n"
                     "🔒 Пароль спросит браузер."
                 )
                 return jsonify({"ok": True}), 200
@@ -911,6 +883,8 @@ if __name__ == '__main__':
     logger.info(f'🚀 Запуск vtb-bot на порту {PORT}')
     logger.info(f'   TOKEN: {"✅" if TOKEN else "❌"}')
     logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
-    logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌ (админка открыта!)"}')
-    logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌ (все)"}')
+    logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌"}')
+    logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌"}')
+    logger.info(f'   OUTPUT_DIR: {OUTPUT_DIR}')
     app.run(host='0.0.0.0', port=PORT, threaded=True)
+    
