@@ -1,0 +1,46 @@
+# === Секреты (НЕ коммитить!) ===
+.env
+.env.*
+*.key
+*.pem
+
+# === Базы данных ===
+*.db
+*.sqlite
+*.sqlite3
+
+# === Папки с данными ===
+VTB_Объявления/
+data/
+temp/
+logs/
+*.log
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# === Playwright ===
+playwright-report/
+test-results/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
