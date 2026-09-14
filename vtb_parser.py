@@ -1,14 +1,7 @@
 # vtb_parser.py
 # ============================================================
 # Парсер VTB-лизинга
-# Алгоритм:
-#   1. Обход ленты раздела (?sort=dateDesc&PAGEN_1=N)
-#   2. Сбор ссылок на карточки /auto/probeg/...
-#   3. Проверка на дубли (Google Sheets + локальная БД)
-#   4. Парсинг карточки (название, код, цена, город, год, пробег)
-#   5. Проверка флагов (t-leasing + t-in_stock, без t-repair)
-#   6. Определение категории (car / самосвал / седельный тягач)
-#   7. Сохранение в очередь БД
+# Дедуп ВСЕГДА включён (Google Sheets + локальная БД)
 # ============================================================
 
 import os
@@ -46,7 +39,6 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 def normalize_text(s: str) -> str:
-    """Убирает неразрывные пробелы, лишние пробелы."""
     if not s:
         return ''
     s = s.replace('\u00a0', ' ').replace('\xa0', ' ')
@@ -55,7 +47,6 @@ def normalize_text(s: str) -> str:
 
 
 def format_price(price_str: str) -> str:
-    """'1 230 000 ₽' -> '1 230 000'."""
     if not price_str:
         return ''
     digits = re.sub(r'[^\d\s]', '', price_str)
@@ -63,17 +54,10 @@ def format_price(price_str: str) -> str:
 
 
 def detect_category(title: str, section: dict) -> Optional[dict]:
-    """
-    Определяет категорию:
-    - легковые (key_in_title = None) → все подряд
-    - грузовые → ищем ключ в названии (без учёта регистра, нормализация пробелов)
-    """
     if section['key_in_title'] is None:
         return section
-
     title_norm = ' '.join(title.lower().split())
     key_norm = ' '.join(section['key_in_title'].lower().split())
-
     if key_norm in title_norm:
         return section
     return None
@@ -90,7 +74,6 @@ class VTBParser:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        # Счётчики
         self.processed = 0
         self.skipped_dup = 0
         self.skipped_flags = 0
@@ -98,14 +81,13 @@ class VTBParser:
         self.errors = 0
 
     # --------------------------------------------------------
-    # Шаг 1-2: обход ленты раздела, сбор ссылок
+    # Обход ленты
     # --------------------------------------------------------
     def collect_urls_from_section(self, page: Page, section: dict,
                                    limit: int) -> List[str]:
-        """Обходит страницы раздела с сортировкой по дате."""
         urls = []
         pagen = 1
-        max_needed = limit * 3  # запас — потом отфильтруем
+        max_needed = limit * 3
 
         while pagen <= MAX_PAGES and len(urls) < max_needed:
             page_url = f"{section['url']}?sort=dateDesc&PAGEN_1={pagen}"
@@ -136,10 +118,9 @@ class VTBParser:
         return urls
 
     # --------------------------------------------------------
-    # Шаг 3: проверка на дубли
+    # Дедуп
     # --------------------------------------------------------
     def is_duplicate(self, url: str) -> bool:
-        """Проверяет Google Sheets + локальную БД."""
         if self.sheets.is_duplicate(url):
             return True
         if self.db.is_parsed(url):
@@ -147,15 +128,14 @@ class VTBParser:
         return False
 
     # --------------------------------------------------------
-    # Шаг 4: парсинг карточки
+    # Парсинг карточки
     # --------------------------------------------------------
     def parse_card(self, page: Page, url: str) -> Optional[Dict]:
-        """Заходит в карточку, извлекает все данные."""
         try:
             page.goto(url, wait_until='networkidle', timeout=PAGE_TIMEOUT)
             page.wait_for_timeout(2000)
 
-            # --- Название (класс на div, а не на h1) ---
+            # Название (класс на div, а не на h1)
             title = ''
             for sel in ['div.t-auto-card-title h1',
                         'h1.t-auto-card-title',
@@ -166,18 +146,18 @@ class VTBParser:
                     if title:
                         break
 
-            # --- Код предложения (может быть span или div) ---
+            # Код предложения (span или div)
             code_el = (page.query_selector('span.js-auto-card-title-code-text')
                        or page.query_selector('div.js-auto-card-title-code-text')
                        or page.query_selector('.js-auto-card-title-code-text'))
             code = normalize_text(code_el.inner_text()) if code_el else ''
 
-            # --- Цена ---
+            # Цена
             price_el = page.query_selector('div.t-auto-card-price')
             price_raw = normalize_text(price_el.inner_text()) if price_el else ''
             price = format_price(price_raw)
 
-            # --- Характеристики: город, год, пробег ---
+            # Характеристики
             city = year = mileage = ''
             items = page.query_selector_all(
                 'div.t-tab-content.active div.t-tab-content-column-item'
@@ -200,7 +180,7 @@ class VTBParser:
                 except Exception:
                     continue
 
-            # --- Флаги (классы) ---
+            # Флаги
             flags = set()
             for el in page.query_selector_all('div.t-market-item-flags-item'):
                 cls = el.get_attribute('class') or ''
@@ -213,7 +193,7 @@ class VTBParser:
                 if FLAG_REPAIR in cls:
                     flags.add('repair')
 
-            # --- Фото (data-images) ---
+            # Фото
             photos = []
             for slider in page.query_selector_all('div.t-main-slider-slide[data-images]'):
                 data_images = slider.get_attribute('data-images')
@@ -246,16 +226,10 @@ class VTBParser:
             return None
 
     # --------------------------------------------------------
-    # Шаг 5: проверка флагов
+    # Правило публикации
     # --------------------------------------------------------
     @staticmethod
     def check_flags(flags: List[str]) -> Tuple[bool, str]:
-        """
-        Правило публикации:
-          ✅ t-leasing  (Доступно в лизинг)
-          ✅ t-in_stock (В наличии / Лизинг)
-          ❌ НЕТ t-repair (Требует ремонта)
-        """
         if 'repair' in flags:
             return False, 'есть "требует ремонта"'
         if 'leasing' not in flags:
@@ -265,10 +239,9 @@ class VTBParser:
         return True, 'OK'
 
     # --------------------------------------------------------
-    # Шаг 7: сохранение объявления (папка + фото)
+    # Сохранение медиа
     # --------------------------------------------------------
     def save_ad_media(self, ad: Dict, index: int, section: dict) -> Optional[str]:
-        """Сохраняет info.txt + photo_N.jpg в папку."""
         cat_clean = section['name'].replace('truck_', '')
         folder_name = f'{index}_{cat_clean}'
         folder_path = os.path.join(self.output_dir, folder_name)
@@ -279,11 +252,9 @@ class VTBParser:
             counter += 1
         os.makedirs(folder_path, exist_ok=True)
 
-        # info.txt
         with open(os.path.join(folder_path, 'info.txt'), 'w', encoding='utf-8') as f:
             f.write(self._build_info_text(ad))
 
-        # Фото
         downloaded = 0
         for i, photo_url in enumerate(ad['photos'], 1):
             ext = Path(photo_url).suffix or '.jpg'
@@ -305,8 +276,7 @@ class VTBParser:
         logger.info(f'  💾 {folder_name} ({downloaded} фото)')
         return folder_path
 
-    def _download_file(self, url: str, filepath: str,
-                        min_size: int = 0) -> bool:
+    def _download_file(self, url: str, filepath: str, min_size: int = 0) -> bool:
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -330,7 +300,6 @@ class VTBParser:
             return False
 
     def _build_info_text(self, ad: Dict) -> str:
-        """Формирует текст объявления (шаблон)."""
         return f"""**{ad['title']}**
 
 **Цена в лизинг: {ad['price']} руб с НДС**
@@ -354,19 +323,17 @@ class VTBParser:
 Код предложения: {ad['code']}"""
 
     # --------------------------------------------------------
-    # ГЛАВНЫЙ МЕТОД
+    # Главный метод
     # --------------------------------------------------------
     def run(self, limit: int = INITIAL_LIMIT):
         logger.info('=' * 60)
         logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
         logger.info('=' * 60)
 
-        # Предзагрузка дублей
+        # Дедуп ВСЕГДА включён
         self.sheets.get_all_urls()
 
-        # Разделы с chat_id из БД
         sections = get_sections_from_db(self.db)
-
         saved_count = 0
 
         with sync_playwright() as p:
@@ -406,19 +373,16 @@ class VTBParser:
 
                         logger.info(f'\n[{i}/{len(urls)}] {url}')
 
-                        # Дубль?
                         if self.is_duplicate(url):
                             logger.info('  ⏭️ Дубль (Google Sheets или БД)')
                             self.skipped_dup += 1
                             continue
 
-                        # Парсим карточку
                         ad = self.parse_card(page, url)
                         if not ad:
                             self.errors += 1
                             continue
 
-                        # Флаги
                         ok, reason = self.check_flags(ad['flags'])
                         if not ok:
                             logger.info(f'  ⏭️ Флаги: {reason} ({ad["flags"]})')
@@ -426,10 +390,8 @@ class VTBParser:
                             continue
                         logger.info(f'  ✅ Флаги ОК: {ad["flags"]}')
 
-                        # Название для лога
                         logger.info(f'  📝 Название: "{ad["title"][:80]}"')
 
-                        # Категория
                         detected = detect_category(ad['title'], section)
                         if not detected:
                             logger.info(f'  ⏭️ Не подходит под "{section["key_in_title"]}"')
@@ -442,14 +404,12 @@ class VTBParser:
                             f'  📂 {detected["name"]} → {detected["chat_id"]}'
                         )
 
-                        # Сохраняем медиа
                         self.processed += 1
                         folder = self.save_ad_media(ad, self.processed, detected)
                         if not folder:
                             self.errors += 1
                             continue
 
-                        # Пишем в очередь
                         ad['folder_name'] = os.path.basename(folder)
                         ad['media_path'] = folder
                         inserted = self.db.add_parsed_ad(ad)
@@ -465,7 +425,6 @@ class VTBParser:
             finally:
                 browser.close()
 
-        # Итоги
         logger.info('\n' + '=' * 60)
         logger.info('📊 ИТОГИ ПАРСИНГА:')
         logger.info(f'  ✅ Обработано: {self.processed}')
@@ -476,7 +435,6 @@ class VTBParser:
         logger.info(f'  💾 В очередь БД: {saved_count}')
         logger.info('=' * 60)
 
-        # Статистика БД
         stats = self.db.count_by_status()
         logger.info(f'📊 Состояние очереди: {stats}')
 
@@ -484,29 +442,21 @@ class VTBParser:
 
 
 # ============================================================
-# Точка входа
+# Точка входа (CLI)
 # ============================================================
 
 def main():
     ap = argparse.ArgumentParser(description='VTB Parser')
     ap.add_argument('--limit', type=int, default=INITIAL_LIMIT,
                     help='Сколько новых объявлений набрать')
-    ap.add_argument('--no-sheets', action='store_true',
-                    help='Не использовать Google Sheets (для теста)')
     args = ap.parse_args()
 
-    # Sheets
-    if args.no_sheets:
-        logger.warning('⚠️ Google Sheets отключён (--no-sheets)')
-        sheets = SheetsClient(url='')
-    else:
-        sheets = SheetsClient(url=SHEETS_URL)
+    # Дедуп всегда включён
+    sheets = SheetsClient(url=SHEETS_URL)
 
-    # БД
     from config import DB_PATH
     db = BotDB(DB_PATH)
 
-    # Парсер
     parser = VTBParser(sheets, db, OUTPUT_DIR)
     saved = parser.run(limit=args.limit)
     logger.info(f'🎯 Готово. Новых в очереди: {saved}')
