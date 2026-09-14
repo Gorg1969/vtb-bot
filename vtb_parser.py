@@ -25,9 +25,10 @@ import requests
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
 
 from config import (
-    SECTIONS, INITIAL_LIMIT, MAX_PHOTOS_PER_AD, MAX_PAGES,
+    INITIAL_LIMIT, MAX_PHOTOS_PER_AD, MAX_PAGES,
     OUTPUT_DIR, FLAG_IN_STOCK, FLAG_LEASING, FLAG_REPAIR,
     FLAG_BUY_AVAILABLE, PAGE_TIMEOUT, CARD_DELAY, SHEETS_URL,
+    get_sections_from_db,
 )
 from sheets_client import SheetsClient
 from db import BotDB
@@ -65,12 +66,15 @@ def detect_category(title: str, section: dict) -> Optional[dict]:
     """
     Определяет категорию:
     - легковые (key_in_title = None) → все подряд
-    - грузовые → ищем ключ в названии
+    - грузовые → ищем ключ в названии (без учёта регистра, нормализация пробелов)
     """
-    title_lower = title.lower()
     if section['key_in_title'] is None:
         return section
-    if section['key_in_title'] in title_lower:
+
+    title_norm = ' '.join(title.lower().split())
+    key_norm = ' '.join(section['key_in_title'].lower().split())
+
+    if key_norm in title_norm:
         return section
     return None
 
@@ -151,20 +155,29 @@ class VTBParser:
             page.goto(url, wait_until='networkidle', timeout=PAGE_TIMEOUT)
             page.wait_for_timeout(2000)
 
-            # Название
-            title_el = page.query_selector('h1.t-auto-card-title')
-            title = normalize_text(title_el.inner_text()) if title_el else ''
+            # --- Название (класс на div, а не на h1) ---
+            title = ''
+            for sel in ['div.t-auto-card-title h1',
+                        'h1.t-auto-card-title',
+                        'h1']:
+                el = page.query_selector(sel)
+                if el:
+                    title = normalize_text(el.inner_text())
+                    if title:
+                        break
 
-            # Код предложения
-            code_el = page.query_selector('span.js-auto-card-title-code-text')
+            # --- Код предложения (может быть span или div) ---
+            code_el = (page.query_selector('span.js-auto-card-title-code-text')
+                       or page.query_selector('div.js-auto-card-title-code-text')
+                       or page.query_selector('.js-auto-card-title-code-text'))
             code = normalize_text(code_el.inner_text()) if code_el else ''
 
-            # Цена
+            # --- Цена ---
             price_el = page.query_selector('div.t-auto-card-price')
             price_raw = normalize_text(price_el.inner_text()) if price_el else ''
             price = format_price(price_raw)
 
-            # Характеристики: город, год, пробег
+            # --- Характеристики: город, год, пробег ---
             city = year = mileage = ''
             items = page.query_selector_all(
                 'div.t-tab-content.active div.t-tab-content-column-item'
@@ -187,7 +200,7 @@ class VTBParser:
                 except Exception:
                     continue
 
-            # Флаги (классы)
+            # --- Флаги (классы) ---
             flags = set()
             for el in page.query_selector_all('div.t-market-item-flags-item'):
                 cls = el.get_attribute('class') or ''
@@ -200,7 +213,7 @@ class VTBParser:
                 if FLAG_REPAIR in cls:
                     flags.add('repair')
 
-            # Фото (data-images)
+            # --- Фото (data-images) ---
             photos = []
             for slider in page.query_selector_all('div.t-main-slider-slide[data-images]'):
                 data_images = slider.get_attribute('data-images')
@@ -351,6 +364,9 @@ class VTBParser:
         # Предзагрузка дублей
         self.sheets.get_all_urls()
 
+        # Разделы с chat_id из БД
+        sections = get_sections_from_db(self.db)
+
         saved_count = 0
 
         with sync_playwright() as p:
@@ -367,7 +383,7 @@ class VTBParser:
             page = context.new_page()
 
             try:
-                for section in SECTIONS:
+                for section in sections:
                     if not section.get('enabled', True):
                         continue
                     if saved_count >= limit:
@@ -409,6 +425,9 @@ class VTBParser:
                             self.skipped_flags += 1
                             continue
                         logger.info(f'  ✅ Флаги ОК: {ad["flags"]}')
+
+                        # Название для лога
+                        logger.info(f'  📝 Название: "{ad["title"][:80]}"')
 
                         # Категория
                         detected = detect_category(ad['title'], section)
