@@ -22,7 +22,7 @@ SHEETS_URL = os.environ.get("SHEETS_URL", "")
 
 # === Пути ===
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/app/VTB_Объявления")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/app/data/VTB_Объявления")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/vtb_parser.db")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 
