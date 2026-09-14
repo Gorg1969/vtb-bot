@@ -1,6 +1,9 @@
 # app.py
 # ============================================================
 # vtb-bot — Flask-сервер
+#  - Бот MAX (webhook)
+#  - Админка (chat_id, расписание, «Опубликовано сегодня»)
+#  - Приём данных от парсера
 # ============================================================
 
 import os
@@ -49,8 +52,16 @@ if not TOKEN:
 ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
 ADMIN_PASS = os.environ.get('ADMIN_PASS', '')
 
+# === Список user_id, кому бот отвечает (через запятую) ===
+# Если пусто — отвечает всем
+ALLOWED_ADMIN_IDS = [
+    int(x) for x in (os.environ.get('ADMIN_IDS') or '').split(',')
+    if x.strip().isdigit()
+]
+
 
 def require_admin(f):
+    """Декоратор: Basic Auth для админки."""
     @wraps(f)
     def decorated(*args, **kwargs):
         auth = request.authorization
@@ -66,9 +77,19 @@ def require_admin(f):
     return decorated
 
 
+def is_allowed_user(user_id):
+    """Проверяет, отвечать ли этому пользователю."""
+    if not ALLOWED_ADMIN_IDS:
+        return True  # если список пуст — отвечаем всем
+    return int(user_id) in ALLOWED_ADMIN_IDS
+
+
+# === Модули (совместимость) ===
 db = Database()
 db.fix_publication_times()
 fm = FileManager(DATA_DIR)
+
+# === Новые модули ===
 bot_db = BotDB(DB_PATH)
 sheets = SheetsClient(url=SHEETS_URL)
 
@@ -95,6 +116,8 @@ class APIClient:
                 params={"user_id": user_id},
                 json=payload, timeout=30, verify=False,
             )
+            if response.status_code != 200:
+                logger.error(f"❌ send_message: {response.status_code} - {response.text[:200]}")
             return response.status_code == 200
         except Exception as e:
             logger.error(f"❌ send_message: {e}")
@@ -135,7 +158,7 @@ report_gen = ReportGenerator(fm, db)
 
 
 # ============================================================
-# Стили (общие)
+# Стили
 # ============================================================
 
 BASE_STYLE = """
@@ -160,6 +183,7 @@ BASE_STYLE = """
     .form-row label { display: block; margin-bottom: 5px; font-weight: bold; color: #333; font-size: 14px; }
     .success-msg { background: #d4edda; color: #155724; padding: 12px; border-radius: 5px; margin-bottom: 15px; }
     .hint { color: #666; font-size: 13px; margin-top: 5px; }
+    .warn { background: #fff3cd; color: #856404; padding: 12px; border-radius: 5px; margin-bottom: 15px; }
 </style>
 """
 
@@ -173,10 +197,14 @@ def index():
     if request.method == 'POST':
         return webhook()
     stats = bot_db.count_by_status()
-    html = BASE_STYLE + f"""
+    admin_ids_status = ', '.join(str(x) for x in ALLOWED_ADMIN_IDS) if ALLOWED_ADMIN_IDS else 'все (не защищено)'
+    warn = '' if ALLOWED_ADMIN_IDS else '<div class="warn">⚠️ ADMIN_IDS не задан — бот отвечает всем. Добавь свой user_id в переменные Bothost.</div>'
+    return BASE_STYLE + f"""
     <div class="card">
         <h1>🤖 VTB Bot</h1>
-        <p>Сервер работает. Токен MAX: {'✅' if TOKEN else '❌'}</p>
+        <p>Токен MAX: {'✅' if TOKEN else '❌'}</p>
+        <p>Бот отвечает: <b>{admin_ids_status}</b></p>
+        {warn}
     </div>
     <div class="card">
         <h2>📊 Очередь парсинга</h2>
@@ -193,7 +221,6 @@ def index():
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
     </div>
     """
-    return html
 
 
 @app.route('/health')
@@ -345,7 +372,7 @@ def admin_page():
 
 
 # ============================================================
-# АДМИНКА — настройки (chat_id, расписание, лимит)
+# АДМИНКА — настройки
 # ============================================================
 
 @app.route('/admin/settings', methods=['GET', 'POST'])
@@ -354,18 +381,15 @@ def admin_settings():
     saved = False
 
     if request.method == 'POST':
-        # chat_id для категорий
         for s in SECTIONS:
             key = f"chat_id_{s['name']}"
             value = (request.form.get(key) or '').strip()
             bot_db.set_setting(key, value)
             logger.info(f'💾 Сохранено {key} = {value}')
 
-        # Расписание
         bot_db.set_setting('schedule_start', (request.form.get('schedule_start') or '06:00').strip())
         bot_db.set_setting('schedule_end', (request.form.get('schedule_end') or '20:00').strip())
 
-        # Лимит
         daily_limit = (request.form.get('daily_limit') or '150').strip()
         try:
             int(daily_limit)
@@ -376,7 +400,6 @@ def admin_settings():
         saved = True
         logger.info('✅ Настройки сохранены')
 
-    # Загружаем текущие (из БД или из config)
     sections = get_sections_from_db(bot_db)
     schedule = get_schedule_from_db(bot_db)
 
@@ -386,7 +409,7 @@ def admin_settings():
         <div class="form-row">
             <label>{s.get('title', s['name'])}:</label>
             <input type="text" name="chat_id_{s['name']}" value="{s['chat_id']}" placeholder="-00000000000000">
-            <div class="hint">chat_id группы MAX для категории «{s.get('title', s['name'])}»</div>
+            <div class="hint">chat_id группы MAX для «{s.get('title', s['name'])}»</div>
         </div>
         """
 
@@ -516,6 +539,11 @@ def webhook():
 
             logger.info(f'📨 user_id={user_id}, text={text[:100]}')
 
+            # === Проверка доступа ===
+            if user_id and not is_allowed_user(user_id):
+                logger.warning(f'⛔ Игнорируем user_id={user_id} (не в ADMIN_IDS)')
+                return jsonify({"ok": True}), 200
+
             if user_id and text == '/start':
                 api.send_message(
                     user_id,
@@ -539,6 +567,10 @@ def webhook():
                 )
                 return jsonify({"ok": True}), 200
 
+            if user_id and text == '/myid':
+                api.send_message(user_id, f"Твой user_id: `{user_id}`")
+                return jsonify({"ok": True}), 200
+
         return jsonify({"ok": True}), 200
     except Exception as e:
         logger.exception(f'❌ webhook: {e}')
@@ -554,5 +586,6 @@ if __name__ == '__main__':
     logger.info(f'   TOKEN: {"✅" if TOKEN else "❌"}')
     logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
     logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌ (админка открыта!)"}')
+    logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌ (все)"}')
     logger.info(f'   PUBLIC_URL: {PUBLIC_URL}')
     app.run(host='0.0.0.0', port=PORT, threaded=True)
