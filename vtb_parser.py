@@ -3,7 +3,8 @@
 # Парсер VTB-лизинга
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
-# - Фильтр по цене: MIN_PRICE <= цена (по умолчанию 2 500 000 ₽)
+# - Фильтр по цене: MIN_PRICE <= цена
+# - Универсальный поиск цены (легковые + грузовые)
 # - info.txt = для публикации (обрезан по #изъятая)
 # - report.txt = полные данные для отчёта
 # ============================================================
@@ -63,7 +64,7 @@ def format_price(price_str: str) -> str:
 
 
 def price_to_int(price_str: str) -> int:
-    """'1 230 000' → 1230000. Если пусто или не число → 0."""
+    """'1 230 000' → 1230000. Если пусто → 0."""
     if not price_str:
         return 0
     digits = re.sub(r'[^\d]', '', str(price_str))
@@ -211,10 +212,22 @@ class VTBParser:
                     if code:
                         break
 
-            # --- Цена ---
-            price_el = page.query_selector('div.t-auto-card-price')
-            price_raw = normalize_text(price_el.inner_text()) if price_el else ''
+            # --- Цена (разные шаблоны у VTB) ---
+            price_raw = ''
+            for sel in ['div.t-auto-card-price',
+                        'div.t-calculator-card-price',
+                        'div.t-auto-card-prices__head div',
+                        '[class*="card-price"]']:
+                el = page.query_selector(sel)
+                if el:
+                    price_raw = normalize_text(el.inner_text())
+                    if price_raw:
+                        logger.info(f'  💵 Цена через "{sel}": {price_raw}')
+                        break
+
             price = format_price(price_raw)
+            if not price:
+                logger.warning('  ⚠️ Цена не найдена')
 
             # --- Характеристики ---
             city = year = mileage = ''
@@ -305,11 +318,9 @@ class VTBParser:
             counter += 1
         os.makedirs(folder_path, exist_ok=True)
 
-        # info.txt — для публикации в MAX
         with open(os.path.join(folder_path, 'info.txt'), 'w', encoding='utf-8') as f:
             f.write(self._build_info_text(ad))
 
-        # report.txt — полные данные для отчёта
         with open(os.path.join(folder_path, 'report.txt'), 'w', encoding='utf-8') as f:
             f.write(self._build_report_text(ad))
 
@@ -369,7 +380,6 @@ class VTBParser:
             return False
 
     def _build_info_text(self, ad: Dict) -> str:
-        """Текст для публикации в MAX. Обрезан на #изъятая."""
         return f"""**{ad['title']}**
 
 **Цена в лизинг: {ad['price']} руб с НДС**
@@ -389,7 +399,6 @@ class VTBParser:
 #изъятая #изъятка #конфискат"""
 
     def _build_report_text(self, ad: Dict) -> str:
-        """Полные данные для отчёта."""
         return f"""Название: {ad['title']}
 Ссылка: {ad['source_url']}
 Код предложения: {ad['code']}
@@ -453,7 +462,6 @@ class VTBParser:
                             self.errors += 1
                             continue
 
-                        # --- Флаги ---
                         ok, reason = self.check_flags(ad['flags'])
                         if not ok:
                             logger.info(f'  ⏭️ Флаги: {reason} ({ad["flags"]})')
