@@ -1,6 +1,7 @@
 # === Секреты (НЕ коммитить!) ===
 .env
 .env.*
+!.env.example
 *.key
 *.pem
 
@@ -44,3 +45,8 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
+# === Временные файлы ===
+*.tmp
+*.bak
+~$*
