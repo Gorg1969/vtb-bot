@@ -1,0 +1,31 @@
+# === Web-фреймворк ===
+Flask==3.0.0
+gunicorn==21.2.0
+
+# === HTTP и парсинг ===
+requests==2.31.0
+beautifulsoup4==4.12.2
+
+# === Playwright (парсер VTB) ===
+playwright==1.40.0
+
+# === Обработка данных ===
+Pillow==10.1.0
+openpyxl==3.1.2
+
+# === Время и часовые пояса ===
+pytz==2023.3
+
+# === Переменные окружения ===
+python-dotenv==1.0.0
+
+# === Планировщик задач ===
+APScheduler==3.10.4
+
+# === Работа с Google Sheets (через Apps Script — requests) ===
+# (доп. библиотек не нужно, работаем через requests)
+
+# === Очереди и БД ===
+redis==5.0.1
+rq==1.15.1
+psycopg2-binary==2.9.9
