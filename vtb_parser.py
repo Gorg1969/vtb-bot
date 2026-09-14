@@ -3,8 +3,8 @@
 # Парсер VTB-лизинга
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
-# - Парсинг кода предложения из span.js-auto-card-title-code
-# - info.txt = только для публикации (обрезан по #изъятая)
+# - Фильтр по цене: MIN_PRICE <= цена (по умолчанию 2 500 000 ₽)
+# - info.txt = для публикации (обрезан по #изъятая)
 # - report.txt = полные данные для отчёта
 # ============================================================
 
@@ -60,6 +60,19 @@ def format_price(price_str: str) -> str:
         return ''
     digits = re.sub(r'[^\d\s]', '', price_str)
     return normalize_text(digits)
+
+
+def price_to_int(price_str: str) -> int:
+    """'1 230 000' → 1230000. Если пусто или не число → 0."""
+    if not price_str:
+        return 0
+    digits = re.sub(r'[^\d]', '', str(price_str))
+    if not digits:
+        return 0
+    try:
+        return int(digits)
+    except ValueError:
+        return 0
 
 
 def detect_category(title: str, section: dict) -> Optional[dict]:
@@ -130,6 +143,7 @@ class VTBParser:
         self.skipped_dup = 0
         self.skipped_flags = 0
         self.skipped_category = 0
+        self.skipped_price = 0
         self.errors = 0
 
     def collect_urls_from_section(self, page: Page, section: dict,
@@ -355,7 +369,7 @@ class VTBParser:
             return False
 
     def _build_info_text(self, ad: Dict) -> str:
-        """Текст для публикации в MAX. Обрезан на #изъятая — без служебных данных."""
+        """Текст для публикации в MAX. Обрезан на #изъятая."""
         return f"""**{ad['title']}**
 
 **Цена в лизинг: {ad['price']} руб с НДС**
@@ -388,6 +402,7 @@ class VTBParser:
         logger.info('=' * 60)
         logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
         logger.info(f'   Сжатие: max {MAX_IMAGE_SIZE}px, JPEG q={JPEG_QUALITY}')
+        logger.info(f'   Фильтр цены: MIN={MIN_PRICE:,} MAX={MAX_PRICE or "∞"}'.replace(',', ' '))
         logger.info('=' * 60)
 
         self.sheets.get_all_urls()
@@ -438,12 +453,25 @@ class VTBParser:
                             self.errors += 1
                             continue
 
+                        # --- Флаги ---
                         ok, reason = self.check_flags(ad['flags'])
                         if not ok:
                             logger.info(f'  ⏭️ Флаги: {reason} ({ad["flags"]})')
                             self.skipped_flags += 1
                             continue
                         logger.info(f'  ✅ Флаги ОК: {ad["flags"]}')
+
+                        # --- Фильтр по цене ---
+                        price_num = price_to_int(ad['price'])
+                        if MIN_PRICE > 0 and price_num < MIN_PRICE:
+                            logger.info(f'  ⏭️ Цена {price_num:,} < {MIN_PRICE:,} — пропуск'.replace(',', ' '))
+                            self.skipped_price += 1
+                            continue
+                        if MAX_PRICE > 0 and price_num > MAX_PRICE:
+                            logger.info(f'  ⏭️ Цена {price_num:,} > {MAX_PRICE:,} — пропуск'.replace(',', ' '))
+                            self.skipped_price += 1
+                            continue
+                        logger.info(f'  💰 Цена ОК: {price_num:,} ₽'.replace(',', ' '))
 
                         logger.info(f'  📝 Название: "{ad["title"][:80]}"')
                         logger.info(f'  📋 Код: "{ad["code"]}"')
@@ -484,6 +512,7 @@ class VTBParser:
         logger.info(f'  ✅ Обработано: {self.processed}')
         logger.info(f'  ⏭️ Дублей: {self.skipped_dup}')
         logger.info(f'  🚫 Флаги: {self.skipped_flags}')
+        logger.info(f'  💰 Цена не подошла: {self.skipped_price}')
         logger.info(f'  📂 Категория: {self.skipped_category}')
         logger.info(f'  ❌ Ошибок: {self.errors}')
         logger.info(f'  💾 В очередь: {saved_count}')
