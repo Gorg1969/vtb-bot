@@ -115,43 +115,84 @@ class APIClient:
             return False
 
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
+        """Загрузка файла в MAX. Токен приходит в ШАГЕ 2 (после загрузки)."""
         if not self.token:
+            logger.error('❌ upload_file: нет токена')
             return None
         try:
-            logger.info(f'📤 Загрузка {file_type} {filename} ({len(file_bytes)} байт)')
+            # --- ШАГ 1: получить URL для загрузки ---
+            logger.info(f'📤 Шаг 1: запрос URL ({file_type}, {filename}, {len(file_bytes)} байт)')
             r = requests.post(
                 f"{self.base_url}/uploads",
                 headers={"Authorization": self.token},
                 params={"type": file_type},
                 timeout=30, verify=False,
             )
+            logger.info(f'📨 Шаг 1: HTTP {r.status_code}')
             if r.status_code != 200:
-                logger.error(f'❌ /uploads: {r.status_code} - {r.text[:200]}')
-                return None
-            data = r.json()
-            upload_url = data.get('url')
-            if not upload_url:
-                logger.error(f'❌ Нет url: {data}')
+                logger.error(f'❌ Шаг 1: {r.status_code} - {r.text[:300]}')
                 return None
 
+            try:
+                data = r.json()
+            except Exception as je:
+                logger.error(f'❌ Шаг 1: не JSON: {je}')
+                logger.error(f'❌ Шаг 1: тело: {r.text[:500]}')
+                return None
+
+            upload_url = data.get('url')
+            if not upload_url:
+                logger.error(f'❌ Шаг 1: нет url в ответе: {data}')
+                return None
+
+            # --- ШАГ 2: загрузить файл ---
+            logger.info(f'📤 Шаг 2: загрузка на {upload_url[:100]}...')
             ur = requests.post(
                 upload_url,
                 files={'data': (filename, file_bytes)},
                 timeout=180, verify=False,
             )
+            logger.info(f'📨 Шаг 2: HTTP {ur.status_code}')
+            logger.info(f'📨 Шаг 2: тело (первые 500): {ur.text[:500]}')
+
             if ur.status_code != 200:
-                logger.error(f'❌ upload: {ur.status_code} - {ur.text[:200]}')
+                logger.error(f'❌ Шаг 2: {ur.status_code}')
                 return None
 
-            result = ur.json()
+            try:
+                result = ur.json()
+            except Exception as je:
+                logger.error(f'❌ Шаг 2: ответ не JSON: {je}')
+                logger.error(f'❌ Шаг 2: тело: {ur.text[:500]}')
+                return None
+
+            # --- Достаём токен из разных возможных мест ---
             token = result.get('token')
-            if not token and 'data' in result:
-                token = result['data'].get('token')
+            if not token and isinstance(result, dict):
+                if 'data' in result and isinstance(result['data'], dict):
+                    token = result['data'].get('token')
+                if not token and 'photos' in result and isinstance(result['photos'], dict):
+                    for v in result['photos'].values():
+                        if isinstance(v, dict) and 'token' in v:
+                            token = v['token']
+                            break
+                if not token and 'photoIds' in result:
+                    token = result.get('photoIds')
+                    if isinstance(token, list):
+                        token = token[0] if token else None
+
             if token:
-                logger.info(f'✅ Токен: {token[:20]}...')
+                logger.info(f'✅ Токен: {str(token)[:30]}...')
+            else:
+                logger.error(f'❌ Токен не найден в ответе шага 2: {result}')
+
             return token
+
+        except requests.exceptions.Timeout:
+            logger.error(f'❌ Таймаут загрузки {filename}')
+            return None
         except Exception as e:
-            logger.exception(f"❌ upload_file: {e}")
+            logger.exception(f"❌ upload_file упал: {e}")
             return None
 
     def send_post(self, chat_id, text, media_tokens):
@@ -181,7 +222,7 @@ class APIClient:
                 json=payload, timeout=60, verify=False,
             )
 
-            logger.info(f'📨 Ответ: {r.status_code}')
+            logger.info(f'📨 Ответ send_post: HTTP {r.status_code}')
             if r.status_code != 200:
                 logger.error(f'❌ send_post: {r.status_code} - {r.text[:300]}')
                 return False, None
@@ -273,6 +314,7 @@ def publish_one_ad(ad: dict) -> tuple:
         except Exception as e:
             logger.error(f'❌ Ошибка загрузки {photo_file}: {e}')
 
+    logger.info(f'📊 Всего токенов: {len(media_tokens)}')
     if not media_tokens:
         return False, 'Не удалось загрузить ни одно фото', None
 
@@ -332,6 +374,7 @@ BASE_STYLE = """
     .success-msg { background: #d4edda; color: #155724; padding: 12px; border-radius: 5px; margin-bottom: 15px; }
     .hint { color: #666; font-size: 13px; margin-top: 5px; }
     .warn { background: #fff3cd; color: #856404; padding: 12px; border-radius: 5px; margin-bottom: 15px; }
+    .error-msg { background: #f8d7da; color: #721c24; padding: 12px; border-radius: 5px; margin-bottom: 15px; }
 </style>
 """
 
@@ -474,7 +517,7 @@ def admin_page():
         <a href="/admin/settings" class="btn">⚙️ Настройки</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
         <a href="/admin/queue" class="btn">📋 Очередь</a>
-        <a href="/admin/check_paths" class="btn">🔍 Проверить пути</a>
+        <a href="/admin/check_paths" class="btn">🔍 Пути</a>
         <a href="/admin/list_folders" class="btn">📁 Папки</a>
         <a href="/setup_webhook" class="btn btn-gray">🔄 Вебхук</a>
     </div>
@@ -721,7 +764,14 @@ def admin_cleanup_orphans():
             conn.close()
             deleted += 1
 
-    return jsonify({'success': True, 'deleted': deleted, 'total': len(rows)})
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🧹 Очистка завершена</h1>
+        <p>Удалено «мёртвых» записей: <b>{deleted}</b> из <b>{len(rows)}</b></p>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>
+    """
 
 
 @app.route('/admin/run_parser')
@@ -736,7 +786,16 @@ def admin_run_parser():
             logger.exception(f'❌ Парсер упал: {e}')
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({'success': True, 'message': f'Парсер запущен (лимит={limit})'})
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🚀 Парсер запущен</h1>
+        <p>Лимит: <b>{limit}</b></p>
+        <p>Работает в фоне. Дождись завершения (2-5 мин).</p>
+        <a href="/admin/queue" class="btn">📋 Проверить очередь</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>
+    """
 
 
 @app.route('/admin/publish_one')
@@ -744,7 +803,13 @@ def admin_run_parser():
 def admin_publish_one():
     ads = bot_db.get_pending_ads(limit=1)
     if not ads:
-        return jsonify({'success': False, 'message': 'Очередь пуста'})
+        return BASE_STYLE + """
+        <div class="card">
+            <h1>⚠️ Очередь пуста</h1>
+            <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Запустить парсер (5)</a>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
 
     ad = ads[0]
     logger.info(f'📤 Публикация: {ad.get("folder_name")}')
@@ -753,20 +818,42 @@ def admin_publish_one():
     try:
         ok, message, post_link = publish_one_ad(ad)
         if ok:
-            return jsonify({
-                'success': True,
-                'message': message,
-                'post_link': post_link,
-                'title': ad.get('title'),
-                'chat_id': ad.get('chat_id'),
-            })
+            link_html = f'<p>🔗 <a href="{post_link}" target="_blank">{post_link}</a></p>' if post_link else ''
+            return BASE_STYLE + f"""
+            <div class="card">
+                <h1>✅ Опубликовано</h1>
+                <p><b>{ad.get('title', '')}</b></p>
+                <p>Категория: <code>{ad.get('category', '')}</code></p>
+                {link_html}
+                <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
+                <a href="/admin/publish_one" class="btn btn-orange">📤 Опубликовать ещё 1</a>
+                <a href="/admin" class="btn btn-gray">← В админку</a>
+                <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
+            </div>
+            """
         else:
             bot_db.mark_ad_failed(ad['id'], message)
-            return jsonify({'success': False, 'message': message})
+            return BASE_STYLE + f"""
+            <div class="card">
+                <h1>❌ Ошибка публикации</h1>
+                <p><b>{ad.get('title', '')}</b></p>
+                <div class="error-msg">{message}</div>
+                <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
+                <a href="/admin/publish_one" class="btn btn-orange">Попробовать ещё</a>
+                <a href="/admin/queue" class="btn">📋 Очередь</a>
+                <a href="/admin" class="btn btn-gray">← В админку</a>
+            </div>
+            """
     except Exception as e:
         logger.exception(f'❌ Ошибка публикации: {e}')
         bot_db.mark_ad_failed(ad['id'], str(e))
-        return jsonify({'success': False, 'message': str(e)})
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>❌ Ошибка</h1>
+            <div class="error-msg">{e}</div>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
 
 
 @app.route('/admin/publish_all')
@@ -786,7 +873,7 @@ def admin_publish_all():
                 ok, message, post_link = publish_one_ad(ad)
                 if ok:
                     published += 1
-                    logger.info(f'  ✅ {message} {post_link or ""}')
+                    logger.info(f'  ✅ {message}')
                 else:
                     failed += 1
                     bot_db.mark_ad_failed(ad['id'], message)
@@ -800,7 +887,15 @@ def admin_publish_all():
         logger.info(f'🏁 Публикация завершена: ✅ {published}, ❌ {failed}')
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({'success': True, 'message': 'Публикация запущена в фоне'})
+
+    return BASE_STYLE + """
+    <div class="card">
+        <h1>📤 Публикация запущена</h1>
+        <p>Работает в фоне. Между постами пауза 30 секунд.</p>
+        <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>
+    """
 
 
 # ============================================================
@@ -887,4 +982,3 @@ if __name__ == '__main__':
     logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌"}')
     logger.info(f'   OUTPUT_DIR: {OUTPUT_DIR}')
     app.run(host='0.0.0.0', port=PORT, threaded=True)
-    
