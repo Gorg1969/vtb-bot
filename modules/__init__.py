@@ -1,4 +1,4 @@
-# modules/__init__.py
+dules/__init__.py
 from .database import Database
 from .file_manager import FileManager
 from .publisher import Publisher
