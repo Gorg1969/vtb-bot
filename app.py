@@ -115,12 +115,10 @@ class APIClient:
             return False
 
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
-        """Загрузка файла в MAX. Токен приходит в ШАГЕ 2 (после загрузки)."""
         if not self.token:
             logger.error('❌ upload_file: нет токена')
             return None
         try:
-            # --- ШАГ 1: получить URL для загрузки ---
             logger.info(f'📤 Шаг 1: запрос URL ({file_type}, {filename}, {len(file_bytes)} байт)')
             r = requests.post(
                 f"{self.base_url}/uploads",
@@ -142,10 +140,9 @@ class APIClient:
 
             upload_url = data.get('url')
             if not upload_url:
-                logger.error(f'❌ Шаг 1: нет url в ответе: {data}')
+                logger.error(f'❌ Шаг 1: нет url: {data}')
                 return None
 
-            # --- ШАГ 2: загрузить файл ---
             logger.info(f'📤 Шаг 2: загрузка на {upload_url[:100]}...')
             ur = requests.post(
                 upload_url,
@@ -166,7 +163,6 @@ class APIClient:
                 logger.error(f'❌ Шаг 2: тело: {ur.text[:500]}')
                 return None
 
-            # --- Достаём токен из разных возможных мест ---
             token = result.get('token')
             if not token and isinstance(result, dict):
                 if 'data' in result and isinstance(result['data'], dict):
@@ -184,7 +180,7 @@ class APIClient:
             if token:
                 logger.info(f'✅ Токен: {str(token)[:30]}...')
             else:
-                logger.error(f'❌ Токен не найден в ответе шага 2: {result}')
+                logger.error(f'❌ Токен не найден: {result}')
 
             return token
 
@@ -537,6 +533,12 @@ def admin_page():
     </div>
 
     <div class="card">
+        <h2>🧹 Очистка</h2>
+        <a href="/admin/cleanup_orphans" class="btn btn-red" onclick="return confirm('Удалить записи без папок на диске?')">🧹 Очистить «мёртвые» записи</a>
+        <a href="/admin/clear_all" class="btn btn-red" onclick="return confirm('⚠️ ПОЛНАЯ ОЧИСТКА! Удалить: всю очередь, журнал публикаций, все папки, все настройки. Продолжить?')">🗑️ ПОЛНАЯ ОЧИСТКА</a>
+    </div>
+
+    <div class="card">
         <h2>⚙️ Разделы и группы MAX</h2>
         <p class="hint">Редактировать chat_id → <a href="/admin/settings">Настройки</a></p>
         <table>
@@ -770,6 +772,77 @@ def admin_cleanup_orphans():
         <p>Удалено «мёртвых» записей: <b>{deleted}</b> из <b>{len(rows)}</b></p>
         <a href="/admin/queue" class="btn">📋 Очередь</a>
         <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>
+    """
+
+
+@app.route('/admin/clear_all')
+@require_admin
+def admin_clear_all():
+    """Полная очистка: очередь + журнал публикаций + папки + настройки."""
+    result = {
+        'parsed_ads_deleted': 0,
+        'publications_deleted': 0,
+        'settings_deleted': 0,
+        'folders_deleted': 0,
+        'folder_errors': 0,
+    }
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        c.execute("SELECT COUNT(*) FROM parsed_ads")
+        result['parsed_ads_deleted'] = c.fetchone()[0]
+        c.execute("DELETE FROM parsed_ads")
+
+        c.execute("SELECT COUNT(*) FROM publications")
+        result['publications_deleted'] = c.fetchone()[0]
+        c.execute("DELETE FROM publications")
+
+        c.execute("SELECT COUNT(*) FROM settings")
+        result['settings_deleted'] = c.fetchone()[0]
+        c.execute("DELETE FROM settings")
+
+        conn.commit()
+        conn.close()
+        logger.info(f"🗑️ БД очищена: parsed_ads={result['parsed_ads_deleted']}, "
+                    f"publications={result['publications_deleted']}, "
+                    f"settings={result['settings_deleted']}")
+    except Exception as e:
+        logger.exception(f'❌ Ошибка очистки БД: {e}')
+
+    try:
+        if os.path.exists(OUTPUT_DIR):
+            for item in os.listdir(OUTPUT_DIR):
+                item_path = os.path.join(OUTPUT_DIR, item)
+                if os.path.isdir(item_path):
+                    try:
+                        shutil.rmtree(item_path)
+                        result['folders_deleted'] += 1
+                    except Exception as e:
+                        result['folder_errors'] += 1
+                        logger.warning(f'⚠️ Не удалить {item_path}: {e}')
+        logger.info(f"🗑️ Удалено папок: {result['folders_deleted']}")
+    except Exception as e:
+        logger.exception(f'❌ Ошибка очистки папок: {e}')
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🗑️ Полная очистка выполнена</h1>
+        <table>
+            <tr><th>Что</th><th>Удалено</th></tr>
+            <tr><td>Очередь парсинга (<code>parsed_ads</code>)</td><td><b>{result['parsed_ads_deleted']}</b></td></tr>
+            <tr><td>Журнал публикаций (<code>publications</code>)</td><td><b>{result['publications_deleted']}</b></td></tr>
+            <tr><td>Настройки (<code>settings</code>)</td><td><b>{result['settings_deleted']}</b></td></tr>
+            <tr><td>Папки с медиа</td><td><b>{result['folders_deleted']}</b></td></tr>
+        </table>
+        {f'<div class="error-msg">⚠️ Ошибок при удалении папок: {result["folder_errors"]}</div>' if result['folder_errors'] else ''}
+        <p class="hint">⚠️ После очистки настроек — chat_id и расписание сброшены на значения из <code>config.py</code>.</p>
+        <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+        <a href="/admin/settings" class="btn">⚙️ Проверить настройки</a>
+        <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Запустить парсер</a>
     </div>
     """
 
