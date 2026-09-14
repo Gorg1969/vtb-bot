@@ -2,9 +2,8 @@
 # ============================================================
 # vtb-bot — Flask-сервер
 #  - Бот MAX (webhook)
-#  - Админка (chat_id, расписание, публикация)
-#  - Парсер + публикатор
-#  - Удаление папок после публикации
+#  - Админка (chat_id, расписание, публикация, диагностика)
+#  - Парсер + публикатор + удаление после публикации
 # ============================================================
 
 import os
@@ -15,6 +14,7 @@ try:
 except AttributeError:
     pass
 
+import sqlite3
 import logging
 import shutil
 import urllib3
@@ -229,35 +229,48 @@ report_gen = ReportGenerator(fm, db)
 # ============================================================
 
 def publish_one_ad(ad: dict) -> tuple:
-    """
-    Публикует одно объявление из очереди.
-    После успешной публикации — УДАЛЯЕТ папку с медиа.
-    """
     ad_id = ad['id']
     folder_name = ad.get('folder_name')
     chat_id = ad.get('chat_id')
     media_path = ad.get('media_path')
 
-    if not folder_name or not media_path:
-        return False, 'Нет папки или медиа', None
+    logger.info(f'🔍 Проверка путей: folder_name={folder_name!r}, media_path={media_path!r}')
+
+    if not media_path:
+        return False, f'Нет media_path в БД', None
 
     if not os.path.exists(media_path):
-        return False, f'Папка не найдена: {media_path}', None
+        # Попробуем альтернативные варианты
+        alternatives = [
+            os.path.join('/app/VTB_Объявления', folder_name or ''),
+            os.path.join('/app/data/VTB_Объявления', folder_name or ''),
+            os.path.join(OUTPUT_DIR, folder_name or ''),
+        ]
+        found = None
+        for alt in alternatives:
+            if alt and os.path.exists(alt):
+                found = alt
+                logger.info(f'🔄 Найден альтернативный путь: {alt}')
+                break
+
+        if not found:
+            return False, f'Папка не найдена: {media_path}. Проверено также: {alternatives}', None
+        media_path = found
 
     info_path = os.path.join(media_path, 'info.txt')
     if not os.path.exists(info_path):
-        return False, 'Нет info.txt', None
+        return False, f'Нет info.txt в {media_path}', None
 
     with open(info_path, 'r', encoding='utf-8') as f:
         text = f.read()
 
-    # Загружаем фото
     media_tokens = []
     photo_files = sorted([
         f for f in os.listdir(media_path)
         if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))
     ])
-    logger.info(f'📷 Найдено фото: {len(photo_files)}')
+    logger.info(f'📷 Фото: {len(photo_files)} → {photo_files}')
+    logger.info(f'📝 Текст: {text[:100]}...')
 
     for photo_file in photo_files[:10]:
         file_path = os.path.join(media_path, photo_file)
@@ -293,7 +306,6 @@ def publish_one_ad(ad: dict) -> tuple:
 
     bot_db.mark_ad_published(ad_id, post_link)
 
-    # Удаляем папку с медиа
     try:
         shutil.rmtree(media_path)
         logger.info(f'🗑️ Папка удалена: {media_path}')
@@ -309,7 +321,7 @@ def publish_one_ad(ad: dict) -> tuple:
 
 BASE_STYLE = """
 <style>
-    body { font-family: Arial; max-width: 1000px; margin: 40px auto; padding: 20px; background: #f5f5f5; }
+    body { font-family: Arial; max-width: 1200px; margin: 40px auto; padding: 20px; background: #f5f5f5; }
     .card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     h1, h2 { margin-top: 0; }
     a { color: #007bff; text-decoration: none; }
@@ -323,7 +335,7 @@ BASE_STYLE = """
     .stat { background: #f8f9fa; padding: 15px 20px; border-radius: 5px; }
     .stat .num { font-size: 24px; font-weight: bold; color: #007bff; }
     table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-    th, td { padding: 10px 12px; border-bottom: 1px solid #eee; text-align: left; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #eee; text-align: left; font-size: 13px; }
     th { background: #f8f9fa; }
     input[type="text"] { padding: 8px 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; width: 100%; max-width: 320px; }
     .form-row { margin-bottom: 15px; }
@@ -350,6 +362,7 @@ def index():
         <h1>🤖 VTB Bot</h1>
         <p>Токен MAX: {'✅' if TOKEN else '❌'}</p>
         <p>Бот отвечает: <b>{admin_ids_status}</b></p>
+        <p>OUTPUT_DIR: <code>{OUTPUT_DIR}</code></p>
     </div>
     <div class="card">
         <h2>📊 Очередь</h2>
@@ -362,8 +375,9 @@ def index():
     <div class="card">
         <h2>⚙️ Управление</h2>
         <a href="/admin" class="btn">🛠 Админка</a>
-        <a href="/admin/settings" class="btn">⚙️ Настройки</a>
-        <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
+        <a href="/admin/check_paths" class="btn">🔍 Проверить пути</a>
+        <a href="/admin/list_folders" class="btn">📁 Папки на диске</a>
     </div>
     """
 
@@ -472,7 +486,10 @@ def admin_page():
         <a href="/" class="btn">← На главную</a>
         <a href="/admin/settings" class="btn">⚙️ Настройки</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
-        <a href="/setup_webhook" class="btn btn-gray">🔄 Перерегистрировать вебхук</a>
+        <a href="/admin/queue" class="btn">📋 Очередь (с путями)</a>
+        <a href="/admin/check_paths" class="btn">🔍 Проверить пути</a>
+        <a href="/admin/list_folders" class="btn">📁 Папки на диске</a>
+        <a href="/setup_webhook" class="btn btn-gray">🔄 Вебхук</a>
     </div>
 
     <div class="card">
@@ -606,6 +623,129 @@ def admin_today():
     """
 
 
+@app.route('/admin/queue')
+@require_admin
+def admin_queue():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM parsed_ads ORDER BY id DESC LIMIT 100')
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    for r in rows:
+        mp = r.get('media_path')
+        if mp:
+            r['path_exists'] = os.path.exists(mp)
+            try:
+                r['path_files'] = ', '.join(os.listdir(mp)[:10]) if r['path_exists'] else '—'
+            except Exception:
+                r['path_files'] = 'ошибка'
+        else:
+            r['path_exists'] = False
+            r['path_files'] = '—'
+
+    table_rows = ""
+    for r in rows:
+        exists_icon = '✅' if r['path_exists'] else '❌'
+        table_rows += f"""
+        <tr>
+            <td>{r.get('id')}</td>
+            <td>{r.get('folder_name', '—')}</td>
+            <td style="font-size:11px;color:#666">{r.get('media_path', '—')}</td>
+            <td>{exists_icon}</td>
+            <td style="font-size:11px">{r.get('path_files', '—')}</td>
+            <td>{r.get('category', '—')}</td>
+            <td>{r.get('status', '—')}</td>
+            <td style="font-size:11px">{r.get('source_url', '—')[:60]}</td>
+        </tr>
+        """
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>📋 Очередь парсинга ({len(rows)})</h1>
+        <a href="/admin" class="btn">← Назад</a>
+        <p class="hint">Проверь пути <b>media_path</b>. Если ❌ — файлы пропали.</p>
+        <table>
+            <tr>
+                <th>ID</th><th>Папка</th><th>media_path</th>
+                <th>Есть?</th><th>Файлы</th>
+                <th>Категория</th><th>Статус</th><th>Источник</th>
+            </tr>
+            {table_rows}
+        </table>
+    </div>
+    """
+
+
+@app.route('/admin/check_paths')
+@require_admin
+def admin_check_paths():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, folder_name, media_path FROM parsed_ads")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    result = {'total': len(rows), 'exists': 0, 'missing': 0, 'missing_details': []}
+    for r in rows:
+        mp = r.get('media_path')
+        if mp and os.path.exists(mp):
+            result['exists'] += 1
+        else:
+            result['missing'] += 1
+            result['missing_details'].append({
+                'id': r['id'],
+                'folder': r.get('folder_name'),
+                'path': mp,
+            })
+
+    return jsonify(result)
+
+
+@app.route('/admin/list_folders')
+@require_admin
+def admin_list_folders():
+    if not os.path.exists(OUTPUT_DIR):
+        return jsonify({'error': f'Папка не существует: {OUTPUT_DIR}', 'files': []})
+    try:
+        files = sorted(os.listdir(OUTPUT_DIR))
+    except Exception as e:
+        return jsonify({'error': str(e), 'files': []})
+    return jsonify({
+        'output_dir': OUTPUT_DIR,
+        'files': files,
+        'count': len(files),
+    })
+
+
+@app.route('/admin/cleanup_orphans')
+@require_admin
+def admin_cleanup_orphans():
+    """Удаляет записи из parsed_ads, у которых папка не найдена на диске."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, folder_name, media_path FROM parsed_ads")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    deleted = 0
+    for r in rows:
+        mp = r.get('media_path')
+        if not mp or not os.path.exists(mp):
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM parsed_ads WHERE id = ?", (r['id'],))
+            conn.commit()
+            conn.close()
+            deleted += 1
+            logger.info(f'🗑️ Удалена запись id={r["id"]} ({r.get("folder_name")})')
+
+    return jsonify({'success': True, 'deleted': deleted, 'total': len(rows)})
+
+
 @app.route('/admin/run_parser')
 @require_admin
 def admin_run_parser():
@@ -634,6 +774,7 @@ def admin_publish_one():
 
     ad = ads[0]
     logger.info(f'📤 Публикация: {ad.get("folder_name")} → {ad.get("chat_id")}')
+    logger.info(f'   media_path={ad.get("media_path")}')
 
     try:
         ok, message, post_link = publish_one_ad(ad)
@@ -708,68 +849,4 @@ def webhook():
             user_id = sender.get('user_id')
             text = (body.get('text') or '').strip()
 
-            logger.info(f'📨 user_id={user_id}, text={text[:100]}')
-
-            if user_id and not is_allowed_user(user_id):
-                logger.warning(f'⛔ Игнорируем user_id={user_id}')
-                return jsonify({"ok": True}), 200
-
-            if user_id and text == '/start':
-                api.send_message(
-                    user_id,
-                    "🏠 **VTB Bot**\n\n"
-                    f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
-                    f"📅 **Опубликовано сегодня:**\n{PUBLIC_URL}/admin/today\n\n"
-                    f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
-                    f"🚀 **Парсинг:**\n{PUBLIC_URL}/admin/run_parser?limit=50\n\n"
-                    f"📤 **Публикация:**\n{PUBLIC_URL}/admin/publish_all\n\n"
-                    "🔒 Пароль спросит браузер."
-                )
-                return jsonify({"ok": True}), 200
-
-            if user_id and text == '/status':
-                stats = bot_db.count_by_status()
-                api.send_message(
-                    user_id,
-                    f"📊 **Статус:**\n"
-                    f"⏳ В очереди: {stats.get('pending', 0)}\n"
-                    f"✅ Опубликовано: {stats.get('published', 0)}\n"
-                    f"❌ Ошибок: {stats.get('failed', 0)}"
-                )
-                return jsonify({"ok": True}), 200
-
-            if user_id and text == '/myid':
-                api.send_message(user_id, f"Твой user_id: `{user_id}`")
-                return jsonify({"ok": True}), 200
-
-            if user_id and text == '/publish':
-                ads = bot_db.get_pending_ads(limit=1)
-                if not ads:
-                    api.send_message(user_id, "⚠️ Очередь пуста")
-                else:
-                    ad = ads[0]
-                    ok, message, post_link = publish_one_ad(ad)
-                    if ok:
-                        api.send_message(user_id, f"✅ Опубликовано: {ad.get('title')}\n{post_link or ''}")
-                    else:
-                        bot_db.mark_ad_failed(ad['id'], message)
-                        api.send_message(user_id, f"❌ Ошибка: {message}")
-                return jsonify({"ok": True}), 200
-
-        return jsonify({"ok": True}), 200
-    except Exception as e:
-        logger.exception(f'❌ webhook: {e}')
-        return jsonify({"ok": False}), 500
-
-
-# ============================================================
-# Запуск
-# ============================================================
-
-if __name__ == '__main__':
-    logger.info(f'🚀 Запуск vtb-bot на порту {PORT}')
-    logger.info(f'   TOKEN: {"✅" if TOKEN else "❌"}')
-    logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
-    logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌ (админка открыта!)"}')
-    logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌ (все)"}')
-    app.run(host='0.0.0.0', port=PORT, threaded=True)
+            logger.info(f'📨 user_id
