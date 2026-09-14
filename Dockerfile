@@ -14,11 +14,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 # === Системные зависимости для Playwright/Chromium ===
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Базовые утилиты
     wget curl gnupg ca-certificates \
-    # Часовые пояса
     tzdata \
-    # Библиотеки для Chromium
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -39,10 +36,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
     libasound2 \
     libatspi2.0-0 \
-    # Шрифты (для корректного рендеринга)
     fonts-liberation \
     fonts-dejavu-core \
-    # Для SQLite
     sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -55,8 +50,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # === Установка Chromium для Playwright ===
-RUN playwright install chromium && \
-    playwright install-deps chromium
+# ВАЖНО: без install-deps — все зависимости уже в apt выше
+RUN playwright install chromium
 
 # === Копируем код ===
 COPY . .
@@ -64,7 +59,7 @@ COPY . .
 # === Создаём папки для данных ===
 RUN mkdir -p /app/data /app/VTB_Объявления /app/logs
 
-# === Открываем порт (Bothost сам пробросит) ===
+# === Открываем порт ===
 EXPOSE 3000
 
 # === Точка входа ===
