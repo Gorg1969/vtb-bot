@@ -14,14 +14,17 @@ try:
 except AttributeError:
     pass
 
-from flask import Flask, request, jsonify, render_template_string, send_file, redirect
 import logging
 import shutil
 import urllib3
 import threading
 import json
 import base64
+import requests
+from functools import wraps
 from werkzeug.exceptions import ClientDisconnected
+
+from flask import Flask, request, jsonify, render_template_string, send_file, redirect
 
 from modules import Database, FileManager, Publisher, ReportGenerator
 from config import (
@@ -45,6 +48,32 @@ logger = logging.getLogger(__name__)
 if not TOKEN:
     logger.error("❌ ТОКЕН MAX НЕ НАЙДЕН!")
 
+# === Пароль для админки ===
+ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
+ADMIN_PASS = os.environ.get('ADMIN_PASS', '')
+
+# === Базовый URL бота (для ссылок) ===
+PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://vtb.bothost.tech')
+
+
+def require_admin(f):
+    """Декоратор: требует Basic Auth для админки."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not ADMIN_PASS:
+            # Если пароль не задан — открыто (для отладки)
+            return f(*args, **kwargs)
+        if not auth or auth.username != ADMIN_USER or auth.password != ADMIN_PASS:
+            return (
+                '🔒 Требуется авторизация',
+                401,
+                {'WWW-Authenticate': 'Basic realm="VTB Admin"'},
+            )
+        return f(*args, **kwargs)
+    return decorated
+
+
 # === Старые модули (совместимость) ===
 db = Database()
 db.fix_publication_times()
@@ -56,7 +85,7 @@ sheets = SheetsClient(url=SHEETS_URL)
 
 
 # ============================================================
-# MAX API Client (из старого app.py — без изменений)
+# MAX API Client
 # ============================================================
 
 class APIClient:
@@ -79,13 +108,15 @@ class APIClient:
                 timeout=30,
                 verify=False,
             )
+            if response.status_code != 200:
+                logger.error(f"❌ send_message: {response.status_code} - {response.text[:200]}")
             return response.status_code == 200
         except Exception as e:
             logger.error(f"❌ Ошибка отправки: {e}")
             return False
 
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
-        """Загрузка файла в MAX (фото/видео). Полная реализация — в старом app.py."""
+        """Загрузка файла в MAX (фото/видео)."""
         if not self.token:
             return None
         try:
@@ -120,15 +151,13 @@ class APIClient:
             return None
 
 
-# Нужно импортировать requests до APIClient
-import requests
 api = APIClient()
 publisher = Publisher(api, fm, db)
 report_gen = ReportGenerator(fm, db)
 
 
 # ============================================================
-# HTML — страницы (упрощённые, полные версии — позже)
+# HTML — главная
 # ============================================================
 
 MAIN_PAGE = """
@@ -158,7 +187,7 @@ MAIN_PAGE = """
     </div>
 
     <div class="card">
-        <h2>📊 Статистика</h2>
+        <h2>📊 Статистика очереди</h2>
         <div class="stats">
             <div class="stat">
                 <div>В очереди</div>
@@ -179,7 +208,7 @@ MAIN_PAGE = """
         <h2>⚙️ Управление</h2>
         <a href="/admin" class="btn">🛠 Админка</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
-        <a href="/admin/run_parser" class="btn btn-green">🚀 Запустить парсер</a>
+        <a href="/admin/run_parser?limit=5&no_sheets=1" class="btn btn-green">🚀 Тест парсера (5 шт)</a>
     </div>
 </body>
 </html>
@@ -210,16 +239,71 @@ def status():
 
 
 # ============================================================
-# Приём JSON от парсера (когда парсер на GitHub Actions / отдельно)
+# Регистрация вебхука
+# ============================================================
+
+@app.route('/setup_webhook')
+def setup_webhook():
+    """Перерегистрировать вебхук MAX на текущий URL."""
+    token = request.args.get('token') or TOKEN
+    if not token:
+        return "❌ Нет токена", 400
+
+    webhook_url = f"{PUBLIC_URL}/webhook"
+    headers = {"Authorization": token, "Content-Type": "application/json"}
+
+    # Сначала удаляем старые подписки
+    try:
+        r = requests.get(
+            f"{BASE_URL}/subscriptions",
+            headers={"Authorization": token},
+            timeout=30,
+            verify=False,
+        )
+        if r.status_code == 200:
+            existing = r.json().get('subscriptions', [])
+            for sub in existing:
+                old_url = sub.get('url')
+                if old_url:
+                    requests.delete(
+                        f"{BASE_URL}/subscriptions",
+                        headers={"Authorization": token},
+                        params={"url": old_url},
+                        timeout=30,
+                        verify=False,
+                    )
+                    logger.info(f'🗑️ Удалена старая подписка: {old_url}')
+    except Exception as e:
+        logger.warning(f'⚠️ Ошибка удаления подписок: {e}')
+
+    # Регистрируем новую
+    try:
+        r = requests.post(
+            f"{BASE_URL}/subscriptions",
+            headers=headers,
+            json={
+                "url": webhook_url,
+                "update_types": ["message_created", "bot_started", "bot_stopped"],
+            },
+            timeout=30,
+            verify=False,
+        )
+        if r.status_code == 200:
+            logger.info(f'✅ Вебхук зарегистрирован: {webhook_url}')
+            return f"✅ Вебхук зарегистрирован: {webhook_url}"
+        else:
+            return f"❌ Ошибка: {r.status_code} - {r.text}"
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
+
+
+# ============================================================
+# Приём JSON от парсера
 # ============================================================
 
 @app.route('/ingest_ads', methods=['POST'])
 def ingest_ads():
-    """
-    Принимает JSON от парсера:
-      {"source": "vtb_parser", "ads": [{...}, {...}]}
-    Складывает в очередь БД.
-    """
+    """Принимает JSON от парсера: {"source": "vtb_parser", "ads": [...]}"""
     try:
         data = request.get_json()
         if not data:
@@ -254,7 +338,7 @@ def ingest_ads():
 
 
 # ============================================================
-# Админка (упрощённая — развернём позже)
+# Админка
 # ============================================================
 
 ADMIN_PAGE = """
@@ -267,7 +351,7 @@ ADMIN_PAGE = """
         body { font-family: Arial; max-width: 1000px; margin: 40px auto; padding: 20px; background: #f5f5f5; }
         .card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
         h1 { margin-top: 0; }
-        .btn { display: inline-block; padding: 10px 20px; background: #007bff; color: white; border-radius: 5px; text-decoration: none; margin-right: 10px; }
+        .btn { display: inline-block; padding: 10px 20px; background: #007bff; color: white; border-radius: 5px; text-decoration: none; margin-right: 10px; margin-bottom: 10px; }
         .btn-green { background: #28a745; }
         .btn-red { background: #dc3545; }
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
@@ -280,7 +364,8 @@ ADMIN_PAGE = """
         <h1>🛠 Админка</h1>
         <a href="/" class="btn">← На главную</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
-        <a href="/admin/run_parser" class="btn btn-green">🚀 Запустить парсер</a>
+        <a href="/admin/run_parser?limit=5&no_sheets=1" class="btn btn-green">🚀 Тест парсера (5 шт)</a>
+        <a href="/admin/run_parser?limit=50" class="btn btn-green">🚀 Парсер (50 шт)</a>
     </div>
 
     <div class="card">
@@ -314,6 +399,7 @@ ADMIN_PAGE = """
 
 
 @app.route('/admin')
+@require_admin
 def admin_page():
     from config import SECTIONS
     stats = bot_db.count_by_status()
@@ -321,8 +407,9 @@ def admin_page():
 
 
 @app.route('/admin/today')
+@require_admin
 def admin_today():
-    """Простой список опубликованного за сегодня."""
+    """Список опубликованного за сегодня."""
     pubs = bot_db.get_publications_today()
     html = """
     <!DOCTYPE html><html><head><meta charset="UTF-8">
@@ -353,7 +440,7 @@ def admin_today():
                 <td>{{ p.title or '—' }}</td>
                 <td>{{ p.code or '—' }}</td>
                 <td>{% if p.max_post_url %}<a href="{{ p.max_post_url }}" target="_blank">MAX</a>{% else %}—{% endif %}</td>
-                <td><a href="{{ p.folder_name or '#' }}" target="_blank">VTB</a></td>
+                <td>{% if p.folder_name %}<a href="{{ p.folder_name }}" target="_blank">VTB</a>{% else %}—{% endif %}</td>
             </tr>
             {% endfor %}
         </table>
@@ -364,6 +451,7 @@ def admin_today():
 
 
 @app.route('/admin/run_parser')
+@require_admin
 def admin_run_parser():
     """Кнопка ручного запуска парсера (в фоне)."""
     limit = int(request.args.get('limit', 50))
@@ -383,7 +471,7 @@ def admin_run_parser():
 
 
 # ============================================================
-# Webhook MAX (упрощённая версия — полная в старом app.py)
+# Webhook MAX
 # ============================================================
 
 @app.route('/webhook', methods=['POST'])
@@ -403,13 +491,27 @@ def webhook():
             user_id = sender.get('user_id')
             text = (body.get('text') or '').strip()
 
+            logger.info(f'📨 user_id={user_id}, text={text[:100]}')
+
             if user_id and text == '/start':
                 api.send_message(
                     user_id,
                     "🏠 **VTB Bot**\n\n"
-                    "🌐 Админка: https://your-bothost-url/admin\n"
-                    "📅 Опубликовано сегодня: /admin/today\n"
-                    "🚀 Запустить парсер: /admin/run_parser\n"
+                    f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
+                    f"📅 **Опубликовано сегодня:**\n{PUBLIC_URL}/admin/today\n\n"
+                    f"🚀 **Запустить парсер:**\n{PUBLIC_URL}/admin/run_parser?limit=50\n\n"
+                    "🔒 Пароль спросит браузер."
+                )
+                return jsonify({"ok": True}), 200
+
+            if user_id and text == '/status':
+                stats = bot_db.count_by_status()
+                api.send_message(
+                    user_id,
+                    f"📊 **Статус очереди:**\n\n"
+                    f"⏳ В очереди: {stats.get('pending', 0)}\n"
+                    f"✅ Опубликовано: {stats.get('published', 0)}\n"
+                    f"❌ Ошибок: {stats.get('failed', 0)}"
                 )
                 return jsonify({"ok": True}), 200
 
@@ -428,7 +530,6 @@ if __name__ == '__main__':
     logger.info(f'🚀 Запуск vtb-bot на порту {PORT}')
     logger.info(f'   TOKEN: {"✅" if TOKEN else "❌"}')
     logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
-    logger.info(f'   DB: {DB_PATH}')
-    logger.info(f'   OUTPUT_DIR: {OUTPUT_DIR}')
-    logger.info(f'   Расписание: {SCHEDULE_START} – {SCHEDULE_END} МСК, {DAILY_LIMIT}/день')
+    logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌ (админка открыта!)"}')
+    logger.info(f'   PUBLIC_URL: {PUBLIC_URL}')
     app.run(host='0.0.0.0', port=PORT, threaded=True)
