@@ -27,6 +27,7 @@ from config import (
     OUTPUT_DIR, FLAG_IN_STOCK, FLAG_LEASING, FLAG_REPAIR,
     FLAG_BUY_AVAILABLE, PAGE_TIMEOUT, CARD_DELAY, SHEETS_URL,
     get_sections_from_db,
+    MIN_PRICE, MAX_PRICE,
 )
 from sheets_client import SheetsClient
 from db import BotDB
