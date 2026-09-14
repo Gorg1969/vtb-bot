@@ -1,9 +1,6 @@
 # app.py
 # ============================================================
 # vtb-bot — Flask-сервер
-#  - Бот MAX (webhook)
-#  - Админка (chat_id, расписание, «Опубликовано сегодня»)
-#  - Приём данных от парсера
 # ============================================================
 
 import os
@@ -52,8 +49,6 @@ if not TOKEN:
 ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
 ADMIN_PASS = os.environ.get('ADMIN_PASS', '')
 
-# === Список user_id, кому бот отвечает (через запятую) ===
-# Если пусто — отвечает всем
 ALLOWED_ADMIN_IDS = [
     int(x) for x in (os.environ.get('ADMIN_IDS') or '').split(',')
     if x.strip().isdigit()
@@ -61,7 +56,6 @@ ALLOWED_ADMIN_IDS = [
 
 
 def require_admin(f):
-    """Декоратор: Basic Auth для админки."""
     @wraps(f)
     def decorated(*args, **kwargs):
         auth = request.authorization
@@ -78,24 +72,21 @@ def require_admin(f):
 
 
 def is_allowed_user(user_id):
-    """Проверяет, отвечать ли этому пользователю."""
     if not ALLOWED_ADMIN_IDS:
-        return True  # если список пуст — отвечаем всем
+        return True
     return int(user_id) in ALLOWED_ADMIN_IDS
 
 
-# === Модули (совместимость) ===
+# === Модули ===
 db = Database()
 db.fix_publication_times()
 fm = FileManager(DATA_DIR)
-
-# === Новые модули ===
 bot_db = BotDB(DB_PATH)
 sheets = SheetsClient(url=SHEETS_URL)
 
 
 # ============================================================
-# MAX API Client
+# MAX API
 # ============================================================
 
 class APIClient:
@@ -198,12 +189,13 @@ def index():
         return webhook()
     stats = bot_db.count_by_status()
     admin_ids_status = ', '.join(str(x) for x in ALLOWED_ADMIN_IDS) if ALLOWED_ADMIN_IDS else 'все (не защищено)'
-    warn = '' if ALLOWED_ADMIN_IDS else '<div class="warn">⚠️ ADMIN_IDS не задан — бот отвечает всем. Добавь свой user_id в переменные Bothost.</div>'
+    warn = '' if ALLOWED_ADMIN_IDS else '<div class="warn">⚠️ ADMIN_IDS не задан — бот отвечает всем.</div>'
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🤖 VTB Bot</h1>
         <p>Токен MAX: {'✅' if TOKEN else '❌'}</p>
         <p>Бот отвечает: <b>{admin_ids_status}</b></p>
+        <p>Дедуп: <b>✅ всегда включён</b></p>
         {warn}
     </div>
     <div class="card">
@@ -234,7 +226,7 @@ def status():
 
 
 # ============================================================
-# Регистрация вебхука
+# Вебхук
 # ============================================================
 
 @app.route('/setup_webhook')
@@ -302,15 +294,13 @@ def ingest_ads():
                 logger.error(f'❌ {e}')
                 skipped += 1
 
-        logger.info(f'📥 Принято: добавлено {added}, дублей {skipped}')
         return jsonify({'success': True, 'added': added, 'skipped': skipped, 'total': len(ads)})
     except Exception as e:
-        logger.exception(f'❌ ingest_ads: {e}')
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
 # ============================================================
-# АДМИНКА — главная
+# Админка
 # ============================================================
 
 @app.route('/admin')
@@ -342,8 +332,9 @@ def admin_page():
         <a href="/" class="btn">← На главную</a>
         <a href="/admin/settings" class="btn">⚙️ Настройки</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
-        <a href="/admin/run_parser?limit=5&no_sheets=1" class="btn btn-green">🚀 Тест парсера (5)</a>
+        <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Тест парсера (5)</a>
         <a href="/admin/run_parser?limit=50" class="btn btn-green">🚀 Парсер (50)</a>
+        <a href="/admin/run_parser?limit=300" class="btn btn-green">🚀 Парсер (300)</a>
         <a href="/setup_webhook" class="btn btn-gray">🔄 Перерегистрировать вебхук</a>
     </div>
 
@@ -371,10 +362,6 @@ def admin_page():
     """
 
 
-# ============================================================
-# АДМИНКА — настройки
-# ============================================================
-
 @app.route('/admin/settings', methods=['GET', 'POST'])
 @require_admin
 def admin_settings():
@@ -398,7 +385,6 @@ def admin_settings():
         bot_db.set_setting('daily_limit', daily_limit)
 
         saved = True
-        logger.info('✅ Настройки сохранены')
 
     sections = get_sections_from_db(bot_db)
     schedule = get_schedule_from_db(bot_db)
@@ -454,10 +440,6 @@ def admin_settings():
     """
 
 
-# ============================================================
-# АДМИНКА — опубликовано сегодня
-# ============================================================
-
 @app.route('/admin/today')
 @require_admin
 def admin_today():
@@ -495,26 +477,21 @@ def admin_today():
     """
 
 
-# ============================================================
-# АДМИНКА — запуск парсера
-# ============================================================
-
 @app.route('/admin/run_parser')
 @require_admin
 def admin_run_parser():
     limit = int(request.args.get('limit', 50))
-    no_sheets = request.args.get('no_sheets') == '1'
 
     def _run():
         try:
-            run_parser(limit=limit, no_sheets=no_sheets)
+            run_parser(limit=limit)
         except Exception as e:
             logger.exception(f'❌ Парсер упал: {e}')
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({
         'success': True,
-        'message': f'Парсер запущен (лимит={limit}, no_sheets={no_sheets})',
+        'message': f'Парсер запущен (лимит={limit}, дедуп ВКЛ)',
     })
 
 
@@ -539,9 +516,8 @@ def webhook():
 
             logger.info(f'📨 user_id={user_id}, text={text[:100]}')
 
-            # === Проверка доступа ===
             if user_id and not is_allowed_user(user_id):
-                logger.warning(f'⛔ Игнорируем user_id={user_id} (не в ADMIN_IDS)')
+                logger.warning(f'⛔ Игнорируем user_id={user_id}')
                 return jsonify({"ok": True}), 200
 
             if user_id and text == '/start':
