@@ -19,12 +19,13 @@ import threading
 import json
 import requests
 import base64
+import io
 from functools import wraps
 from datetime import datetime
 
 from flask import (
     Flask, request, jsonify, render_template_string,
-    send_file, redirect
+    send_file, redirect, Response
 )
 
 from modules import Database, FileManager, Publisher, ReportGenerator
@@ -116,79 +117,42 @@ class APIClient:
 
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
         if not self.token:
-            logger.error('❌ upload_file: нет токена')
             return None
         try:
-            logger.info(f'📤 Шаг 1: запрос URL ({file_type}, {filename}, {len(file_bytes)} байт)')
+            logger.info(f'📤 Загрузка {file_type} {filename} ({len(file_bytes)} байт)')
             r = requests.post(
                 f"{self.base_url}/uploads",
                 headers={"Authorization": self.token},
                 params={"type": file_type},
                 timeout=30, verify=False,
             )
-            logger.info(f'📨 Шаг 1: HTTP {r.status_code}')
             if r.status_code != 200:
-                logger.error(f'❌ Шаг 1: {r.status_code} - {r.text[:300]}')
+                logger.error(f'❌ /uploads: {r.status_code} - {r.text[:200]}')
                 return None
-
-            try:
-                data = r.json()
-            except Exception as je:
-                logger.error(f'❌ Шаг 1: не JSON: {je}')
-                logger.error(f'❌ Шаг 1: тело: {r.text[:500]}')
-                return None
-
+            data = r.json()
             upload_url = data.get('url')
             if not upload_url:
-                logger.error(f'❌ Шаг 1: нет url: {data}')
+                logger.error(f'❌ Нет url: {data}')
                 return None
 
-            logger.info(f'📤 Шаг 2: загрузка на {upload_url[:100]}...')
             ur = requests.post(
                 upload_url,
                 files={'data': (filename, file_bytes)},
                 timeout=180, verify=False,
             )
-            logger.info(f'📨 Шаг 2: HTTP {ur.status_code}')
-            logger.info(f'📨 Шаг 2: тело (первые 500): {ur.text[:500]}')
-
             if ur.status_code != 200:
-                logger.error(f'❌ Шаг 2: {ur.status_code}')
+                logger.error(f'❌ upload: {ur.status_code}')
                 return None
 
-            try:
-                result = ur.json()
-            except Exception as je:
-                logger.error(f'❌ Шаг 2: ответ не JSON: {je}')
-                logger.error(f'❌ Шаг 2: тело: {ur.text[:500]}')
-                return None
-
+            result = ur.json()
             token = result.get('token')
-            if not token and isinstance(result, dict):
-                if 'data' in result and isinstance(result['data'], dict):
-                    token = result['data'].get('token')
-                if not token and 'photos' in result and isinstance(result['photos'], dict):
-                    for v in result['photos'].values():
-                        if isinstance(v, dict) and 'token' in v:
-                            token = v['token']
-                            break
-                if not token and 'photoIds' in result:
-                    token = result.get('photoIds')
-                    if isinstance(token, list):
-                        token = token[0] if token else None
-
+            if not token and 'data' in result:
+                token = result['data'].get('token')
             if token:
-                logger.info(f'✅ Токен: {str(token)[:30]}...')
-            else:
-                logger.error(f'❌ Токен не найден: {result}')
-
+                logger.info(f'✅ Токен: {token[:20]}...')
             return token
-
-        except requests.exceptions.Timeout:
-            logger.error(f'❌ Таймаут загрузки {filename}')
-            return None
         except Exception as e:
-            logger.exception(f"❌ upload_file упал: {e}")
+            logger.exception(f"❌ upload_file: {e}")
             return None
 
     def send_post(self, chat_id, text, media_tokens):
@@ -218,7 +182,7 @@ class APIClient:
                 json=payload, timeout=60, verify=False,
             )
 
-            logger.info(f'📨 Ответ send_post: HTTP {r.status_code}')
+            logger.info(f'📨 Ответ: {r.status_code}')
             if r.status_code != 200:
                 logger.error(f'❌ send_post: {r.status_code} - {r.text[:300]}')
                 return False, None
@@ -264,25 +228,11 @@ def publish_one_ad(ad: dict) -> tuple:
     chat_id = ad.get('chat_id')
     media_path = ad.get('media_path')
 
-    logger.info(f'🔍 Проверка: folder={folder_name!r}, path={media_path!r}')
-
     if not media_path:
         return False, 'Нет media_path', None
 
     if not os.path.exists(media_path):
-        alternatives = [
-            os.path.join('/app/VTB_Объявления', folder_name or ''),
-            os.path.join('/app/data/VTB_Объявления', folder_name or ''),
-            os.path.join(OUTPUT_DIR, folder_name or ''),
-        ]
-        found = None
-        for alt in alternatives:
-            if alt and os.path.exists(alt):
-                found = alt
-                break
-        if not found:
-            return False, f'Папка не найдена: {media_path}', None
-        media_path = found
+        return False, f'Папка не найдена: {media_path}', None
 
     info_path = os.path.join(media_path, 'info.txt')
     if not os.path.exists(info_path):
@@ -310,7 +260,6 @@ def publish_one_ad(ad: dict) -> tuple:
         except Exception as e:
             logger.error(f'❌ Ошибка загрузки {photo_file}: {e}')
 
-    logger.info(f'📊 Всего токенов: {len(media_tokens)}')
     if not media_tokens:
         return False, 'Не удалось загрузить ни одно фото', None
 
@@ -348,7 +297,7 @@ def publish_one_ad(ad: dict) -> tuple:
 
 BASE_STYLE = """
 <style>
-    body { font-family: Arial; max-width: 1200px; margin: 40px auto; padding: 20px; background: #f5f5f5; }
+    body { font-family: Arial; max-width: 1400px; margin: 40px auto; padding: 20px; background: #f5f5f5; }
     .card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     h1, h2 { margin-top: 0; }
     a { color: #007bff; text-decoration: none; }
@@ -363,7 +312,7 @@ BASE_STYLE = """
     .stat .num { font-size: 24px; font-weight: bold; color: #007bff; }
     table { width: 100%; border-collapse: collapse; margin-top: 10px; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #eee; text-align: left; font-size: 13px; }
-    th { background: #f8f9fa; }
+    th { background: #f8f9fa; position: sticky; top: 0; }
     input[type="text"] { padding: 8px 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; width: 100%; max-width: 320px; }
     .form-row { margin-bottom: 15px; }
     .form-row label { display: block; margin-bottom: 5px; font-weight: bold; color: #333; font-size: 14px; }
@@ -371,6 +320,7 @@ BASE_STYLE = """
     .hint { color: #666; font-size: 13px; margin-top: 5px; }
     .warn { background: #fff3cd; color: #856404; padding: 12px; border-radius: 5px; margin-bottom: 15px; }
     .error-msg { background: #f8d7da; color: #721c24; padding: 12px; border-radius: 5px; margin-bottom: 15px; }
+    .counter-big { font-size: 36px; font-weight: bold; color: #28a745; }
 </style>
 """
 
@@ -401,9 +351,7 @@ def index():
     <div class="card">
         <h2>⚙️ Управление</h2>
         <a href="/admin" class="btn">🛠 Админка</a>
-        <a href="/admin/queue" class="btn">📋 Очередь</a>
-        <a href="/admin/check_paths" class="btn">🔍 Проверить пути</a>
-        <a href="/admin/list_folders" class="btn">📁 Папки</a>
+        <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
     </div>
     """
 
@@ -478,7 +426,7 @@ def ingest_ads():
 
 
 # ============================================================
-# АДМИНКА
+# АДМИНКА — главная
 # ============================================================
 
 @app.route('/admin')
@@ -513,8 +461,6 @@ def admin_page():
         <a href="/admin/settings" class="btn">⚙️ Настройки</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
         <a href="/admin/queue" class="btn">📋 Очередь</a>
-        <a href="/admin/check_paths" class="btn">🔍 Пути</a>
-        <a href="/admin/list_folders" class="btn">📁 Папки</a>
         <a href="/setup_webhook" class="btn btn-gray">🔄 Вебхук</a>
     </div>
 
@@ -561,6 +507,10 @@ def admin_page():
     </div>
     """
     
+# ============================================================
+# АДМИНКА — настройки
+# ============================================================
+
 @app.route('/admin/settings', methods=['GET', 'POST'])
 @require_admin
 def admin_settings():
@@ -619,39 +569,246 @@ def admin_settings():
     """
 
 
+# ============================================================
+# АДМИНКА — Опубликовано сегодня (интерактивная таблица)
+# ============================================================
+
 @app.route('/admin/today')
 @require_admin
 def admin_today():
-    pubs = bot_db.get_publications_today()
-    rows = ""
+    """Интерактивная страница публикаций за сегодня."""
+    pubs = bot_db.get_publications_today_full()
+
+    rows_html = ""
     for i, p in enumerate(pubs, 1):
-        max_link = f'<a href="{p["max_post_url"]}" target="_blank">MAX</a>' if p.get('max_post_url') else '—'
-        src_link = f'<a href="{p["folder_name"]}" target="_blank">VTB</a>' if p.get('folder_name') and str(p['folder_name']).startswith('http') else '—'
-        rows += f"""
+        max_cell = (f'<a href="{p["max_post_url"]}" target="_blank">🔗 MAX</a>'
+                    if p.get('max_post_url') else '—')
+        src_cell = (f'<a href="{p["source_url"]}" target="_blank">🔗 VTB</a>'
+                    if p.get('source_url') and str(p['source_url']).startswith('http') else '—')
+        rows_html += f"""
         <tr>
             <td>{i}</td>
-            <td>{p.get('published_at', '—')}</td>
-            <td>{p.get('category', '—')}</td>
-            <td>{p.get('title', '—')}</td>
-            <td>{p.get('code', '—')}</td>
-            <td>{max_link}</td>
-            <td>{src_link}</td>
+            <td>{p.get('date','')}</td>
+            <td>{p.get('time','')}</td>
+            <td>{max_cell}</td>
+            <td>{src_cell}</td>
+            <td>{p.get('title','')}</td>
+            <td>{p.get('code','')}</td>
+            <td>{p.get('price','') or ''}</td>
         </tr>
         """
-    if not rows:
-        rows = "<tr><td colspan='7'>Пока ничего не опубликовано</td></tr>"
+
+    if not rows_html:
+        rows_html = "<tr><td colspan='8' style='text-align:center;color:#999'>Пока ничего не опубликовано</td></tr>"
 
     return BASE_STYLE + f"""
     <div class="card">
-        <h1>📅 Опубликовано сегодня ({len(pubs)})</h1>
-        <a href="/admin" class="btn">← Назад</a>
-        <table>
-            <tr><th>#</th><th>Время</th><th>Категория</th><th>Название</th><th>Код</th><th>MAX</th><th>Источник</th></tr>
-            {rows}
-        </table>
+        <h1>📅 Опубликовано сегодня</h1>
+        <p>Всего: <span class="counter-big" id="totalCount">{len(pubs)}</span></p>
+        <div style="margin-top:15px">
+            <a href="/admin" class="btn btn-gray">← Назад</a>
+            <button class="btn" onclick="refreshTable()">🔄 Обновить</button>
+            <a href="/api/today/export" class="btn btn-green">📥 Скачать Excel</a>
+            <button class="btn btn-orange" onclick="copyMaxLinks()">📋 Копировать ссылки MAX</button>
+        </div>
+        <p class="hint" id="lastUpdate">Автообновление каждые 15 сек</p>
     </div>
+
+    <div class="card">
+        <div style="max-height: 600px; overflow-y: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>№</th>
+                        <th>Дата</th>
+                        <th>Время (МСК)</th>
+                        <th>Ссылка на пост</th>
+                        <th>Ссылка-источник</th>
+                        <th>Название</th>
+                        <th>Код</th>
+                        <th>Цена</th>
+                    </tr>
+                </thead>
+                <tbody id="todayTable">
+                    {rows_html}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        let lastMaxLinks = [];
+
+        function escapeHtml(s) {{
+            if (!s) return '';
+            return s.replace(/[&<>"']/g, c => ({{
+                '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+            }})[c]);
+        }}
+
+        async function refreshTable() {{
+            try {{
+                const resp = await fetch('/api/today?_=' + Date.now());
+                const data = await resp.json();
+                if (!data.success) return;
+
+                const tbody = document.getElementById('todayTable');
+                const pubs = data.publications || [];
+                lastMaxLinks = pubs.map(p => p.max_post_url).filter(Boolean);
+
+                if (pubs.length === 0) {{
+                    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#999">Пока ничего не опубликовано</td></tr>';
+                }} else {{
+                    tbody.innerHTML = pubs.map((p, i) => {{
+                        const maxCell = p.max_post_url
+                            ? `<a href="${{escapeHtml(p.max_post_url)}}" target="_blank">🔗 MAX</a>`
+                            : '—';
+                        const srcCell = (p.source_url && p.source_url.startsWith('http'))
+                            ? `<a href="${{escapeHtml(p.source_url)}}" target="_blank">🔗 VTB</a>`
+                            : '—';
+                        return `<tr>
+                            <td>${{i+1}}</td>
+                            <td>${{escapeHtml(p.date)}}</td>
+                            <td>${{escapeHtml(p.time)}}</td>
+                            <td>${{maxCell}}</td>
+                            <td>${{srcCell}}</td>
+                            <td>${{escapeHtml(p.title)}}</td>
+                            <td>${{escapeHtml(p.code)}}</td>
+                            <td>${{escapeHtml(p.price)}}</td>
+                        </tr>`;
+                    }}).join('');
+                }}
+
+                document.getElementById('totalCount').textContent = pubs.length;
+                document.getElementById('lastUpdate').textContent =
+                    'Обновлено: ' + new Date().toLocaleTimeString('ru-RU') +
+                    ' (автообновление каждые 15 сек)';
+            }} catch (e) {{
+                console.error(e);
+            }}
+        }}
+
+        function copyMaxLinks() {{
+            if (lastMaxLinks.length === 0) {{
+                alert('Нет ссылок для копирования');
+                return;
+            }}
+            const text = lastMaxLinks.join('\\n');
+            navigator.clipboard.writeText(text).then(
+                () => alert('✅ Скопировано ' + lastMaxLinks.length + ' ссылок'),
+                () => alert('❌ Не удалось скопировать')
+            );
+        }}
+
+        // Автообновление каждые 15 секунд
+        setInterval(refreshTable, 15000);
+    </script>
     """
 
+
+# ============================================================
+# API — данные для страницы /admin/today
+# ============================================================
+
+@app.route('/api/today')
+@require_admin
+def api_today():
+    pubs = bot_db.get_publications_today_full()
+    resp = jsonify({'success': True, 'publications': pubs, 'count': len(pubs)})
+    resp.headers['Content-Type'] = 'application/json; charset=utf-8'
+    return resp
+
+
+@app.route('/api/today/export')
+@require_admin
+def api_today_export():
+    """Генерация Excel-отчёта за сегодня."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
+    pubs = bot_db.get_publications_today_full()
+    today = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Отчет"
+
+    headers = ['№', 'Дата', 'Время (МСК)', 'Ссылка на пост',
+               'Ссылка (источник)', 'Название', 'Код предложения', 'Цена в лизинге']
+
+    header_font = Font(bold=True, size=11, color="FFFFFF")
+    header_fill = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin = Border(
+        left=Side(style="thin", color="D0D0D0"),
+        right=Side(style="thin", color="D0D0D0"),
+        top=Side(style="thin", color="D0D0D0"),
+        bottom=Side(style="thin", color="D0D0D0"),
+    )
+
+    # Заголовок листа
+    title = ws.cell(row=1, column=1, value="Отчет по публикациям")
+    title.font = Font(bold=True, size=14)
+    title.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells('A1:H1')
+    ws.row_dimensions[1].height = 30
+
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=2, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = thin
+    ws.row_dimensions[2].height = 25
+
+    link_font = Font(color="0563C1", underline="single", size=10)
+    text_font = Font(size=10)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    for i, p in enumerate(pubs, 1):
+        r = i + 2
+        vals = [
+            i,
+            p.get('date', ''),
+            p.get('time', ''),
+            p.get('max_post_url', ''),
+            p.get('source_url', ''),
+            p.get('title', ''),
+            p.get('code', ''),
+            p.get('price', ''),
+        ]
+        for col, val in enumerate(vals, 1):
+            cell = ws.cell(row=r, column=col, value=val)
+            cell.font = text_font
+            cell.border = thin
+            cell.alignment = center if col in (1, 2, 3) else left
+            if col in (4, 5) and val and str(val).startswith('http'):
+                cell.font = link_font
+                cell.hyperlink = val
+
+    widths = {'A': 5, 'B': 12, 'C': 12, 'D': 45, 'E': 55, 'F': 35, 'G': 22, 'H': 18}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = 'A3'
+
+    # Сохраняем в память
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f"Отчет_{today}.xlsx"
+    return send_file(
+        buf,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+# ============================================================
+# АДМИНКА — очередь, пути, папки, очистка, run_parser
+# ============================================================
 
 @app.route('/admin/queue')
 @require_admin
@@ -687,7 +844,6 @@ def admin_queue():
             <td style="font-size:11px">{r.get('path_files', '—')}</td>
             <td>{r.get('category', '—')}</td>
             <td>{r.get('status', '—')}</td>
-            <td style="font-size:11px">{r.get('source_url', '—')[:60]}</td>
         </tr>
         """
 
@@ -699,7 +855,7 @@ def admin_queue():
             <tr>
                 <th>ID</th><th>Папка</th><th>media_path</th>
                 <th>Есть?</th><th>Файлы</th>
-                <th>Категория</th><th>Статус</th><th>Источник</th>
+                <th>Категория</th><th>Статус</th>
             </tr>
             {table_rows}
         </table>
@@ -729,7 +885,6 @@ def admin_check_paths():
                 'folder': r.get('folder_name'),
                 'path': mp,
             })
-
     return jsonify(result)
 
 
@@ -779,7 +934,6 @@ def admin_cleanup_orphans():
 @app.route('/admin/clear_all')
 @require_admin
 def admin_clear_all():
-    """Полная очистка: очередь + журнал публикаций + папки + настройки."""
     result = {
         'parsed_ads_deleted': 0,
         'publications_deleted': 0,
@@ -823,7 +977,6 @@ def admin_clear_all():
                     except Exception as e:
                         result['folder_errors'] += 1
                         logger.warning(f'⚠️ Не удалить {item_path}: {e}')
-        logger.info(f"🗑️ Удалено папок: {result['folders_deleted']}")
     except Exception as e:
         logger.exception(f'❌ Ошибка очистки папок: {e}')
 
@@ -838,11 +991,9 @@ def admin_clear_all():
             <tr><td>Папки с медиа</td><td><b>{result['folders_deleted']}</b></td></tr>
         </table>
         {f'<div class="error-msg">⚠️ Ошибок при удалении папок: {result["folder_errors"]}</div>' if result['folder_errors'] else ''}
-        <p class="hint">⚠️ После очистки настроек — chat_id и расписание сброшены на значения из <code>config.py</code>.</p>
         <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
         <a href="/admin" class="btn btn-gray">← В админку</a>
         <a href="/admin/settings" class="btn">⚙️ Проверить настройки</a>
-        <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Запустить парсер</a>
     </div>
     """
 
@@ -886,7 +1037,6 @@ def admin_publish_one():
 
     ad = ads[0]
     logger.info(f'📤 Публикация: {ad.get("folder_name")}')
-    logger.info(f'   media_path={ad.get("media_path")}')
 
     try:
         ok, message, post_link = publish_one_ad(ad)
@@ -900,8 +1050,8 @@ def admin_publish_one():
                 {link_html}
                 <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
                 <a href="/admin/publish_one" class="btn btn-orange">📤 Опубликовать ещё 1</a>
-                <a href="/admin" class="btn btn-gray">← В админку</a>
                 <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
+                <a href="/admin" class="btn btn-gray">← В админку</a>
             </div>
             """
         else:
@@ -911,9 +1061,7 @@ def admin_publish_one():
                 <h1>❌ Ошибка публикации</h1>
                 <p><b>{ad.get('title', '')}</b></p>
                 <div class="error-msg">{message}</div>
-                <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
                 <a href="/admin/publish_one" class="btn btn-orange">Попробовать ещё</a>
-                <a href="/admin/queue" class="btn">📋 Очередь</a>
                 <a href="/admin" class="btn btn-gray">← В админку</a>
             </div>
             """
@@ -1053,5 +1201,5 @@ if __name__ == '__main__':
     logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
     logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌"}')
     logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌"}')
-    logger.info(f'   OUTPUT_DIR: {OUTPUT_DIR}')
     app.run(host='0.0.0.0', port=PORT, threaded=True)
+    
