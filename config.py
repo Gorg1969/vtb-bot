@@ -27,7 +27,6 @@ DB_PATH = os.environ.get("DB_PATH", "/app/data/vtb_parser.db")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 
 # === Разделы сайта VTB ===
-# Категория определяется по URL раздела — ключи в названии НЕ используются.
 SECTIONS = [
     {
         'name': 'truck_samosval',
@@ -72,16 +71,16 @@ MAX_PHOTOS_PER_AD = 5
 MAX_PAGES = 200
 
 # === Фильтр по цене ===
-MIN_PRICE = 2_500_000     # минимальная цена (₽); 0 = без ограничения
-MAX_PRICE = 0             # максимальная цена (₽); 0 = без ограничения
+MIN_PRICE = 2_500_000
+MAX_PRICE = 0
 
-# === Флаги (CSS-классы на карточке VTB) ===
+# === Флаги ===
 FLAG_IN_STOCK = 't-in_stock'
 FLAG_LEASING = 't-leasing'
 FLAG_BUY_AVAILABLE = 't-buy-available'
 FLAG_REPAIR = 't-repair'
 
-# === Расписание (значения по умолчанию) ===
+# === Расписание ===
 SCHEDULE_START = "06:00"
 SCHEDULE_END = "20:00"
 DAILY_LIMIT = 150
@@ -90,16 +89,12 @@ DAILY_LIMIT = 150
 PAGE_TIMEOUT = 60000
 CARD_DELAY = 0.5
 
-# === Закраска номеров (ВРЕМЕННО ОТКЛЮЧЕНА) ===
-MASK_PLATES = False                             # ← ОТКЛЮЧЕНО (YOLO не влезает в образ)
-PLATE_MODEL_PATH = '/app/yolov8_plate.pt'
-PLATE_CONFIDENCE = 0.5
-PLATE_PADDING = 3
+# === Закраска номеров ===
+MASK_PLATES = True                                      # ← ВКЛЮЧАЕМ
+PLATE_MODEL_PATH = '/app/yolov8_plate_fp16.onnx'        # ← наш ONNX-файл
+PLATE_CONFIDENCE = 0.4                                  # порог уверенности
+PLATE_PADDING = 3                                       # отступ (пиксели)
 
-
-# ============================================================
-# Получение разделов с подстановкой chat_id из БД
-# ============================================================
 
 def get_sections_from_db(db=None):
     sections = [dict(s) for s in SECTIONS]
