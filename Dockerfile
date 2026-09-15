@@ -1,7 +1,7 @@
 # ============================================================
 # Dockerfile для vtb-bot (Bothost)
-# ВРЕМЕННО БЕЗ YOLO — для стабильной работы бота
-# Закраску добавим позже через отдельный сервис
+# python:3.11-slim + Chromium (Playwright) + OpenCV + ONNX Runtime
+# Без torch — закраска номеров через ONNX (YOLO)
 # ============================================================
 
 FROM python:3.11-slim
@@ -13,6 +13,7 @@ ENV PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PIP_NO_CACHE_DIR=1
 
+# === Системные зависимости ===
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl gnupg ca-certificates \
     tzdata \
@@ -22,10 +23,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
     libcairo2 libasound2 libatspi2.0-0 \
     fonts-liberation fonts-dejavu-core sqlite3 \
+    libgl1 libglib2.0-0 libsm6 libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# === Python-зависимости ===
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
         Flask==3.0.0 \
@@ -35,13 +38,19 @@ RUN pip install --no-cache-dir --upgrade pip && \
         Pillow==10.1.0 \
         openpyxl==3.1.2 \
         pytz==2023.3 \
-        python-dotenv==1.0.0 && \
+        python-dotenv==1.0.0 \
+        onnxruntime==1.16.3 \
+        opencv-python-headless==4.8.1.78 \
+        numpy==1.26.3 && \
     rm -rf /root/.cache/pip /tmp/* /var/tmp/*
 
+# === Chromium для Playwright ===
 RUN playwright install chromium
 
+# === Копируем код (включая yolov8_plate_fp16.onnx) ===
 COPY . .
 
+# === Создаём папки ===
 RUN mkdir -p /app/data /app/data/VTB_Объявления /app/logs
 
 EXPOSE 3000
