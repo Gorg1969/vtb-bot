@@ -22,10 +22,13 @@ python-dotenv==1.0.0
 # === Планировщик задач ===
 APScheduler==3.10.4
 
-# === Работа с Google Sheets (через Apps Script — requests) ===
-# (доп. библиотек не нужно, работаем через requests)
-
 # === Очереди и БД ===
 redis==5.0.1
 rq==1.15.1
 psycopg2-binary==2.9.9
+
+# === Закраска номеров (YOLO) ===
+ultralytics==8.0.200
+torch==2.1.0
+torchvision==0.16.0
+opencv-python-headless==4.8.1.78
