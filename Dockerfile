@@ -1,6 +1,7 @@
 # ============================================================
-# Dockerfile для vtb-bot (Bothost)
-# Образ: python:3.11-slim + Chromium (Playwright) + OpenCV (YOLO)
+# Dockerfile для vtb-bot (Bothost) 2
+# Образ: python:3.11-slim + Chromium (Playwright) + OpenCV + YOLO
+# Оптимизирован под экономию места (CPU-torch, чистка кэшей)
 # ============================================================
 
 FROM python:3.11-slim
@@ -10,12 +11,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive \
     TZ=Europe/Moscow \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PIP_NO_CACHE_DIR=1
 
 # === Системные зависимости ===
-# - для Playwright/Chromium
-# - для OpenCV (YOLO)
-# - утилиты
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl gnupg ca-certificates \
     tzdata \
@@ -52,28 +51,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # === Рабочая папка ===
 WORKDIR /app
 
-# === Зависимости Python ===
-COPY requirements.txt .
+# === Зависимости Python — устанавливаем по частям с чисткой кэша ===
 
-# 1. Устанавливаем всё, кроме torch (быстро)
+# 1. Базовые пакеты (Flask, requests, playwright, обработка файлов)
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir \
+        Flask==3.0.0 \
+        requests==2.31.0 \
+        beautifulsoup4==4.12.2 \
+        playwright==1.40.0 \
+        Pillow==10.1.0 \
+        openpyxl==3.1.2 \
+        pytz==2023.3 \
+        python-dotenv==1.0.0 && \
+    rm -rf /root/.cache/pip /tmp/* /var/tmp/*
 
-# 2. Ставим CPU-версию torch (~200 МБ вместо 5 ГБ с CUDA)
-#    Это должно идти ОТДЕЛЬНОЙ командой, чтобы pip не тянул CUDA-версию
+# 2. YOLO-зависимости (ultralytics + opencv-headless)
 RUN pip install --no-cache-dir \
-    torch==2.1.0 \
-    torchvision==0.16.0 \
-    --index-url https://download.pytorch.org/whl/cpu
+        ultralytics==8.0.200 \
+        opencv-python-headless==4.8.1.78 && \
+    rm -rf /root/.cache/pip /tmp/* /var/tmp/*
 
-# === Torch CPU (без CUDA — экономия ~5 ГБ) ===
+# 3. CPU-версия torch (без CUDA — экономия ~5 ГБ)
 RUN pip install --no-cache-dir \
-    torch==2.1.0 \
-    torchvision==0.16.0 \
-    --index-url https://download.pytorch.org/whl/cpu
+        torch==2.1.0 \
+        torchvision==0.16.0 \
+        --index-url https://download.pytorch.org/whl/cpu && \
+    rm -rf /root/.cache/pip /tmp/* /var/tmp/*
 
-# === Установка Chromium для Playwright ===
-RUN playwright install chromium
+# === Chromium для Playwright ===
+RUN playwright install chromium && \
+    rm -rf /root/.cache/pip /tmp/* /var/tmp/*
 
 # === Копируем код ===
 COPY . .
