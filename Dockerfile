@@ -54,8 +54,17 @@ WORKDIR /app
 
 # === Зависимости Python ===
 COPY requirements.txt .
+
+# 1. Устанавливаем всё, кроме torch (быстро)
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
+
+# 2. Ставим CPU-версию torch (~200 МБ вместо 5 ГБ с CUDA)
+#    Это должно идти ОТДЕЛЬНОЙ командой, чтобы pip не тянул CUDA-версию
+RUN pip install --no-cache-dir \
+    torch==2.1.0 \
+    torchvision==0.16.0 \
+    --index-url https://download.pytorch.org/whl/cpu
 
 # === Torch CPU (без CUDA — экономия ~5 ГБ) ===
 RUN pip install --no-cache-dir \
