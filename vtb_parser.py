@@ -5,6 +5,7 @@
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
 # - Категория по URL раздела
+# - Название обрезается перед годом (20XX г.)
 # - info.txt = для публикации, report.txt = для отчёта
 # - Закраска номеров: ВРЕМЕННО ОТКЛЮЧЕНА
 # ============================================================
@@ -66,6 +67,21 @@ def normalize_text(s: str) -> str:
     s = s.replace('\u00a0', ' ').replace('\xa0', ' ')
     s = re.sub(r'\s+', ' ', s)
     return s.strip()
+
+
+def strip_year_from_title(raw_title: str) -> str:
+    """
+    Обрезает название перед годом выпуска.
+    'Бульдозер SHANTUI SD17B3 XL 2023 г. / 2208 м.ч. / Тюмень АЛ ...' 
+        → 'Бульдозер SHANTUI SD17B3 XL'
+    """
+    if not raw_title:
+        return ''
+    # Ищем " 20XX г." или " 19XX г." (с пробелом перед)
+    match = re.search(r'\s+(19|20)\d{2}\s*г\.', raw_title)
+    if match:
+        return raw_title[:match.start()].strip()
+    return raw_title.strip()
 
 
 def format_price(price_str: str) -> str:
@@ -218,16 +234,24 @@ class VTBParser:
             page.goto(url, wait_until='domcontentloaded', timeout=90000)
             page.wait_for_timeout(2000)
 
-            # Название
+            # --- Название — обрезаем перед годом (20XX г.) ---
             title = ''
+            raw_title = ''
             for sel in ['div.t-auto-card-title h1', 'h1.t-auto-card-title', 'h1']:
                 el = page.query_selector(sel)
                 if el:
-                    title = normalize_text(el.inner_text())
-                    if title:
+                    raw_title = normalize_text(el.inner_text())
+                    if raw_title:
                         break
 
-            # Код
+            if raw_title:
+                title = strip_year_from_title(raw_title)
+                if title != raw_title:
+                    logger.info(f'  📝 Название (обрезано): "{title}"')
+                else:
+                    logger.info(f'  📝 Название: "{title}"')
+
+            # --- Код предложения ---
             code = ''
             for sel in ['.js-auto-card-title-code',
                         'span.js-auto-card-title-code',
@@ -238,7 +262,7 @@ class VTBParser:
                     if code:
                         break
 
-            # Цена
+            # --- Цена ---
             price_raw = ''
             try:
                 page.wait_for_selector(
@@ -267,7 +291,7 @@ class VTBParser:
             if not price:
                 logger.warning('  ⚠️ Цена не найдена')
 
-            # Характеристики
+            # --- Характеристики ---
             city = year = mileage = ''
             items = page.query_selector_all(
                 'div.t-tab-content.active div.t-tab-content-column-item'
@@ -290,7 +314,7 @@ class VTBParser:
                 except Exception:
                     continue
 
-            # Флаги
+            # --- Флаги ---
             flags = set()
             for el in page.query_selector_all('div.t-market-item-flags-item'):
                 cls = el.get_attribute('class') or ''
@@ -303,7 +327,7 @@ class VTBParser:
                 if FLAG_REPAIR in cls:
                     flags.add('repair')
 
-            # Фото
+            # --- Фото ---
             photos = []
             for slider in page.query_selector_all('div.t-main-slider-slide[data-images]'):
                 data_images = slider.get_attribute('data-images')
