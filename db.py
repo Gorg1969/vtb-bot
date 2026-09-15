@@ -1,9 +1,6 @@
 # db.py
 # ============================================================
 # Единая SQLite для бота и парсера
-# - parsed_ads: что спарсили с VTB (очередь на публикацию)
-# - publications: что уже опубликовано (для админки "Опубликовано сегодня")
-# - settings: настройки из админки (chat_id, расписание и т.д.)
 # ============================================================
 
 import sqlite3
@@ -50,7 +47,7 @@ class BotDB:
             )
         ''')
 
-        # === Опубликовано (для админки) ===
+        # === Опубликовано ===
         c.execute('''
             CREATE TABLE IF NOT EXISTS publications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,7 +66,7 @@ class BotDB:
             )
         ''')
 
-        # === Настройки админки (переопределяют config.py) ===
+        # === Настройки админки ===
         c.execute('''
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -87,7 +84,6 @@ class BotDB:
     # --------------------------------------------------------
 
     def add_parsed_ad(self, ad: Dict) -> bool:
-        """Добавляет объявление в очередь (пропускает дубли по source_url)."""
         try:
             conn = self._connect()
             c = conn.cursor()
@@ -118,7 +114,6 @@ class BotDB:
             return False
 
     def get_parsed_urls(self) -> Set[str]:
-        """Все source_url из очереди (для дедупа)."""
         conn = self._connect()
         c = conn.cursor()
         c.execute('SELECT source_url FROM parsed_ads')
@@ -135,7 +130,6 @@ class BotDB:
         return found
 
     def get_pending_ads(self, limit: int = 10) -> List[Dict]:
-        """Взять N объявлений из очереди на публикацию."""
         conn = self._connect()
         c = conn.cursor()
         c.execute('''
@@ -179,7 +173,7 @@ class BotDB:
         return result
 
     # --------------------------------------------------------
-    # ПУБЛИКАЦИИ (для админки "Опубликовано сегодня")
+    # ПУБЛИКАЦИИ
     # --------------------------------------------------------
 
     def add_publication(self, data: Dict) -> int:
@@ -209,7 +203,7 @@ class BotDB:
         return pub_id
 
     def get_publications_today(self) -> List[Dict]:
-        """Публикации за сегодня (МСК)."""
+        """Публикации за сегодня (простые)."""
         conn = self._connect()
         c = conn.cursor()
         c.execute('''
@@ -220,6 +214,53 @@ class BotDB:
         rows = [dict(r) for r in c.fetchall()]
         conn.close()
         return rows
+
+    def get_publications_today_full(self) -> List[Dict]:
+        """
+        Публикации за сегодня (расширенные — с датой, временем МСК, ценой).
+        Используется на странице /admin/today и для экспорта в Excel.
+        """
+        import pytz
+        moscow_tz = pytz.timezone('Europe/Moscow')
+
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute('''
+            SELECT id, published_at, max_post_url, folder_name,
+                   title, code, price, category, group_id
+            FROM publications
+            WHERE DATE(published_at) = DATE('now', 'localtime')
+            ORDER BY published_at ASC
+        ''')
+        rows = c.fetchall()
+        conn.close()
+
+        result = []
+        for row in rows:
+            pub_dt = row[1]
+            if isinstance(pub_dt, str):
+                try:
+                    pub_dt = datetime.fromisoformat(pub_dt)
+                except Exception:
+                    pub_dt = datetime.now()
+            if pub_dt is None:
+                pub_dt = datetime.now()
+            if hasattr(pub_dt, 'tzinfo') and pub_dt.tzinfo is None:
+                pub_dt = moscow_tz.localize(pub_dt)
+
+            result.append({
+                'id': row[0],
+                'date': pub_dt.strftime('%d.%m.%Y'),
+                'time': pub_dt.strftime('%H:%M'),
+                'max_post_url': row[2] or '',
+                'source_url': row[3] or '',
+                'title': row[4] or '',
+                'code': row[5] or '',
+                'price': row[6] or '',
+                'category': row[7] or '',
+                'group_id': row[8] or '',
+            })
+        return result
 
     def get_publications(self, limit: int = 100) -> List[Dict]:
         conn = self._connect()
@@ -234,7 +275,7 @@ class BotDB:
         return rows
 
     # --------------------------------------------------------
-    # НАСТРОЙКИ (админка)
+    # НАСТРОЙКИ
     # --------------------------------------------------------
 
     def set_setting(self, key: str, value: str):
