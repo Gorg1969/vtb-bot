@@ -1,13 +1,13 @@
-# vtb_parser.py 2
+# vtb_parser.py
 # ============================================================
 # Парсер VTB-лизинга
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
 # - Категория по URL раздела
-# - Название обрезается перед годом (20XX г.)
+# - Название обрезается перед годом
+# - Пагинация: ?sort=dateDesc&PAGEN_1=N
 # - info.txt = для публикации, report.txt = для отчёта
-# - Закраска номеров: ВРЕМЕННО ОТКЛЮЧЕНА
 # ============================================================
 
 import os
@@ -25,7 +25,7 @@ from PIL import Image
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
 
 from config import (
-    INITIAL_LIMIT, MAX_PHOTOS_PER_AD, MAX_PAGES,
+    INITIAL_LIMIT, MAX_PHOTOS_PER_AD, MAX_PAGES, MAX_CARDS_PER_SECTION,
     OUTPUT_DIR, FLAG_IN_STOCK, FLAG_LEASING, FLAG_REPAIR,
     FLAG_BUY_AVAILABLE, PAGE_TIMEOUT, CARD_DELAY, SHEETS_URL,
     get_sections_from_db,
@@ -42,7 +42,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# === Опциональный импорт plate_mask (если недоступен — заглушка) ===
 try:
     from plate_mask import mask_plate
     MASK_AVAILABLE = True
@@ -70,14 +69,8 @@ def normalize_text(s: str) -> str:
 
 
 def strip_year_from_title(raw_title: str) -> str:
-    """
-    Обрезает название перед годом выпуска.
-    'Бульдозер SHANTUI SD17B3 XL 2023 г. / 2208 м.ч. / Тюмень АЛ ...' 
-        → 'Бульдозер SHANTUI SD17B3 XL'
-    """
     if not raw_title:
         return ''
-    # Ищем " 20XX г." или " 19XX г." (с пробелом перед)
     match = re.search(r'\s+(19|20)\d{2}\s*г\.', raw_title)
     if match:
         return raw_title[:match.start()].strip()
@@ -165,14 +158,24 @@ class VTBParser:
 
     def collect_urls_from_section(self, page: Page, section: dict,
                                    limit: int) -> List[str]:
+        """
+        Обходит страницы раздела.
+        Формат URL: <base>/?sort=dateDesc&PAGEN_1=N
+        """
         urls = []
         pagen = 1
-        max_needed = limit * 3
 
-        while pagen <= MAX_PAGES and len(urls) < max_needed:
-            base_url = section['url'].rstrip('/')
-            sep = '&' if '?' in base_url else '?'
-            page_url = f"{base_url}{sep}sort=dateDesc&PAGEN_1={pagen}"
+        base_url = section['url']
+        if not base_url.endswith('/'):
+            base_url += '/'
+
+        max_cards = max(limit * 3, MAX_CARDS_PER_SECTION)
+
+        while pagen <= MAX_PAGES and len(urls) < max_cards:
+            if pagen == 1:
+                page_url = f"{base_url}?sort=dateDesc"
+            else:
+                page_url = f"{base_url}?sort=dateDesc&PAGEN_1={pagen}"
 
             logger.info(f'📄 Страница {pagen}')
 
@@ -186,17 +189,15 @@ class VTBParser:
                 break
 
             try:
-                page.wait_for_selector(
-                    'a.t-market-item-slider-item',
-                    timeout=30000
-                )
+                page.wait_for_selector('a.t-market-item-slider-item', timeout=30000)
             except PlaywrightTimeout:
                 page.wait_for_timeout(5000)
                 cards = page.query_selector_all('a.t-market-item-slider-item')
                 if not cards:
-                    logger.info(f'⏹️ Стр. {pagen} — карточек нет')
+                    logger.info(f'⏹️ Стр. {pagen} — карточек нет (конец раздела)')
                     break
 
+            # Скроллинг для lazy-карточек
             try:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(1500)
@@ -210,14 +211,23 @@ class VTBParser:
                 logger.info(f'⏹️ Стр. {pagen} пустая')
                 break
 
+            page_urls = []
             for card in cards:
                 href = card.get_attribute('href')
                 if href:
                     if href.startswith('/'):
                         href = 'https://www.vtb-leasing.ru' + href
-                    urls.append(href)
+                    page_urls.append(href)
 
-            logger.info(f'  → {len(cards)} карточек (всего: {len(urls)})')
+            # Защита от зацикливания: если все URL уже видели — стоп
+            if pagen > 1 and page_urls:
+                new_on_page = [u for u in page_urls if u not in urls]
+                if len(new_on_page) == 0:
+                    logger.warning(f'⚠️ Стр. {pagen} — все URL дублируются, стоп')
+                    break
+
+            urls.extend(page_urls)
+            logger.info(f'  → {len(page_urls)} карточек (всего: {len(urls)})')
             pagen += 1
 
         return urls
@@ -234,7 +244,6 @@ class VTBParser:
             page.goto(url, wait_until='domcontentloaded', timeout=90000)
             page.wait_for_timeout(2000)
 
-            # --- Название — обрезаем перед годом (20XX г.) ---
             title = ''
             raw_title = ''
             for sel in ['div.t-auto-card-title h1', 'h1.t-auto-card-title', 'h1']:
@@ -251,7 +260,6 @@ class VTBParser:
                 else:
                     logger.info(f'  📝 Название: "{title}"')
 
-            # --- Код предложения ---
             code = ''
             for sel in ['.js-auto-card-title-code',
                         'span.js-auto-card-title-code',
@@ -262,7 +270,6 @@ class VTBParser:
                     if code:
                         break
 
-            # --- Цена ---
             price_raw = ''
             try:
                 page.wait_for_selector(
@@ -291,7 +298,6 @@ class VTBParser:
             if not price:
                 logger.warning('  ⚠️ Цена не найдена')
 
-            # --- Характеристики ---
             city = year = mileage = ''
             items = page.query_selector_all(
                 'div.t-tab-content.active div.t-tab-content-column-item'
@@ -314,7 +320,6 @@ class VTBParser:
                 except Exception:
                     continue
 
-            # --- Флаги ---
             flags = set()
             for el in page.query_selector_all('div.t-market-item-flags-item'):
                 cls = el.get_attribute('class') or ''
@@ -327,7 +332,6 @@ class VTBParser:
                 if FLAG_REPAIR in cls:
                     flags.add('repair')
 
-            # --- Фото ---
             photos = []
             for slider in page.query_selector_all('div.t-main-slider-slide[data-images]'):
                 data_images = slider.get_attribute('data-images')
@@ -404,7 +408,6 @@ class VTBParser:
                         os.remove(final_path)
                     os.rename(jpeg_path, final_path)
 
-                # Закраска — только если включена и доступна
                 if MASK_PLATES and MASK_AVAILABLE:
                     try:
                         with open(final_path, 'rb') as f:
