@@ -57,6 +57,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# === Torch CPU (без CUDA — экономия ~5 ГБ) ===
+RUN pip install --no-cache-dir \
+    torch==2.1.0 \
+    torchvision==0.16.0 \
+    --index-url https://download.pytorch.org/whl/cpu
+
 # === Установка Chromium для Playwright ===
 RUN playwright install chromium
 
