@@ -1,6 +1,6 @@
 # ============================================================
 # Dockerfile для vtb-bot (Bothost)
-# Образ: python:3.11-slim + Chromium для Playwright
+# Образ: python:3.11-slim + Chromium (Playwright) + OpenCV (YOLO)
 # ============================================================
 
 FROM python:3.11-slim
@@ -12,7 +12,10 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Europe/Moscow \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# === Системные зависимости для Playwright/Chromium ===
+# === Системные зависимости ===
+# - для Playwright/Chromium
+# - для OpenCV (YOLO)
+# - утилиты
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl gnupg ca-certificates \
     tzdata \
@@ -39,6 +42,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     fonts-dejavu-core \
     sqlite3 \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # === Рабочая папка ===
@@ -50,7 +58,6 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # === Установка Chromium для Playwright ===
-# ВАЖНО: без install-deps — все зависимости уже в apt выше
 RUN playwright install chromium
 
 # === Копируем код ===
