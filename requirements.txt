@@ -29,6 +29,5 @@ psycopg2-binary==2.9.9
 
 # === Закраска номеров (YOLO) ===
 ultralytics==8.0.200
-torch==2.1.0
-torchvision==0.16.0
 opencv-python-headless==4.8.1.78
+# torch и torchvision ставим отдельно в Dockerfile (CPU-версия, без CUDA)
