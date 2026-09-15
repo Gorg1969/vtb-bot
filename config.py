@@ -28,7 +28,6 @@ LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 
 # === Разделы сайта VTB ===
 # Категория определяется по URL раздела — ключи в названии НЕ используются.
-# Все категории должны иметь УНИКАЛЬНЫЙ URL.
 SECTIONS = [
     {
         'name': 'truck_samosval',
@@ -76,12 +75,6 @@ MAX_PAGES = 200
 MIN_PRICE = 2_500_000     # минимальная цена (₽); 0 = без ограничения
 MAX_PRICE = 0             # максимальная цена (₽); 0 = без ограничения
 
-# === Закраска номеров ===
-MASK_PLATES = True                              # закрашивать номера
-PLATE_MODEL_PATH = '/app/yolov8_plate.pt'       # путь к модели
-PLATE_CONFIDENCE = 0.5                          # порог уверенности (0..1)
-PLATE_PADDING = 3                               # отступ вокруг номера (пиксели)
-
 # === Флаги (CSS-классы на карточке VTB) ===
 FLAG_IN_STOCK = 't-in_stock'
 FLAG_LEASING = 't-leasing'
@@ -97,29 +90,30 @@ DAILY_LIMIT = 150
 PAGE_TIMEOUT = 60000
 CARD_DELAY = 0.5
 
+# === Закраска номеров (ВРЕМЕННО ОТКЛЮЧЕНА) ===
+MASK_PLATES = False                             # ← ОТКЛЮЧЕНО (YOLO не влезает в образ)
+PLATE_MODEL_PATH = '/app/yolov8_plate.pt'
+PLATE_CONFIDENCE = 0.5
+PLATE_PADDING = 3
+
 
 # ============================================================
 # Получение разделов с подстановкой chat_id из БД
 # ============================================================
 
 def get_sections_from_db(db=None):
-    """SECTIONS с chat_id, переопределёнными из БД."""
     sections = [dict(s) for s in SECTIONS]
-
     if db is None:
         return sections
-
     for s in sections:
         key = f"chat_id_{s['name']}"
         db_value = db.get_setting(key)
         if db_value:
             s['chat_id'] = db_value
-
     return sections
 
 
 def get_schedule_from_db(db=None):
-    """Расписание + лимит из БД, fallback — из config."""
     result = {
         'start': SCHEDULE_START,
         'end': SCHEDULE_END,
@@ -127,11 +121,9 @@ def get_schedule_from_db(db=None):
     }
     if db is None:
         return result
-
     start = db.get_setting('schedule_start')
     end = db.get_setting('schedule_end')
     limit = db.get_setting('daily_limit')
-
     if start:
         result['start'] = start
     if end:
@@ -141,5 +133,4 @@ def get_schedule_from_db(db=None):
             result['daily_limit'] = int(limit)
         except ValueError:
             pass
-
     return result
