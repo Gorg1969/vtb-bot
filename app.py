@@ -1,6 +1,7 @@
 # app.py
 # ============================================================
 # vtb-bot — Flask-сервер (часть 1/2)
+# + автопубликация по расписанию
 # ============================================================
 
 import os
@@ -16,12 +17,14 @@ import logging
 import shutil
 import urllib3
 import threading
+import random
 import json
 import requests
 import base64
 import io
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timedelta
+import pytz
 
 from flask import (
     Flask, request, jsonify, render_template_string,
@@ -57,6 +60,8 @@ ALLOWED_ADMIN_IDS = [
     int(x) for x in (os.environ.get('ADMIN_IDS') or '').split(',')
     if x.strip().isdigit()
 ]
+
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 
 def require_admin(f):
@@ -116,7 +121,6 @@ class APIClient:
             return False
 
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
-        """Загрузка файла в MAX. Возвращает token или None."""
         if not self.token:
             logger.error('❌ upload_file: нет токена')
             return None
@@ -322,6 +326,215 @@ def publish_one_ad(ad: dict) -> tuple:
 
 
 # ============================================================
+# Автопубликация по расписанию (фоновый поток)
+# ============================================================
+
+AUTOPUBLISH_ENABLED = [False]   # список, чтобы можно было менять из потоков
+AUTOPUBLISH_THREAD = [None]     # ссылка на поток
+
+
+def get_schedule_params():
+    """Возвращает (start_h, start_m, end_h, end_m, daily_limit)."""
+    sched = get_schedule_from_db(bot_db)
+    try:
+        sh, sm = [int(x) for x in sched.get('start', '06:00').split(':')]
+    except Exception:
+        sh, sm = 6, 0
+    try:
+        eh, em = [int(x) for x in sched.get('end', '20:00').split(':')]
+    except Exception:
+        eh, em = 20, 0
+    try:
+        limit = int(sched.get('daily_limit', 150))
+    except Exception:
+        limit = 150
+    return sh, sm, eh, em, limit
+
+
+def count_today_publications() -> int:
+    """Сколько публикаций за сегодня (в МСК)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            SELECT COUNT(*) FROM publications
+            WHERE DATE(published_at) = DATE('now', 'localtime')
+              AND status = 'success'
+        ''')
+        n = c.fetchone()[0]
+        conn.close()
+        return n
+    except Exception as e:
+        logger.error(f'❌ count_today_publications: {e}')
+        return 0
+
+
+def calc_interval_seconds(limit: int):
+    """
+    Средний интервал между постами = длина окна / лимит.
+    Окно: 06:00–20:00 = 14 часов = 50400 секунд.
+    Возвращает (min_interval, max_interval) со случайным разбросом ±30%.
+    """
+    sh, sm, eh, em, _ = get_schedule_params()
+    window_seconds = (eh * 3600 + em * 60) - (sh * 3600 + sm * 60)
+    if window_seconds <= 0:
+        window_seconds = 14 * 3600
+    if limit <= 0:
+        limit = 150
+    avg_interval = window_seconds / limit
+    min_i = int(avg_interval * 0.7)
+    max_i = int(avg_interval * 1.3)
+    if min_i < 10:
+        min_i = 10
+    if max_i < min_i:
+        max_i = min_i
+    return min_i, max_i
+
+
+def is_in_schedule_window():
+    """Внутри окна 06:00–20:00 МСК?"""
+    now_msk = datetime.now(MOSCOW_TZ)
+    sh, sm, eh, em, _ = get_schedule_params()
+    start_min = sh * 60 + sm
+    end_min = eh * 60 + em
+    now_min = now_msk.hour * 60 + now_msk.minute
+    return start_min <= now_min < end_min
+
+
+def seconds_until_window_start():
+    """Сколько секунд до начала окна (06:00 МСК)."""
+    now_msk = datetime.now(MOSCOW_TZ)
+    sh, sm, eh, em, _ = get_schedule_params()
+    today_start = now_msk.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    if now_msk >= today_start:
+        tomorrow_start = today_start + timedelta(days=1)
+        return int((tomorrow_start - now_msk).total_seconds())
+    return int((today_start - now_msk).total_seconds())
+
+
+def auto_publish_loop():
+    """
+    Главный цикл автопубликации.
+    Работает, пока AUTOPUBLISH_ENABLED[0] = True.
+    """
+    logger.info('🚀 Автопубликация: поток запущен')
+
+    while AUTOPUBLISH_ENABLED[0]:
+        try:
+            # 1. Проверка окна
+            if not is_in_schedule_window():
+                wait_sec = min(seconds_until_window_start(), 3600)
+                logger.info(f'⏰ Вне окна расписания. Ждём {wait_sec} сек')
+                for _ in range(wait_sec):
+                    if not AUTOPUBLISH_ENABLED[0]:
+                        break
+                    time.sleep(1)
+                continue
+
+            # 2. Проверка дневного лимита
+            sh, sm, eh, em, limit = get_schedule_params()
+            today_count = count_today_publications()
+            if today_count >= limit:
+                logger.info(f'⏹ Дневной лимит {limit} достигнут. Ждём до 06:00')
+                wait_sec = min(seconds_until_window_start(), 3600)
+                for _ in range(wait_sec):
+                    if not AUTOPUBLISH_ENABLED[0]:
+                        break
+                    time.sleep(1)
+                continue
+
+            # 3. Берём 1 объявление из очереди
+            ads = bot_db.get_pending_ads(limit=1)
+            if not ads:
+                logger.info('📭 Очередь пуста. Ждём 60 сек')
+                for _ in range(60):
+                    if not AUTOPUBLISH_ENABLED[0]:
+                        break
+                    time.sleep(1)
+                continue
+
+            ad = ads[0]
+            logger.info(f'📤 [{today_count+1}/{limit}] Автопубликация: {ad.get("folder_name")}')
+            try:
+                ok, message, post_link = publish_one_ad(ad)
+                if ok:
+                    logger.info(f'  ✅ {message} {post_link or ""}')
+                    bot_db.set_setting('last_auto_publish_at', datetime.now().isoformat())
+                else:
+                    logger.warning(f'  ❌ {message}')
+                    bot_db.mark_ad_failed(ad['id'], message)
+            except Exception as e:
+                logger.exception(f'  ❌ Ошибка публикации: {e}')
+                bot_db.mark_ad_failed(ad['id'], str(e))
+
+            # 4. Пауза со случайным разбросом
+            min_i, max_i = calc_interval_seconds(limit)
+            pause = random.randint(min_i, max_i)
+            logger.info(f'⏸ Пауза {pause} сек до следующего поста')
+            for _ in range(pause):
+                if not AUTOPUBLISH_ENABLED[0]:
+                    break
+                time.sleep(1)
+
+        except Exception as e:
+            logger.exception(f'❌ Ошибка в auto_publish_loop: {e}')
+            time.sleep(60)
+
+    logger.info('⏹ Автопубликация остановлена')
+
+
+def start_auto_publish():
+    if AUTOPUBLISH_THREAD[0] and AUTOPUBLISH_THREAD[0].is_alive():
+        logger.info('ℹ️ Автопубликация уже запущена')
+        return
+    AUTOPUBLISH_ENABLED[0] = True
+    bot_db.set_setting('autopublish_enabled', '1')
+    t = threading.Thread(target=auto_publish_loop, daemon=True)
+    t.start()
+    AUTOPUBLISH_THREAD[0] = t
+    logger.info('✅ Автопубликация запущена')
+
+
+def stop_auto_publish():
+    AUTOPUBLISH_ENABLED[0] = False
+    bot_db.set_setting('autopublish_enabled', '0')
+    logger.info('🛑 Автопубликация остановлена')
+
+
+def get_autopublish_status():
+    enabled = AUTOPUBLISH_ENABLED[0]
+    sh, sm, eh, em, limit = get_schedule_params()
+    today_count = count_today_publications()
+    in_window = is_in_schedule_window()
+
+    if not enabled:
+        msg = '⏹ Выключена'
+        next_in = None
+    elif not in_window:
+        secs = seconds_until_window_start()
+        mins = secs // 60
+        msg = f'⏰ Ждёт окна (до 06:00, ~{mins} мин)'
+        next_in = secs
+    elif today_count >= limit:
+        msg = f'⏹ Лимит {limit} достигнут'
+        next_in = None
+    else:
+        min_i, max_i = calc_interval_seconds(limit)
+        msg = f'✅ Работает ({today_count}/{limit})'
+        next_in = max_i
+
+    return {
+        'enabled': enabled,
+        'in_window': in_window,
+        'today_count': today_count,
+        'daily_limit': limit,
+        'status_message': msg,
+        'next_in_seconds': next_in,
+        'window': f'{sh:02d}:{sm:02d} – {eh:02d}:{em:02d} МСК',
+    }
+
+
+# ============================================================
 # Стили
 # ============================================================
 
@@ -351,6 +564,8 @@ BASE_STYLE = """
     .warn { background: #fff3cd; color: #856404; padding: 12px; border-radius: 5px; margin-bottom: 15px; }
     .error-msg { background: #f8d7da; color: #721c24; padding: 12px; border-radius: 5px; margin-bottom: 15px; }
     .counter-big { font-size: 36px; font-weight: bold; color: #28a745; }
+    .status-on { color: #28a745; font-weight: bold; }
+    .status-off { color: #dc3545; font-weight: bold; }
 </style>
 """
 
@@ -364,10 +579,12 @@ def index():
     if request.method == 'POST':
         return webhook()
     stats = bot_db.count_by_status()
+    ap_status = get_autopublish_status()
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🤖 VTB Bot</h1>
         <p>Токен MAX: {'✅' if TOKEN else '❌'}</p>
+        <p>Автопубликация: <span class="{'status-on' if ap_status['enabled'] else 'status-off'}">{ap_status['status_message']}</span></p>
         <p>OUTPUT_DIR: <code>{OUTPUT_DIR}</code></p>
     </div>
     <div class="card">
@@ -465,6 +682,7 @@ def admin_page():
     sections = get_sections_from_db(bot_db)
     stats = bot_db.count_by_status()
     schedule = get_schedule_from_db(bot_db)
+    ap_status = get_autopublish_status()
 
     rows = ""
     for s in sections:
@@ -484,6 +702,12 @@ def admin_page():
 
     pending = stats.get('pending', 0)
 
+    ap_class = 'status-on' if ap_status['enabled'] else 'status-off'
+    ap_next = ''
+    if ap_status.get('next_in_seconds'):
+        mins = ap_status['next_in_seconds'] // 60
+        ap_next = f' (следующий пост через ~{mins} мин)'
+
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🛠 Админка</h1>
@@ -495,6 +719,16 @@ def admin_page():
     </div>
 
     <div class="card">
+        <h2>🕒 Автопубликация</h2>
+        <p>Статус: <span class="{ap_class}">{ap_status['status_message']}</span>{ap_next}</p>
+        <p>Окно: <b>{ap_status['window']}</b> · Сегодня: <b>{ap_status['today_count']}/{ap_status['daily_limit']}</b></p>
+        <a href="/admin/toggle_autopublish" class="btn {'btn-red' if ap_status['enabled'] else 'btn-green'}" onclick="return confirm('Переключить автопубликацию?')">
+            {'⏹ Выключить автопубликацию' if ap_status['enabled'] else '▶ Включить автопубликацию'}
+        </a>
+        <a href="/admin" class="btn btn-gray">🔄 Обновить статус</a>
+    </div>
+
+    <div class="card">
         <h2>🚀 Парсинг (дедуп ВКЛ)</h2>
         <a href="/admin/run_parser?limit=5" class="btn btn-green">Тест (5)</a>
         <a href="/admin/run_parser?limit=50" class="btn btn-green">50</a>
@@ -502,10 +736,9 @@ def admin_page():
     </div>
 
     <div class="card">
-        <h2>📤 Публикация в MAX</h2>
+        <h2>📤 Ручная публикация</h2>
         <p>В очереди: <b>{pending}</b></p>
         <a href="/admin/publish_one" class="btn btn-orange" onclick="return confirm('Опубликовать 1?')">📤 Опубликовать 1</a>
-        <a href="/admin/publish_all" class="btn btn-orange" onclick="return confirm('Опубликовать ВСЕ?')">📤 Опубликовать все</a>
     </div>
 
     <div class="card">
@@ -537,6 +770,20 @@ def admin_page():
     </div>
     """
     
+# ============================================================
+# АДМИНКА — переключатель автопубликации
+# ============================================================
+
+@app.route('/admin/toggle_autopublish')
+@require_admin
+def admin_toggle_autopublish():
+    if AUTOPUBLISH_ENABLED[0]:
+        stop_auto_publish()
+    else:
+        start_auto_publish()
+    return redirect('/admin')
+
+
 # ============================================================
 # АДМИНКА — настройки
 # ============================================================
@@ -589,6 +836,7 @@ def admin_settings():
             <div class="form-row"><label>Начало:</label><input type="text" name="schedule_start" value="{schedule['start']}"></div>
             <div class="form-row"><label>Конец:</label><input type="text" name="schedule_end" value="{schedule['end']}"></div>
             <div class="form-row"><label>Лимит/день:</label><input type="text" name="daily_limit" value="{schedule['daily_limit']}"></div>
+            <p class="hint">Интервал между постами = (конец − начало) / лимит, со случайным разбросом ±30%</p>
         </div>
         {saved_msg}
         <div class="card">
@@ -600,7 +848,7 @@ def admin_settings():
 
 
 # ============================================================
-# АДМИНКА — Опубликовано сегодня (интерактивная таблица)
+# АДМИНКА — Опубликовано сегодня
 # ============================================================
 
 @app.route('/admin/today')
@@ -812,7 +1060,7 @@ def api_today_export():
     widths = {'A': 5, 'B': 12, 'C': 12, 'D': 45, 'E': 55, 'F': 35, 'G': 22, 'H': 18}
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
-        ws.freeze_panes = 'A3'
+    ws.freeze_panes = 'A3'
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -981,9 +1229,6 @@ def admin_clear_all():
 
         conn.commit()
         conn.close()
-        logger.info(f"🗑️ БД очищена: parsed_ads={result['parsed_ads_deleted']}, "
-                    f"publications={result['publications_deleted']}, "
-                    f"settings={result['settings_deleted']}")
     except Exception as e:
         logger.exception(f'❌ Ошибка очистки БД: {e}')
 
@@ -1098,48 +1343,6 @@ def admin_publish_one():
         """
 
 
-@app.route('/admin/publish_all')
-@require_admin
-def admin_publish_all():
-    def _run():
-        pause = 30
-        published = 0
-        failed = 0
-        while True:
-            ads = bot_db.get_pending_ads(limit=1)
-            if not ads:
-                break
-            ad = ads[0]
-            logger.info(f'📤 [{published+failed+1}] {ad.get("folder_name")}')
-            try:
-                ok, message, post_link = publish_one_ad(ad)
-                if ok:
-                    published += 1
-                    logger.info(f'  ✅ {message}')
-                else:
-                    failed += 1
-                    bot_db.mark_ad_failed(ad['id'], message)
-                    logger.warning(f'  ❌ {message}')
-            except Exception as e:
-                failed += 1
-                bot_db.mark_ad_failed(ad['id'], str(e))
-                logger.exception(f'  ❌ {e}')
-            if bot_db.get_pending_ads(limit=1):
-                time.sleep(pause)
-        logger.info(f'🏁 Публикация завершена: ✅ {published}, ❌ {failed}')
-
-    threading.Thread(target=_run, daemon=True).start()
-
-    return BASE_STYLE + """
-    <div class="card">
-        <h1>📤 Публикация запущена</h1>
-        <p>Работает в фоне. Между постами пауза 30 секунд.</p>
-        <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
-        <a href="/admin" class="btn btn-gray">← В админку</a>
-    </div>
-    """
-
-
 # ============================================================
 # Webhook MAX
 # ============================================================
@@ -1179,12 +1382,15 @@ def webhook():
 
             if user_id and text == '/status':
                 stats = bot_db.count_by_status()
+                ap_status = get_autopublish_status()
                 api.send_message(
                     user_id,
                     f"📊 **Статус:**\n"
                     f"⏳ В очереди: {stats.get('pending', 0)}\n"
                     f"✅ Опубликовано: {stats.get('published', 0)}\n"
-                    f"❌ Ошибок: {stats.get('failed', 0)}"
+                    f"❌ Ошибок: {stats.get('failed', 0)}\n\n"
+                    f"🕒 Автопубликация: {ap_status['status_message']}\n"
+                    f"📅 Сегодня: {ap_status['today_count']}/{ap_status['daily_limit']}"
                 )
                 return jsonify({"ok": True}), 200
 
@@ -1192,18 +1398,14 @@ def webhook():
                 api.send_message(user_id, f"Твой user_id: `{user_id}`")
                 return jsonify({"ok": True}), 200
 
-            if user_id and text == '/publish':
-                ads = bot_db.get_pending_ads(limit=1)
-                if not ads:
-                    api.send_message(user_id, "⚠️ Очередь пуста")
-                else:
-                    ad = ads[0]
-                    ok, message, post_link = publish_one_ad(ad)
-                    if ok:
-                        api.send_message(user_id, f"✅ Опубликовано: {ad.get('title')}\n{post_link or ''}")
-                    else:
-                        bot_db.mark_ad_failed(ad['id'], message)
-                        api.send_message(user_id, f"❌ Ошибка: {message}")
+            if user_id and text == '/autopublish_on':
+                start_auto_publish()
+                api.send_message(user_id, "✅ Автопубликация включена")
+                return jsonify({"ok": True}), 200
+
+            if user_id and text == '/autopublish_off':
+                stop_auto_publish()
+                api.send_message(user_id, "🛑 Автопубликация выключена")
                 return jsonify({"ok": True}), 200
 
         return jsonify({"ok": True}), 200
@@ -1216,10 +1418,23 @@ def webhook():
 # Запуск
 # ============================================================
 
+def init_autopublish():
+    """При старте — если в БД стоит autopublish_enabled=1, запускаем поток."""
+    enabled = bot_db.get_setting('autopublish_enabled', '0')
+    if enabled == '1':
+        logger.info('🔁 Автопубликация была включена — запускаем поток')
+        start_auto_publish()
+    else:
+        logger.info('ℹ️ Автопубликация выключена')
+
+
 if __name__ == '__main__':
     logger.info(f'🚀 Запуск vtb-bot на порту {PORT}')
     logger.info(f'   TOKEN: {"✅" if TOKEN else "❌"}')
     logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
     logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌"}')
     logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌"}')
+
+    init_autopublish()
+
     app.run(host='0.0.0.0', port=PORT, threaded=True)
