@@ -76,6 +76,12 @@ MAX_PAGES = 200
 MIN_PRICE = 2_500_000     # минимальная цена (₽); 0 = без ограничения
 MAX_PRICE = 0             # максимальная цена (₽); 0 = без ограничения
 
+# === Закраска номеров ===
+MASK_PLATES = True                              # закрашивать номера
+PLATE_MODEL_PATH = '/app/yolov8_plate.pt'       # путь к модели
+PLATE_CONFIDENCE = 0.5                          # порог уверенности (0..1)
+PLATE_PADDING = 3                               # отступ вокруг номера (пиксели)
+
 # === Флаги (CSS-классы на карточке VTB) ===
 FLAG_IN_STOCK = 't-in_stock'
 FLAG_LEASING = 't-leasing'
