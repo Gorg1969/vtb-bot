@@ -27,6 +27,7 @@ DB_PATH = os.environ.get("DB_PATH", "/app/data/vtb_parser.db")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 
 # === Разделы сайта VTB ===
+# URL — БЕЗ параметров. Парсер сам добавит ?sort=dateDesc&PAGEN_1=N
 SECTIONS = [
     {
         'name': 'truck_samosval',
@@ -63,12 +64,28 @@ SECTIONS = [
         'chat_id': '-73112403724817',
         'enabled': True,
     },
+    # === НОВЫЕ КАТЕГОРИИ ===
+    {
+        'name': 'trailer',
+        'title': 'Прицепы',
+        'url': 'https://www.vtb-leasing.ru/auto-market/f/type-is-5/',
+        'chat_id': '-73112639261201',
+        'enabled': True,
+    },
+    {
+        'name': 'car',
+        'title': 'Легковые',
+        'url': 'https://www.vtb-leasing.ru/auto-market/sale/car/',
+        'chat_id': '-73112487086609',
+        'enabled': True,
+    },
 ]
 
 # === Лимиты ===
 INITIAL_LIMIT = 300
 MAX_PHOTOS_PER_AD = 5
 MAX_PAGES = 200
+MAX_CARDS_PER_SECTION = 300    # максимум карточек с одного раздела
 
 # === Фильтр по цене ===
 MIN_PRICE = 2_500_000
@@ -90,10 +107,10 @@ PAGE_TIMEOUT = 60000
 CARD_DELAY = 0.5
 
 # === Закраска номеров ===
-MASK_PLATES = True                                      # ← ВКЛЮЧАЕМ
-PLATE_MODEL_PATH = '/app/yolov8_plate_fp16.onnx'        # ← наш ONNX-файл
-PLATE_CONFIDENCE = 0.4                                  # порог уверенности
-PLATE_PADDING = 3                                       # отступ (пиксели)
+MASK_PLATES = True
+PLATE_MODEL_PATH = '/app/yolov8_plate_fp16.onnx'
+PLATE_CONFIDENCE = 0.4
+PLATE_PADDING = 3
 
 
 def get_sections_from_db(db=None):
