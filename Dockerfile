@@ -1,7 +1,7 @@
 # ============================================================
-# Dockerfile для vtb-bot (Bothost) 2
-# Образ: python:3.11-slim + Chromium (Playwright) + OpenCV + YOLO
-# Оптимизирован под экономию места (CPU-torch, чистка кэшей)
+# Dockerfile для vtb-bot (Bothost) 3
+# python:3.11-slim + Chromium (Playwright) + OpenCV + YOLO (CPU-torch)
+# Оптимизирован под экономию места
 # ============================================================
 
 FROM python:3.11-slim
@@ -44,16 +44,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
-    libxext6 \
     libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # === Рабочая папка ===
 WORKDIR /app
 
-# === Зависимости Python — устанавливаем по частям с чисткой кэша ===
+# ============================================================
+# Установка Python-зависимостей по слоям с чисткой кэша
+# ============================================================
 
-# 1. Базовые пакеты (Flask, requests, playwright, обработка файлов)
+# 1. Базовые пакеты (Flask, requests, playwright и т.д.)
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
         Flask==3.0.0 \
@@ -66,17 +67,31 @@ RUN pip install --no-cache-dir --upgrade pip && \
         python-dotenv==1.0.0 && \
     rm -rf /root/.cache/pip /tmp/* /var/tmp/*
 
-# 2. YOLO-зависимости (ultralytics + opencv-headless)
-RUN pip install --no-cache-dir \
-        ultralytics==8.0.200 \
-        opencv-python-headless==4.8.1.78 && \
-    rm -rf /root/.cache/pip /tmp/* /var/tmp/*
-
-# 3. CPU-версия torch (без CUDA — экономия ~5 ГБ)
+# 2. CPU-версия torch ПЕРВОЙ (без CUDA — экономия ~5 ГБ)
 RUN pip install --no-cache-dir \
         torch==2.1.0 \
         torchvision==0.16.0 \
         --index-url https://download.pytorch.org/whl/cpu && \
+    rm -rf /root/.cache/pip /tmp/* /var/tmp/*
+
+# 3. ultralytics БЕЗ зависимостей (--no-deps), чтобы не тянул свой torch
+RUN pip install --no-cache-dir --no-deps \
+        ultralytics==8.0.200 && \
+    rm -rf /root/.cache/pip /tmp/* /var/tmp/*
+
+# 4. Зависимости ultralytics — ЯВНО (opencv, numpy, matplotlib, scipy, pandas, seaborn, ...)
+RUN pip install --no-cache-dir \
+        opencv-python-headless==4.8.1.78 \
+        numpy==1.26.3 \
+        matplotlib==3.8.2 \
+        scipy==1.11.4 \
+        pandas==2.1.4 \
+        seaborn==0.13.0 \
+        pyyaml==6.0.1 \
+        tqdm==4.66.1 \
+        psutil==5.9.7 \
+        py-cpuinfo==9.0.0 \
+        thop==0.1.1.post2209072238 && \
     rm -rf /root/.cache/pip /tmp/* /var/tmp/*
 
 # === Chromium для Playwright ===
