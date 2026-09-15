@@ -39,7 +39,6 @@ RUN pip install --no-cache-dir --upgrade pip && \
         openpyxl==3.1.2 \
         pytz==2023.3 \
         python-dotenv==1.0.0 \
-        onnxruntime==1.16.3 \
         opencv-python-headless==4.8.1.78 \
         numpy==1.26.3 && \
     rm -rf /root/.cache/pip /tmp/* /var/tmp/*
