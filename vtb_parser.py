@@ -4,7 +4,7 @@
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
-# - Универсальный поиск цены (легковые + грузовые)
+# - Универсальный поиск цены с ожиданием JS-калькулятора
 # - info.txt = для публикации (обрезан по #изъятая)
 # - report.txt = полные данные для отчёта
 # ============================================================
@@ -190,7 +190,7 @@ class VTBParser:
     def parse_card(self, page: Page, url: str) -> Optional[Dict]:
         try:
             page.goto(url, wait_until='networkidle', timeout=PAGE_TIMEOUT)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(1500)
 
             # --- Название ---
             title = ''
@@ -201,7 +201,7 @@ class VTBParser:
                     if title:
                         break
 
-            # --- Код предложения (span с классом БЕЗ -text) ---
+            # --- Код предложения ---
             code = ''
             for sel in ['.js-auto-card-title-code',
                         'span.js-auto-card-title-code',
@@ -212,8 +212,18 @@ class VTBParser:
                     if code:
                         break
 
-            # --- Цена (разные шаблоны у VTB) ---
+            # --- Цена (калькулятор подгружается JS — ждём) ---
             price_raw = ''
+            try:
+                page.wait_for_selector(
+                    'div.t-auto-card-price, div.t-calculator-card-price',
+                    timeout=10000,
+                    state='attached'
+                )
+                page.wait_for_timeout(1500)
+            except PlaywrightTimeout:
+                logger.warning('  ⚠️ Таймаут ожидания цены (10 сек)')
+
             for sel in ['div.t-auto-card-price',
                         'div.t-calculator-card-price',
                         'div.t-auto-card-prices__head div',
@@ -227,7 +237,7 @@ class VTBParser:
 
             price = format_price(price_raw)
             if not price:
-                logger.warning('  ⚠️ Цена не найдена')
+                logger.warning('  ⚠️ Цена не найдена (пусто)')
 
             # --- Характеристики ---
             city = year = mileage = ''
