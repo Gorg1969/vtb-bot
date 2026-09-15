@@ -5,7 +5,7 @@
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
 # - Закраска номеров через YOLO (mask_plate)
-# - Категория по URL раздела (ключи НЕ используются)
+# - Категория по URL раздела
 # - info.txt = для публикации (обрезан по #изъятая)
 # - report.txt = полные данные для отчёта
 # ============================================================
@@ -145,15 +145,44 @@ class VTBParser:
         max_needed = limit * 3
 
         while pagen <= MAX_PAGES and len(urls) < max_needed:
-            page_url = f"{section['url']}?sort=dateDesc&PAGEN_1={pagen}"
+            # Учитываем, если в URL уже есть ?
+            base_url = section['url'].rstrip('/')
+            sep = '&' if '?' in base_url else '?'
+            page_url = f"{base_url}{sep}sort=dateDesc&PAGEN_1={pagen}"
+
             logger.info(f'📄 Страница {pagen}')
 
+            # 1. Открываем — ждём только DOM, не ждём «тишину сети»
             try:
-                page.goto(page_url, wait_until='networkidle', timeout=PAGE_TIMEOUT)
+                page.goto(page_url, wait_until='domcontentloaded', timeout=90000)
             except PlaywrightTimeout:
                 logger.warning(f'⚠️ Таймаут на стр. {pagen}')
                 break
 
+            # 2. Ждём появления карточек (до 30 сек)
+            try:
+                page.wait_for_selector(
+                    'a.t-market-item-slider-item',
+                    timeout=30000
+                )
+            except PlaywrightTimeout:
+                # Не появились — пробуем ещё раз после паузы
+                page.wait_for_timeout(5000)
+                cards = page.query_selector_all('a.t-market-item-slider-item')
+                if not cards:
+                    logger.info(f'⏹️ Стр. {pagen} — карточек нет')
+                    break
+
+            # 3. Скроллинг для lazy-карточек
+            try:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1500)
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+            # 4. Собираем ссылки
             cards = page.query_selector_all('a.t-market-item-slider-item')
             if not cards:
                 logger.info(f'⏹️ Стр. {pagen} пустая')
@@ -180,8 +209,8 @@ class VTBParser:
 
     def parse_card(self, page: Page, url: str) -> Optional[Dict]:
         try:
-            page.goto(url, wait_until='networkidle', timeout=PAGE_TIMEOUT)
-            page.wait_for_timeout(1500)
+            page.goto(url, wait_until='domcontentloaded', timeout=90000)
+            page.wait_for_timeout(2000)
 
             # Название
             title = ''
