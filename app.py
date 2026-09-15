@@ -812,4 +812,414 @@ def api_today_export():
     widths = {'A': 5, 'B': 12, 'C': 12, 'D': 45, 'E': 55, 'F': 35, 'G': 22, 'H': 18}
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
-    ws.freeze_panes = '
+        ws.freeze_panes = 'A3'
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f"Отчет_{today}.xlsx"
+    return send_file(
+        buf,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+# ============================================================
+# АДМИНКА — очередь, пути, папки, очистка, run_parser
+# ============================================================
+
+@app.route('/admin/queue')
+@require_admin
+def admin_queue():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM parsed_ads ORDER BY id DESC LIMIT 100')
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    for r in rows:
+        mp = r.get('media_path')
+        if mp:
+            r['path_exists'] = os.path.exists(mp)
+            try:
+                r['path_files'] = ', '.join(os.listdir(mp)[:10]) if r['path_exists'] else '—'
+            except Exception:
+                r['path_files'] = 'ошибка'
+        else:
+            r['path_exists'] = False
+            r['path_files'] = '—'
+
+    table_rows = ""
+    for r in rows:
+        exists_icon = '✅' if r['path_exists'] else '❌'
+        table_rows += f"""
+        <tr>
+            <td>{r.get('id')}</td>
+            <td>{r.get('folder_name', '—')}</td>
+            <td style="font-size:11px;color:#666">{r.get('media_path', '—')}</td>
+            <td>{exists_icon}</td>
+            <td style="font-size:11px">{r.get('path_files', '—')}</td>
+            <td>{r.get('category', '—')}</td>
+            <td>{r.get('status', '—')}</td>
+        </tr>
+        """
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>📋 Очередь парсинга ({len(rows)})</h1>
+        <a href="/admin" class="btn">← Назад</a>
+        <table>
+            <tr>
+                <th>ID</th><th>Папка</th><th>media_path</th>
+                <th>Есть?</th><th>Файлы</th>
+                <th>Категория</th><th>Статус</th>
+            </tr>
+            {table_rows}
+        </table>
+    </div>
+    """
+
+
+@app.route('/admin/check_paths')
+@require_admin
+def admin_check_paths():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, folder_name, media_path FROM parsed_ads")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    result = {'total': len(rows), 'exists': 0, 'missing': 0, 'missing_details': []}
+    for r in rows:
+        mp = r.get('media_path')
+        if mp and os.path.exists(mp):
+            result['exists'] += 1
+        else:
+            result['missing'] += 1
+            result['missing_details'].append({
+                'id': r['id'],
+                'folder': r.get('folder_name'),
+                'path': mp,
+            })
+    return jsonify(result)
+
+
+@app.route('/admin/list_folders')
+@require_admin
+def admin_list_folders():
+    if not os.path.exists(OUTPUT_DIR):
+        return jsonify({'error': f'Папка не существует: {OUTPUT_DIR}', 'files': []})
+    try:
+        files = sorted(os.listdir(OUTPUT_DIR))
+    except Exception as e:
+        return jsonify({'error': str(e), 'files': []})
+    return jsonify({'output_dir': OUTPUT_DIR, 'files': files, 'count': len(files)})
+
+
+@app.route('/admin/cleanup_orphans')
+@require_admin
+def admin_cleanup_orphans():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, folder_name, media_path FROM parsed_ads")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    deleted = 0
+    for r in rows:
+        mp = r.get('media_path')
+        if not mp or not os.path.exists(mp):
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM parsed_ads WHERE id = ?", (r['id'],))
+            conn.commit()
+            conn.close()
+            deleted += 1
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🧹 Очистка завершена</h1>
+        <p>Удалено «мёртвых» записей: <b>{deleted}</b> из <b>{len(rows)}</b></p>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>
+    """
+
+
+@app.route('/admin/clear_all')
+@require_admin
+def admin_clear_all():
+    result = {
+        'parsed_ads_deleted': 0,
+        'publications_deleted': 0,
+        'settings_deleted': 0,
+        'folders_deleted': 0,
+        'folder_errors': 0,
+    }
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        c.execute("SELECT COUNT(*) FROM parsed_ads")
+        result['parsed_ads_deleted'] = c.fetchone()[0]
+        c.execute("DELETE FROM parsed_ads")
+
+        c.execute("SELECT COUNT(*) FROM publications")
+        result['publications_deleted'] = c.fetchone()[0]
+        c.execute("DELETE FROM publications")
+
+        c.execute("SELECT COUNT(*) FROM settings")
+        result['settings_deleted'] = c.fetchone()[0]
+        c.execute("DELETE FROM settings")
+
+        conn.commit()
+        conn.close()
+        logger.info(f"🗑️ БД очищена: parsed_ads={result['parsed_ads_deleted']}, "
+                    f"publications={result['publications_deleted']}, "
+                    f"settings={result['settings_deleted']}")
+    except Exception as e:
+        logger.exception(f'❌ Ошибка очистки БД: {e}')
+
+    try:
+        if os.path.exists(OUTPUT_DIR):
+            for item in os.listdir(OUTPUT_DIR):
+                item_path = os.path.join(OUTPUT_DIR, item)
+                if os.path.isdir(item_path):
+                    try:
+                        shutil.rmtree(item_path)
+                        result['folders_deleted'] += 1
+                    except Exception as e:
+                        result['folder_errors'] += 1
+                        logger.warning(f'⚠️ Не удалить {item_path}: {e}')
+    except Exception as e:
+        logger.exception(f'❌ Ошибка очистки папок: {e}')
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🗑️ Полная очистка выполнена</h1>
+        <table>
+            <tr><th>Что</th><th>Удалено</th></tr>
+            <tr><td>Очередь парсинга (<code>parsed_ads</code>)</td><td><b>{result['parsed_ads_deleted']}</b></td></tr>
+            <tr><td>Журнал публикаций (<code>publications</code>)</td><td><b>{result['publications_deleted']}</b></td></tr>
+            <tr><td>Настройки (<code>settings</code>)</td><td><b>{result['settings_deleted']}</b></td></tr>
+            <tr><td>Папки с медиа</td><td><b>{result['folders_deleted']}</b></td></tr>
+        </table>
+        {f'<div class="error-msg">⚠️ Ошибок при удалении папок: {result["folder_errors"]}</div>' if result['folder_errors'] else ''}
+        <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+        <a href="/admin/settings" class="btn">⚙️ Проверить настройки</a>
+    </div>
+    """
+
+
+@app.route('/admin/run_parser')
+@require_admin
+def admin_run_parser():
+    limit = int(request.args.get('limit', 50))
+
+    def _run():
+        try:
+            run_parser(limit=limit)
+        except Exception as e:
+            logger.exception(f'❌ Парсер упал: {e}')
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🚀 Парсер запущен</h1>
+        <p>Лимит: <b>{limit}</b></p>
+        <p>Работает в фоне. Дождись завершения (2-5 мин).</p>
+        <a href="/admin/queue" class="btn">📋 Проверить очередь</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>
+    """
+
+
+@app.route('/admin/publish_one')
+@require_admin
+def admin_publish_one():
+    ads = bot_db.get_pending_ads(limit=1)
+    if not ads:
+        return BASE_STYLE + """
+        <div class="card">
+            <h1>⚠️ Очередь пуста</h1>
+            <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Запустить парсер (5)</a>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
+
+    ad = ads[0]
+    logger.info(f'📤 Публикация: {ad.get("folder_name")}')
+
+    try:
+        ok, message, post_link = publish_one_ad(ad)
+        if ok:
+            link_html = f'<p>🔗 <a href="{post_link}" target="_blank">{post_link}</a></p>' if post_link else ''
+            return BASE_STYLE + f"""
+            <div class="card">
+                <h1>✅ Опубликовано</h1>
+                <p><b>{ad.get('title', '')}</b></p>
+                <p>Категория: <code>{ad.get('category', '')}</code></p>
+                {link_html}
+                <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
+                <a href="/admin/publish_one" class="btn btn-orange">📤 Опубликовать ещё 1</a>
+                <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
+                <a href="/admin" class="btn btn-gray">← В админку</a>
+            </div>
+            """
+        else:
+            bot_db.mark_ad_failed(ad['id'], message)
+            return BASE_STYLE + f"""
+            <div class="card">
+                <h1>❌ Ошибка публикации</h1>
+                <p><b>{ad.get('title', '')}</b></p>
+                <div class="error-msg">{message}</div>
+                <a href="/admin/publish_one" class="btn btn-orange">Попробовать ещё</a>
+                <a href="/admin" class="btn btn-gray">← В админку</a>
+            </div>
+            """
+    except Exception as e:
+        logger.exception(f'❌ Ошибка публикации: {e}')
+        bot_db.mark_ad_failed(ad['id'], str(e))
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>❌ Ошибка</h1>
+            <div class="error-msg">{e}</div>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
+
+
+@app.route('/admin/publish_all')
+@require_admin
+def admin_publish_all():
+    def _run():
+        pause = 30
+        published = 0
+        failed = 0
+        while True:
+            ads = bot_db.get_pending_ads(limit=1)
+            if not ads:
+                break
+            ad = ads[0]
+            logger.info(f'📤 [{published+failed+1}] {ad.get("folder_name")}')
+            try:
+                ok, message, post_link = publish_one_ad(ad)
+                if ok:
+                    published += 1
+                    logger.info(f'  ✅ {message}')
+                else:
+                    failed += 1
+                    bot_db.mark_ad_failed(ad['id'], message)
+                    logger.warning(f'  ❌ {message}')
+            except Exception as e:
+                failed += 1
+                bot_db.mark_ad_failed(ad['id'], str(e))
+                logger.exception(f'  ❌ {e}')
+            if bot_db.get_pending_ads(limit=1):
+                time.sleep(pause)
+        logger.info(f'🏁 Публикация завершена: ✅ {published}, ❌ {failed}')
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    return BASE_STYLE + """
+    <div class="card">
+        <h1>📤 Публикация запущена</h1>
+        <p>Работает в фоне. Между постами пауза 30 секунд.</p>
+        <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>
+    """
+
+
+# ============================================================
+# Webhook MAX
+# ============================================================
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        data = request.get_json()
+        logger.info(f'📩 WEBHOOK: {data}')
+        if not data:
+            return jsonify({"ok": True}), 200
+
+        if data.get('update_type') == 'message_created':
+            message = data.get('message', {})
+            sender = message.get('sender', {})
+            body = message.get('body', {})
+            user_id = sender.get('user_id')
+            text = (body.get('text') or '').strip()
+
+            logger.info(f'📨 user_id={user_id}, text={text[:100]}')
+
+            if user_id and not is_allowed_user(user_id):
+                logger.warning(f'⛔ Игнор user_id={user_id}')
+                return jsonify({"ok": True}), 200
+
+            if user_id and text == '/start':
+                api.send_message(
+                    user_id,
+                    "🏠 **VTB Bot**\n\n"
+                    f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
+                    f"📅 **Опубликовано:**\n{PUBLIC_URL}/admin/today\n\n"
+                    f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
+                    f"📋 **Очередь:**\n{PUBLIC_URL}/admin/queue\n\n"
+                    "🔒 Пароль спросит браузер."
+                )
+                return jsonify({"ok": True}), 200
+
+            if user_id and text == '/status':
+                stats = bot_db.count_by_status()
+                api.send_message(
+                    user_id,
+                    f"📊 **Статус:**\n"
+                    f"⏳ В очереди: {stats.get('pending', 0)}\n"
+                    f"✅ Опубликовано: {stats.get('published', 0)}\n"
+                    f"❌ Ошибок: {stats.get('failed', 0)}"
+                )
+                return jsonify({"ok": True}), 200
+
+            if user_id and text == '/myid':
+                api.send_message(user_id, f"Твой user_id: `{user_id}`")
+                return jsonify({"ok": True}), 200
+
+            if user_id and text == '/publish':
+                ads = bot_db.get_pending_ads(limit=1)
+                if not ads:
+                    api.send_message(user_id, "⚠️ Очередь пуста")
+                else:
+                    ad = ads[0]
+                    ok, message, post_link = publish_one_ad(ad)
+                    if ok:
+                        api.send_message(user_id, f"✅ Опубликовано: {ad.get('title')}\n{post_link or ''}")
+                    else:
+                        bot_db.mark_ad_failed(ad['id'], message)
+                        api.send_message(user_id, f"❌ Ошибка: {message}")
+                return jsonify({"ok": True}), 200
+
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        logger.exception(f'❌ webhook: {e}')
+        return jsonify({"ok": False}), 500
+
+
+# ============================================================
+# Запуск
+# ============================================================
+
+if __name__ == '__main__':
+    logger.info(f'🚀 Запуск vtb-bot на порту {PORT}')
+    logger.info(f'   TOKEN: {"✅" if TOKEN else "❌"}')
+    logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
+    logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌"}')
+    logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌"}')
+    app.run(host='0.0.0.0', port=PORT, threaded=True)
