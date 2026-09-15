@@ -5,6 +5,7 @@
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
 # - Универсальный поиск цены с ожиданием JS-калькулятора
+# - Категория по URL раздела (ключи НЕ используются)
 # - info.txt = для публикации (обрезан по #изъятая)
 # - report.txt = полные данные для отчёта
 # ============================================================
@@ -64,7 +65,6 @@ def format_price(price_str: str) -> str:
 
 
 def price_to_int(price_str: str) -> int:
-    """'1 230 000' → 1230000. Если пусто → 0."""
     if not price_str:
         return 0
     digits = re.sub(r'[^\d]', '', str(price_str))
@@ -76,20 +76,30 @@ def price_to_int(price_str: str) -> int:
         return 0
 
 
-def detect_category(title: str, section: dict) -> Optional[dict]:
-    if section['key_in_title'] is None:
-        return section
-    title_norm = ' '.join(title.lower().split())
-    key_norm = ' '.join(section['key_in_title'].lower().split())
-    if key_norm in title_norm:
-        return section
-    return None
+def detect_category(url: str, sections: list) -> Optional[dict]:
+    """
+    Категория = раздел, чей URL содержится в URL карточки.
+    Более длинный URL раздела приоритетнее (чтобы /foo/bar/ не матчил /foo/).
+    """
+    url = url.rstrip('/')
+    best_match = None
+    best_len = 0
+
+    for section in sections:
+        section_url = section.get('url', '').rstrip('/')
+        if not section_url:
+            continue
+        if section_url in url:
+            if len(section_url) > best_len:
+                best_match = section
+                best_len = len(section_url)
+
+    return best_match
 
 
 def compress_image(input_path: str,
                     max_size: int = MAX_IMAGE_SIZE,
                     quality: int = JPEG_QUALITY) -> str:
-    """Ресайз + JPEG. Возвращает путь к сжатому файлу."""
     try:
         img = Image.open(input_path)
 
@@ -192,7 +202,7 @@ class VTBParser:
             page.goto(url, wait_until='networkidle', timeout=PAGE_TIMEOUT)
             page.wait_for_timeout(1500)
 
-            # --- Название ---
+            # Название
             title = ''
             for sel in ['div.t-auto-card-title h1', 'h1.t-auto-card-title', 'h1']:
                 el = page.query_selector(sel)
@@ -201,7 +211,7 @@ class VTBParser:
                     if title:
                         break
 
-            # --- Код предложения ---
+            # Код предложения
             code = ''
             for sel in ['.js-auto-card-title-code',
                         'span.js-auto-card-title-code',
@@ -212,7 +222,7 @@ class VTBParser:
                     if code:
                         break
 
-            # --- Цена (калькулятор подгружается JS — ждём) ---
+            # Цена
             price_raw = ''
             try:
                 page.wait_for_selector(
@@ -229,17 +239,21 @@ class VTBParser:
                         'div.t-auto-card-prices__head div',
                         '[class*="card-price"]']:
                 el = page.query_selector(sel)
-                if el:
-                    price_raw = normalize_text(el.inner_text())
-                    if price_raw:
-                        logger.info(f'  💵 Цена через "{sel}": {price_raw}')
-                        break
+                if not el:
+                    continue
+                text = normalize_text(el.inner_text())
+                if text and re.search(r'\d', text):
+                    price_raw = text
+                    logger.info(f'  💵 Цена через "{sel}": {price_raw}')
+                    break
+                else:
+                    logger.info(f'  ⏭️ "{sel}" = "{text[:50]}" — не цена, ищем дальше')
 
             price = format_price(price_raw)
             if not price:
-                logger.warning('  ⚠️ Цена не найдена (пусто)')
+                logger.warning('  ⚠️ Цена не найдена')
 
-            # --- Характеристики ---
+            # Характеристики
             city = year = mileage = ''
             items = page.query_selector_all(
                 'div.t-tab-content.active div.t-tab-content-column-item'
@@ -262,7 +276,7 @@ class VTBParser:
                 except Exception:
                     continue
 
-            # --- Флаги ---
+            # Флаги
             flags = set()
             for el in page.query_selector_all('div.t-market-item-flags-item'):
                 cls = el.get_attribute('class') or ''
@@ -275,7 +289,7 @@ class VTBParser:
                 if FLAG_REPAIR in cls:
                     flags.add('repair')
 
-            # --- Фото ---
+            # Фото
             photos = []
             for slider in page.query_selector_all('div.t-main-slider-slide[data-images]'):
                 data_images = slider.get_attribute('data-images')
@@ -448,7 +462,8 @@ class VTBParser:
                         break
 
                     logger.info(f'\n{"=" * 60}')
-                    logger.info(f'📂 Раздел: {section["name"]}')
+                    logger.info(f'📂 Раздел: {section["name"]} ({section["title"]})')
+                    logger.info(f'   URL: {section["url"]}')
                     logger.info(f'{"=" * 60}')
 
                     remaining = limit - saved_count
@@ -479,7 +494,7 @@ class VTBParser:
                             continue
                         logger.info(f'  ✅ Флаги ОК: {ad["flags"]}')
 
-                        # --- Фильтр по цене ---
+                        # Фильтр по цене
                         price_num = price_to_int(ad['price'])
                         if MIN_PRICE > 0 and price_num < MIN_PRICE:
                             logger.info(f'  ⏭️ Цена {price_num:,} < {MIN_PRICE:,} — пропуск'.replace(',', ' '))
@@ -494,18 +509,13 @@ class VTBParser:
                         logger.info(f'  📝 Название: "{ad["title"][:80]}"')
                         logger.info(f'  📋 Код: "{ad["code"]}"')
 
-                        detected = detect_category(ad['title'], section)
-                        if not detected:
-                            logger.info(f'  ⏭️ Не подходит под "{section["key_in_title"]}"')
-                            self.skipped_category += 1
-                            continue
-
-                        ad['category'] = detected['name']
-                        ad['chat_id'] = detected['chat_id']
-                        logger.info(f'  📂 {detected["name"]} → {detected["chat_id"]}')
+                        # Категория — по URL карточки (мы уже внутри нужного раздела)
+                        ad['category'] = section['name']
+                        ad['chat_id'] = section['chat_id']
+                        logger.info(f'  📂 {section["name"]} → {section["chat_id"]}')
 
                         self.processed += 1
-                        folder = self.save_ad_media(ad, self.processed, detected)
+                        folder = self.save_ad_media(ad, self.processed, section)
                         if not folder:
                             self.errors += 1
                             continue
@@ -531,7 +541,7 @@ class VTBParser:
         logger.info(f'  ⏭️ Дублей: {self.skipped_dup}')
         logger.info(f'  🚫 Флаги: {self.skipped_flags}')
         logger.info(f'  💰 Цена не подошла: {self.skipped_price}')
-        logger.info(f'  📂 Категория: {self.skipped_category}')
+        logger.info(f'  📂 Категория не определена: {self.skipped_category}')
         logger.info(f'  ❌ Ошибок: {self.errors}')
         logger.info(f'  💾 В очередь: {saved_count}')
         logger.info('=' * 60)
