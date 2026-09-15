@@ -4,7 +4,7 @@
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
-# - Универсальный поиск цены с ожиданием JS-калькулятора
+# - Закраска номеров через YOLO (mask_plate)
 # - Категория по URL раздела (ключи НЕ используются)
 # - info.txt = для публикации (обрезан по #изъятая)
 # - report.txt = полные данные для отчёта
@@ -30,7 +30,9 @@ from config import (
     FLAG_BUY_AVAILABLE, PAGE_TIMEOUT, CARD_DELAY, SHEETS_URL,
     get_sections_from_db,
     MIN_PRICE, MAX_PRICE,
+    MASK_PLATES, PLATE_MODEL_PATH, PLATE_CONFIDENCE, PLATE_PADDING,
 )
+from plate_mask import mask_plate
 from sheets_client import SheetsClient
 from db import BotDB
 
@@ -74,27 +76,6 @@ def price_to_int(price_str: str) -> int:
         return int(digits)
     except ValueError:
         return 0
-
-
-def detect_category(url: str, sections: list) -> Optional[dict]:
-    """
-    Категория = раздел, чей URL содержится в URL карточки.
-    Более длинный URL раздела приоритетнее (чтобы /foo/bar/ не матчил /foo/).
-    """
-    url = url.rstrip('/')
-    best_match = None
-    best_len = 0
-
-    for section in sections:
-        section_url = section.get('url', '').rstrip('/')
-        if not section_url:
-            continue
-        if section_url in url:
-            if len(section_url) > best_len:
-                best_match = section
-                best_len = len(section_url)
-
-    return best_match
 
 
 def compress_image(input_path: str,
@@ -222,7 +203,7 @@ class VTBParser:
                     if code:
                         break
 
-            # Цена
+            # Цена (ждём JS-калькулятор)
             price_raw = ''
             try:
                 page.wait_for_selector(
@@ -246,8 +227,6 @@ class VTBParser:
                     price_raw = text
                     logger.info(f'  💵 Цена через "{sel}": {price_raw}')
                     break
-                else:
-                    logger.info(f'  ⏭️ "{sel}" = "{text[:50]}" — не цена, ищем дальше')
 
             price = format_price(price_raw)
             if not price:
@@ -365,6 +344,23 @@ class VTBParser:
                     if os.path.exists(final_path):
                         os.remove(final_path)
                     os.rename(jpeg_path, final_path)
+
+                # --- Закраска номера ---
+                if MASK_PLATES:
+                    try:
+                        with open(final_path, 'rb') as f:
+                            original = f.read()
+                        masked = mask_plate(
+                            original,
+                            model_path=PLATE_MODEL_PATH,
+                            confidence=PLATE_CONFIDENCE,
+                            padding=PLATE_PADDING,
+                        )
+                        with open(final_path, 'wb') as f:
+                            f.write(masked)
+                    except Exception as e:
+                        logger.warning(f'⚠️ Ошибка закраски {final_path}: {e}')
+
                 downloaded += 1
             else:
                 if os.path.exists(temp_path):
@@ -436,6 +432,7 @@ class VTBParser:
         logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
         logger.info(f'   Сжатие: max {MAX_IMAGE_SIZE}px, JPEG q={JPEG_QUALITY}')
         logger.info(f'   Фильтр цены: MIN={MIN_PRICE:,} MAX={MAX_PRICE or "∞"}'.replace(',', ' '))
+        logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES else "ВЫКЛ"}')
         logger.info('=' * 60)
 
         self.sheets.get_all_urls()
@@ -509,7 +506,7 @@ class VTBParser:
                         logger.info(f'  📝 Название: "{ad["title"][:80]}"')
                         logger.info(f'  📋 Код: "{ad["code"]}"')
 
-                        # Категория — по URL карточки (мы уже внутри нужного раздела)
+                        # Категория — по URL раздела
                         ad['category'] = section['name']
                         ad['chat_id'] = section['chat_id']
                         logger.info(f'  📂 {section["name"]} → {section["chat_id"]}')
