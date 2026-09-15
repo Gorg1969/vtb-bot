@@ -4,10 +4,9 @@
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
-# - Закраска номеров через YOLO (mask_plate)
 # - Категория по URL раздела
-# - info.txt = для публикации (обрезан по #изъятая)
-# - report.txt = полные данные для отчёта
+# - info.txt = для публикации, report.txt = для отчёта
+# - Закраска номеров: ВРЕМЕННО ОТКЛЮЧЕНА
 # ============================================================
 
 import os
@@ -32,7 +31,6 @@ from config import (
     MIN_PRICE, MAX_PRICE,
     MASK_PLATES, PLATE_MODEL_PATH, PLATE_CONFIDENCE, PLATE_PADDING,
 )
-from plate_mask import mask_plate
 from sheets_client import SheetsClient
 from db import BotDB
 
@@ -42,6 +40,17 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# === Опциональный импорт plate_mask (если недоступен — заглушка) ===
+try:
+    from plate_mask import mask_plate
+    MASK_AVAILABLE = True
+except ImportError:
+    MASK_AVAILABLE = False
+    logger.warning('⚠️ plate_mask недоступен — закраска отключена')
+
+    def mask_plate(image_bytes, **kwargs):
+        return image_bytes
 
 MAX_IMAGE_SIZE = 1080
 JPEG_QUALITY = 85
@@ -145,35 +154,33 @@ class VTBParser:
         max_needed = limit * 3
 
         while pagen <= MAX_PAGES and len(urls) < max_needed:
-            # Учитываем, если в URL уже есть ?
             base_url = section['url'].rstrip('/')
             sep = '&' if '?' in base_url else '?'
             page_url = f"{base_url}{sep}sort=dateDesc&PAGEN_1={pagen}"
 
             logger.info(f'📄 Страница {pagen}')
 
-            # 1. Открываем — ждём только DOM, не ждём «тишину сети»
             try:
                 page.goto(page_url, wait_until='domcontentloaded', timeout=90000)
             except PlaywrightTimeout:
                 logger.warning(f'⚠️ Таймаут на стр. {pagen}')
                 break
+            except Exception as e:
+                logger.error(f'❌ Ошибка загрузки стр. {pagen}: {e}')
+                break
 
-            # 2. Ждём появления карточек (до 30 сек)
             try:
                 page.wait_for_selector(
                     'a.t-market-item-slider-item',
                     timeout=30000
                 )
             except PlaywrightTimeout:
-                # Не появились — пробуем ещё раз после паузы
                 page.wait_for_timeout(5000)
                 cards = page.query_selector_all('a.t-market-item-slider-item')
                 if not cards:
                     logger.info(f'⏹️ Стр. {pagen} — карточек нет')
                     break
 
-            # 3. Скроллинг для lazy-карточек
             try:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(1500)
@@ -182,7 +189,6 @@ class VTBParser:
             except Exception:
                 pass
 
-            # 4. Собираем ссылки
             cards = page.query_selector_all('a.t-market-item-slider-item')
             if not cards:
                 logger.info(f'⏹️ Стр. {pagen} пустая')
@@ -221,7 +227,7 @@ class VTBParser:
                     if title:
                         break
 
-            # Код предложения
+            # Код
             code = ''
             for sel in ['.js-auto-card-title-code',
                         'span.js-auto-card-title-code',
@@ -232,7 +238,7 @@ class VTBParser:
                     if code:
                         break
 
-            # Цена (ждём JS-калькулятор)
+            # Цена
             price_raw = ''
             try:
                 page.wait_for_selector(
@@ -374,8 +380,8 @@ class VTBParser:
                         os.remove(final_path)
                     os.rename(jpeg_path, final_path)
 
-                # --- Закраска номера ---
-                if MASK_PLATES:
+                # Закраска — только если включена и доступна
+                if MASK_PLATES and MASK_AVAILABLE:
                     try:
                         with open(final_path, 'rb') as f:
                             original = f.read()
@@ -461,7 +467,7 @@ class VTBParser:
         logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
         logger.info(f'   Сжатие: max {MAX_IMAGE_SIZE}px, JPEG q={JPEG_QUALITY}')
         logger.info(f'   Фильтр цены: MIN={MIN_PRICE:,} MAX={MAX_PRICE or "∞"}'.replace(',', ' '))
-        logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES else "ВЫКЛ"}')
+        logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES and MASK_AVAILABLE else "ВЫКЛ"}')
         logger.info('=' * 60)
 
         self.sheets.get_all_urls()
@@ -520,7 +526,6 @@ class VTBParser:
                             continue
                         logger.info(f'  ✅ Флаги ОК: {ad["flags"]}')
 
-                        # Фильтр по цене
                         price_num = price_to_int(ad['price'])
                         if MIN_PRICE > 0 and price_num < MIN_PRICE:
                             logger.info(f'  ⏭️ Цена {price_num:,} < {MIN_PRICE:,} — пропуск'.replace(',', ' '))
@@ -535,7 +540,6 @@ class VTBParser:
                         logger.info(f'  📝 Название: "{ad["title"][:80]}"')
                         logger.info(f'  📋 Код: "{ad["code"]}"')
 
-                        # Категория — по URL раздела
                         ad['category'] = section['name']
                         ad['chat_id'] = section['chat_id']
                         logger.info(f'  📂 {section["name"]} → {section["chat_id"]}')
