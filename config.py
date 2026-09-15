@@ -26,31 +26,43 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/app/data/VTB_Объявления")
 DB_PATH = os.environ.get("DB_PATH", "/app/data/vtb_parser.db")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 
-# === Разделы сайта VTB (значения по умолчанию) ===
-# chat_id можно переопределить в админке (хранятся в БД)
+# === Разделы сайта VTB ===
+# Категория определяется по URL раздела — ключи в названии НЕ используются.
+# Все категории должны иметь УНИКАЛЬНЫЙ URL.
 SECTIONS = [
-    {
-        'name': 'car',
-        'title': 'Легковые',
-        'url': 'https://www.vtb-leasing.ru/auto-market/sale/car/',
-        'chat_id': '-73112487086609',
-        'key_in_title': None,
-        'enabled': True,
-    },
     {
         'name': 'truck_samosval',
         'title': 'Самосвалы',
-        'url': 'https://www.vtb-leasing.ru/auto-market/sale/truck/',
+        'url': 'https://www.vtb-leasing.ru/auto-market/f/type-is-2/subtype_truck-is-569a697f8a2174b34fadc4bfcf45dd51/',
         'chat_id': '-73112596204049',
-        'key_in_title': 'самосвал',
         'enabled': True,
     },
     {
         'name': 'truck_sedelny',
         'title': 'Седельные тягачи',
-        'url': 'https://www.vtb-leasing.ru/auto-market/sale/truck/',
+        'url': 'https://www.vtb-leasing.ru/auto-market/f/type-is-2/subtype_truck-is-0f039d32dc77df2bac4071f3956c09ca/',
         'chat_id': '-69959827081745',
-        'key_in_title': 'седельный тягач',
+        'enabled': True,
+    },
+    {
+        'name': 'buldozer',
+        'title': 'Бульдозеры',
+        'url': 'https://www.vtb-leasing.ru/auto-market/f/type-is-6/subtype_special-is-b1e156e60e6bc31171c4089dbfa293eb/',
+        'chat_id': '-73112403724817',
+        'enabled': True,
+    },
+    {
+        'name': 'excavator',
+        'title': 'Экскаваторы',
+        'url': 'https://www.vtb-leasing.ru/auto-market/f/type-is-6/subtype_special-is-4b49d2ec4e6a23d1e277c2a3eaf893ee/',
+        'chat_id': '-73112403724817',
+        'enabled': True,
+    },
+    {
+        'name': 'grader',
+        'title': 'Грейдеры',
+        'url': 'https://www.vtb-leasing.ru/auto-market/f/type-is-6/subtype_special-is-e063efe897e18a8291c411cf537b1fd1/',
+        'chat_id': '-73112403724817',
         'enabled': True,
     },
 ]
@@ -60,9 +72,9 @@ INITIAL_LIMIT = 300
 MAX_PHOTOS_PER_AD = 5
 MAX_PAGES = 200
 
-# === Фильтры объявлений ===
-MIN_PRICE = 2_500_000     # минимальная цена (₽), меньше — пропускаем
-MAX_PRICE = 0             # максимальная цена (0 = без ограничения)
+# === Фильтр по цене ===
+MIN_PRICE = 2_500_000     # минимальная цена (₽); 0 = без ограничения
+MAX_PRICE = 0             # максимальная цена (₽); 0 = без ограничения
 
 # === Флаги (CSS-классы на карточке VTB) ===
 FLAG_IN_STOCK = 't-in_stock'
@@ -85,11 +97,8 @@ CARD_DELAY = 0.5
 # ============================================================
 
 def get_sections_from_db(db=None):
-    """
-    Возвращает SECTIONS с chat_id, переопределёнными из БД.
-    Если db не передан или значение не задано — берём из config.py.
-    """
-    sections = [dict(s) for s in SECTIONS]  # копия
+    """SECTIONS с chat_id, переопределёнными из БД."""
+    sections = [dict(s) for s in SECTIONS]
 
     if db is None:
         return sections
