@@ -40,7 +40,6 @@ class SheetsClient:
                     allow_redirects=True,
                 )
 
-                # 404 от CDN (script.googleusercontent.com) — пробуем ещё раз
                 if resp.status_code == 404:
                     logger.warning(f'⚠️ 404 от Google CDN (попытка {attempt})')
                     if attempt < self.max_retries:
@@ -57,7 +56,6 @@ class SheetsClient:
                         continue
                     return set()
 
-                # Парсим JSON
                 try:
                     data = resp.json()
                 except Exception as je:
