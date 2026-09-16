@@ -6,7 +6,8 @@
 # - Фильтр по цене: MIN_PRICE <= цена
 # - Категория по URL раздела
 # - Название обрезается перед годом
-# - Пагинация: ?sort=dateDesc&PAGEN_1=N
+# - Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2
+#   ВАЖНО: sort=dateDesc ЛОМАЕТ пагинацию, поэтому его НЕТ
 # - info.txt = для публикации, report.txt = для отчёта
 # ============================================================
 
@@ -160,7 +161,14 @@ class VTBParser:
                                    limit: int) -> List[str]:
         """
         Обходит страницы раздела.
-        Формат URL: <base>/?sort=dateDesc&PAGEN_1=N
+
+        Пагинация VTB-Лизинг (проверено вручную):
+          - стр. 1  →  <base>/                        (чистый URL)
+          - стр. N  →  <base>/?PAGEN_1=N              (N >= 2)
+
+        ВАЖНО: параметр sort=dateDesc ЛОМАЕТ пагинацию — сайт
+        игнорирует PAGEN_1 и всегда отдаёт стр. 1. Поэтому sort
+        в URL больше НЕ добавляем.
         """
         urls = []
         pagen = 1
@@ -170,15 +178,18 @@ class VTBParser:
             base_url += '/'
 
         max_cards = max(limit * 3, MAX_CARDS_PER_SECTION)
+        prev_first_url = None
 
         while pagen <= MAX_PAGES and len(urls) < max_cards:
+            # === ФОРМИРОВАНИЕ URL ===
             if pagen == 1:
-                page_url = f"{base_url}?sort=dateDesc"
+                page_url = base_url                       # чистый URL = стр. 1
             else:
-                page_url = f"{base_url}?sort=dateDesc&PAGEN_1={pagen}"
+                page_url = f"{base_url}?PAGEN_1={pagen}"  # стр. 2, 3, 4, ...
 
-            logger.info(f'📄 Страница {pagen}')
+            logger.info(f'📄 Страница {pagen}: {page_url}')
 
+            # === ЗАГРУЗКА ===
             try:
                 page.goto(page_url, wait_until='domcontentloaded', timeout=90000)
             except PlaywrightTimeout:
@@ -191,13 +202,40 @@ class VTBParser:
             try:
                 page.wait_for_selector('a.t-market-item-slider-item', timeout=30000)
             except PlaywrightTimeout:
-                page.wait_for_timeout(5000)
-                cards = page.query_selector_all('a.t-market-item-slider-item')
-                if not cards:
-                    logger.info(f'⏹️ Стр. {pagen} — карточек нет (конец раздела)')
-                    break
+                logger.info(f'⏹️ Стр. {pagen} — карточек нет (конец раздела)')
+                break
 
-            # Скроллинг для lazy-карточек
+            # === ЖДЁМ СМЕНЫ DOM (защита от старой страницы) ===
+            if pagen > 1 and prev_first_url:
+                dom_updated = False
+                for attempt in range(15):
+                    page.wait_for_timeout(1000)
+                    first_card = page.query_selector('a.t-market-item-slider-item')
+                    if first_card:
+                        href = first_card.get_attribute('href')
+                        if href:
+                            if href.startswith('/'):
+                                href = 'https://www.vtb-leasing.ru' + href
+                            if href != prev_first_url:
+                                logger.info(f'  ✓ DOM обновился (attempt {attempt + 1})')
+                                dom_updated = True
+                                break
+
+                if not dom_updated:
+                    logger.warning(
+                        f'⚠️ Стр. {pagen}: DOM не обновился за 15 сек, '
+                        f'пробуем reload'
+                    )
+                    try:
+                        page.reload(wait_until='domcontentloaded', timeout=60000)
+                        page.wait_for_selector(
+                            'a.t-market-item-slider-item', timeout=30000
+                        )
+                        page.wait_for_timeout(3000)
+                    except Exception as e:
+                        logger.warning(f'⚠️ reload не помог: {e}')
+
+            # === СКРОЛЛ ДЛЯ LAZY-LOAD ===
             try:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(1500)
@@ -206,6 +244,7 @@ class VTBParser:
             except Exception:
                 pass
 
+            # === СБОР ССЫЛОК ===
             cards = page.query_selector_all('a.t-market-item-slider-item')
             if not cards:
                 logger.info(f'⏹️ Стр. {pagen} пустая')
@@ -219,15 +258,27 @@ class VTBParser:
                         href = 'https://www.vtb-leasing.ru' + href
                     page_urls.append(href)
 
-            # Защита от зацикливания: если все URL уже видели — стоп
-            if pagen > 1 and page_urls:
+            if not page_urls:
+                break
+
+            prev_first_url = page_urls[0]
+
+            # === ПРОВЕРКА НА НОВЫЕ URL ===
+            if pagen > 1:
                 new_on_page = [u for u in page_urls if u not in urls]
                 if len(new_on_page) == 0:
-                    logger.warning(f'⚠️ Стр. {pagen} — все URL дублируются, стоп')
+                    logger.warning(
+                        f'⚠️ Стр. {pagen} — все URL дублируются, стоп'
+                    )
                     break
+                logger.info(
+                    f'  → {len(page_urls)} карточек, '
+                    f'из них новых {len(new_on_page)}'
+                )
+            else:
+                logger.info(f'  → {len(page_urls)} карточек')
 
             urls.extend(page_urls)
-            logger.info(f'  → {len(page_urls)} карточек (всего: {len(urls)})')
             pagen += 1
 
         return urls
@@ -495,6 +546,7 @@ class VTBParser:
         logger.info(f'   Сжатие: max {MAX_IMAGE_SIZE}px, JPEG q={JPEG_QUALITY}')
         logger.info(f'   Фильтр цены: MIN={MIN_PRICE:,} MAX={MAX_PRICE or "∞"}'.replace(',', ' '))
         logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES and MASK_AVAILABLE else "ВЫКЛ"}')
+        logger.info(f'   Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2')
         logger.info('=' * 60)
 
         self.sheets.get_all_urls()
