@@ -44,7 +44,7 @@ class SheetsClient:
                 if resp.status_code == 404:
                     logger.warning(f'⚠️ 404 от Google CDN (попытка {attempt})')
                     if attempt < self.max_retries:
-                        time.sleep(5)
+                        time.sleep(2)
                         continue
                     else:
                         logger.error('❌ Все попытки исчерпаны, дедуп не работает')
@@ -84,14 +84,14 @@ class SheetsClient:
             except requests.exceptions.Timeout:
                 logger.error(f'❌ Таймаут Google Sheets (попытка {attempt})')
                 if attempt < self.max_retries:
-                    time.sleep(5)
+                    time.sleep(3)
                     continue
                 return set()
 
             except Exception as e:
                 logger.error(f'❌ Ошибка Google Sheets: {e}')
                 if attempt < self.max_retries:
-                    time.sleep(5)
+                    time.sleep(3)
                     continue
                 return set()
 
@@ -117,7 +117,7 @@ class SheetsClient:
                 if resp.status_code == 404:
                     logger.warning(f'⚠️ 404 checkBulk (попытка {attempt})')
                     if attempt < self.max_retries:
-                        time.sleep(5)
+                        time.sleep(2)
                         continue
                     return {'duplicates': [], 'new': urls}
 
