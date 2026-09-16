@@ -10,6 +10,10 @@ import logging
 import argparse
 from datetime import datetime
 
+# Отключаем спам от urllib3 про непроверенные HTTPS
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 os.environ.setdefault('TZ', 'Europe/Moscow')
 try:
     import time
