@@ -1,4 +1,4 @@
-# sheets_client.py
+# sheets_client.py 2
 # ============================================================
 # Клиент Google Apps Script (для дедупа)
 # С retry и обходом CDN-редиректа (404 от script.googleusercontent.com)
