@@ -828,9 +828,7 @@ def admin_settings():
         </div>
     </form>
     """
-
-
-# ============================================================
+    # ============================================================
 # АДМИНКА — Опубликовано сегодня
 # ============================================================
 
@@ -1248,14 +1246,14 @@ def admin_clear_all():
 
 
 # ============================================================
-# ХРАНИЛИЩЕ PID ПАРСЕРА (защита от двойного запуска)
+# Защита от двойного запуска парсера
 # ============================================================
 
 _PARSER_PID = [None]
 
 
 def parser_is_running() -> bool:
-    """Проверяет, жив ли процесс парсера, запущенный ИМЕННО ЭТИМ Flask-процессом."""
+    """Жив ли процесс парсера, запущенный ИМЕННО этим Flask-процессом."""
     pid = _PARSER_PID[0]
     if pid is None:
         return False
@@ -1278,7 +1276,6 @@ def admin_run_parser():
     """
     limit = int(request.args.get('limit', 50))
 
-    # Проверяем, не запущен ли уже парсер
     if parser_is_running():
         return BASE_STYLE + """
         <div class="card">
@@ -1289,18 +1286,15 @@ def admin_run_parser():
         """
 
     log_path = '/tmp/parser_subprocess.log'
-    try:
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    except Exception:
-        log_path = '/tmp/parser_subprocess.log'
 
     try:
         log_file = open(log_path, 'a', encoding='utf-8')
         proc = subprocess.Popen(
-            [sys.executable, '-m', 'parser_runner', '--limit', str(limit)],
+            [sys.executable, '-u', '-m', 'parser_runner', '--limit', str(limit)],
             stdout=log_file,
             stderr=subprocess.STDOUT,
             cwd=os.path.dirname(os.path.abspath(__file__)),
+            bufsize=1,
         )
         _PARSER_PID[0] = proc.pid
         logger.info(f'🚀 Парсер запущен PID={proc.pid}, лимит={limit}, лог={log_path}')
