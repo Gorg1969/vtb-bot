@@ -1,7 +1,8 @@
 # app.py
 # ============================================================
-# vtb-bot — Flask-сервер (часть 1/2)
+# vtb-bot — Flask-сервер (проект 1)
 # + автопубликация по расписанию
+# + парсер в отдельном процессе (экономия RAM)
 # ============================================================
 
 import os
@@ -12,9 +13,12 @@ try:
 except AttributeError:
     pass
 
+import gc
 import sqlite3
 import logging
 import shutil
+import subprocess
+import sys
 import urllib3
 import threading
 import random
@@ -329,12 +333,11 @@ def publish_one_ad(ad: dict) -> tuple:
 # Автопубликация по расписанию (фоновый поток)
 # ============================================================
 
-AUTOPUBLISH_ENABLED = [False]   # список, чтобы можно было менять из потоков
-AUTOPUBLISH_THREAD = [None]     # ссылка на поток
+AUTOPUBLISH_ENABLED = [False]
+AUTOPUBLISH_THREAD = [None]
 
 
 def get_schedule_params():
-    """Возвращает (start_h, start_m, end_h, end_m, daily_limit)."""
     sched = get_schedule_from_db(bot_db)
     try:
         sh, sm = [int(x) for x in sched.get('start', '06:00').split(':')]
@@ -352,7 +355,6 @@ def get_schedule_params():
 
 
 def count_today_publications() -> int:
-    """Сколько публикаций за сегодня (в МСК)."""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -370,11 +372,6 @@ def count_today_publications() -> int:
 
 
 def calc_interval_seconds(limit: int):
-    """
-    Средний интервал между постами = длина окна / лимит.
-    Окно: 06:00–20:00 = 14 часов = 50400 секунд.
-    Возвращает (min_interval, max_interval) со случайным разбросом ±30%.
-    """
     sh, sm, eh, em, _ = get_schedule_params()
     window_seconds = (eh * 3600 + em * 60) - (sh * 3600 + sm * 60)
     if window_seconds <= 0:
@@ -392,7 +389,6 @@ def calc_interval_seconds(limit: int):
 
 
 def is_in_schedule_window():
-    """Внутри окна 06:00–20:00 МСК?"""
     now_msk = datetime.now(MOSCOW_TZ)
     sh, sm, eh, em, _ = get_schedule_params()
     start_min = sh * 60 + sm
@@ -402,7 +398,6 @@ def is_in_schedule_window():
 
 
 def seconds_until_window_start():
-    """Сколько секунд до начала окна (06:00 МСК)."""
     now_msk = datetime.now(MOSCOW_TZ)
     sh, sm, eh, em, _ = get_schedule_params()
     today_start = now_msk.replace(hour=sh, minute=sm, second=0, microsecond=0)
@@ -412,11 +407,20 @@ def seconds_until_window_start():
     return int((today_start - now_msk).total_seconds())
 
 
+def _sleep_with_check(seconds: int):
+    """
+    Спит `seconds` секунд, но просыпается раз в 5 сек,
+    чтобы проверить флаг AUTOPUBLISH_ENABLED.
+    Не грузит CPU (time.sleep), просто короче проверки.
+    """
+    elapsed = 0
+    while elapsed < seconds and AUTOPUBLISH_ENABLED[0]:
+        chunk = min(5, seconds - elapsed)
+        time.sleep(chunk)
+        elapsed += chunk
+
+
 def auto_publish_loop():
-    """
-    Главный цикл автопубликации.
-    Работает, пока AUTOPUBLISH_ENABLED[0] = True.
-    """
     logger.info('🚀 Автопубликация: поток запущен')
 
     while AUTOPUBLISH_ENABLED[0]:
@@ -425,10 +429,7 @@ def auto_publish_loop():
             if not is_in_schedule_window():
                 wait_sec = min(seconds_until_window_start(), 3600)
                 logger.info(f'⏰ Вне окна расписания. Ждём {wait_sec} сек')
-                for _ in range(wait_sec):
-                    if not AUTOPUBLISH_ENABLED[0]:
-                        break
-                    time.sleep(1)
+                _sleep_with_check(wait_sec)
                 continue
 
             # 2. Проверка дневного лимита
@@ -437,20 +438,14 @@ def auto_publish_loop():
             if today_count >= limit:
                 logger.info(f'⏹ Дневной лимит {limit} достигнут. Ждём до 06:00')
                 wait_sec = min(seconds_until_window_start(), 3600)
-                for _ in range(wait_sec):
-                    if not AUTOPUBLISH_ENABLED[0]:
-                        break
-                    time.sleep(1)
+                _sleep_with_check(wait_sec)
                 continue
 
             # 3. Берём 1 объявление из очереди
             ads = bot_db.get_pending_ads(limit=1)
             if not ads:
                 logger.info('📭 Очередь пуста. Ждём 60 сек')
-                for _ in range(60):
-                    if not AUTOPUBLISH_ENABLED[0]:
-                        break
-                    time.sleep(1)
+                _sleep_with_check(60)
                 continue
 
             ad = ads[0]
@@ -467,18 +462,18 @@ def auto_publish_loop():
                 logger.exception(f'  ❌ Ошибка публикации: {e}')
                 bot_db.mark_ad_failed(ad['id'], str(e))
 
+            # === ОСВОБОЖДАЕМ ПАМЯТЬ ПОСЛЕ ПУБЛИКАЦИИ ===
+            gc.collect()
+
             # 4. Пауза со случайным разбросом
             min_i, max_i = calc_interval_seconds(limit)
             pause = random.randint(min_i, max_i)
             logger.info(f'⏸ Пауза {pause} сек до следующего поста')
-            for _ in range(pause):
-                if not AUTOPUBLISH_ENABLED[0]:
-                    break
-                time.sleep(1)
+            _sleep_with_check(pause)
 
         except Exception as e:
             logger.exception(f'❌ Ошибка в auto_publish_loop: {e}')
-            time.sleep(60)
+            _sleep_with_check(60)
 
     logger.info('⏹ Автопубликация остановлена')
 
@@ -733,6 +728,7 @@ def admin_page():
         <a href="/admin/run_parser?limit=5" class="btn btn-green">Тест (5)</a>
         <a href="/admin/run_parser?limit=50" class="btn btn-green">50</a>
         <a href="/admin/run_parser?limit=300" class="btn btn-green">300</a>
+        <p class="hint">Парсер запускается в отдельном процессе — после завершения память освобождается</p>
     </div>
 
     <div class="card">
@@ -769,10 +765,7 @@ def admin_page():
         </table>
     </div>
     """
-    
-# ============================================================
-# АДМИНКА — переключатель автопубликации
-# ============================================================
+
 
 @app.route('/admin/toggle_autopublish')
 @require_admin
@@ -1267,25 +1260,70 @@ def admin_clear_all():
 @app.route('/admin/run_parser')
 @require_admin
 def admin_run_parser():
+    """
+    Запуск парсера в ОТДЕЛЬНОМ процессе.
+    После завершения память полностью освобождается ОС.
+    """
     limit = int(request.args.get('limit', 50))
 
-    def _run():
-        try:
-            run_parser(limit=limit)
-        except Exception as e:
-            logger.exception(f'❌ Парсер упал: {e}')
+    # Проверяем, не запущен ли уже парсер
+    if parser_is_running():
+        return BASE_STYLE + """
+        <div class="card">
+            <h1>⚠️ Парсер уже запущен</h1>
+            <p>Дождитесь завершения текущего процесса.</p>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
 
-    threading.Thread(target=_run, daemon=True).start()
+    log_path = os.path.join(LOG_DIR if 'LOG_DIR' in dir() else '/tmp', 'parser_subprocess.log')
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    except Exception:
+        log_path = '/tmp/parser_subprocess.log'
 
-    return BASE_STYLE + f"""
-    <div class="card">
-        <h1>🚀 Парсер запущен</h1>
-        <p>Лимит: <b>{limit}</b></p>
-        <p>Работает в фоне. Дождись завершения (2-5 мин).</p>
-        <a href="/admin/queue" class="btn">📋 Проверить очередь</a>
-        <a href="/admin" class="btn btn-gray">← В админку</a>
-    </div>
-    """
+    try:
+        log_file = open(log_path, 'a', encoding='utf-8')
+        proc = subprocess.Popen(
+            [sys.executable, '-m', 'parser_runner', '--limit', str(limit)],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        logger.info(f'🚀 Парсер запущен PID={proc.pid}, лимит={limit}, лог={log_path}')
+
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>🚀 Парсер запущен (отдельный процесс)</h1>
+            <p>PID: <b>{proc.pid}</b></p>
+            <p>Лимит: <b>{limit}</b></p>
+            <p>Лог: <code>{log_path}</code></p>
+            <p class="hint">После завершения процесс умрёт, и вся память вернётся ОС. Это не помешает другим ботам на Bothost.</p>
+            <a href="/admin/queue" class="btn">📋 Проверить очередь</a>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
+    except Exception as e:
+        logger.exception(f'❌ Не удалось запустить парсер: {e}')
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>❌ Ошибка запуска парсера</h1>
+            <div class="error-msg">{e}</div>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
+
+
+def parser_is_running() -> bool:
+    """Проверяет, есть ли живой процесс parser_runner."""
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', 'parser_runner'],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
 
 
 @app.route('/admin/publish_one')
@@ -1419,7 +1457,6 @@ def webhook():
 # ============================================================
 
 def init_autopublish():
-    """При старте — если в БД стоит autopublish_enabled=1, запускаем поток."""
     enabled = bot_db.get_setting('autopublish_enabled', '0')
     if enabled == '1':
         logger.info('🔁 Автопубликация была включена — запускаем поток')
