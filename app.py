@@ -408,11 +408,6 @@ def seconds_until_window_start():
 
 
 def _sleep_with_check(seconds: int):
-    """
-    Спит `seconds` секунд, но просыпается раз в 5 сек,
-    чтобы проверить флаг AUTOPUBLISH_ENABLED.
-    Не грузит CPU (time.sleep), просто короче проверки.
-    """
     elapsed = 0
     while elapsed < seconds and AUTOPUBLISH_ENABLED[0]:
         chunk = min(5, seconds - elapsed)
@@ -425,14 +420,12 @@ def auto_publish_loop():
 
     while AUTOPUBLISH_ENABLED[0]:
         try:
-            # 1. Проверка окна
             if not is_in_schedule_window():
                 wait_sec = min(seconds_until_window_start(), 3600)
                 logger.info(f'⏰ Вне окна расписания. Ждём {wait_sec} сек')
                 _sleep_with_check(wait_sec)
                 continue
 
-            # 2. Проверка дневного лимита
             sh, sm, eh, em, limit = get_schedule_params()
             today_count = count_today_publications()
             if today_count >= limit:
@@ -441,7 +434,6 @@ def auto_publish_loop():
                 _sleep_with_check(wait_sec)
                 continue
 
-            # 3. Берём 1 объявление из очереди
             ads = bot_db.get_pending_ads(limit=1)
             if not ads:
                 logger.info('📭 Очередь пуста. Ждём 60 сек')
@@ -462,10 +454,8 @@ def auto_publish_loop():
                 logger.exception(f'  ❌ Ошибка публикации: {e}')
                 bot_db.mark_ad_failed(ad['id'], str(e))
 
-            # === ОСВОБОЖДАЕМ ПАМЯТЬ ПОСЛЕ ПУБЛИКАЦИИ ===
             gc.collect()
 
-            # 4. Пауза со случайным разбросом
             min_i, max_i = calc_interval_seconds(limit)
             pause = random.randint(min_i, max_i)
             logger.info(f'⏸ Пауза {pause} сек до следующего поста')
@@ -1257,6 +1247,28 @@ def admin_clear_all():
     """
 
 
+# ============================================================
+# ХРАНИЛИЩЕ PID ПАРСЕРА (защита от двойного запуска)
+# ============================================================
+
+_PARSER_PID = [None]
+
+
+def parser_is_running() -> bool:
+    """Проверяет, жив ли процесс парсера, запущенный ИМЕННО ЭТИМ Flask-процессом."""
+    pid = _PARSER_PID[0]
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        _PARSER_PID[0] = None
+        return False
+    except PermissionError:
+        return True
+
+
 @app.route('/admin/run_parser')
 @require_admin
 def admin_run_parser():
@@ -1276,7 +1288,7 @@ def admin_run_parser():
         </div>
         """
 
-    log_path = os.path.join(LOG_DIR if 'LOG_DIR' in dir() else '/tmp', 'parser_subprocess.log')
+    log_path = '/tmp/parser_subprocess.log'
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
     except Exception:
@@ -1290,6 +1302,7 @@ def admin_run_parser():
             stderr=subprocess.STDOUT,
             cwd=os.path.dirname(os.path.abspath(__file__)),
         )
+        _PARSER_PID[0] = proc.pid
         logger.info(f'🚀 Парсер запущен PID={proc.pid}, лимит={limit}, лог={log_path}')
 
         return BASE_STYLE + f"""
@@ -1312,18 +1325,6 @@ def admin_run_parser():
             <a href="/admin" class="btn btn-gray">← В админку</a>
         </div>
         """
-
-
-def parser_is_running() -> bool:
-    """Проверяет, есть ли живой процесс parser_runner."""
-    try:
-        result = subprocess.run(
-            ['pgrep', '-f', 'parser_runner'],
-            capture_output=True, text=True, timeout=5,
-        )
-        return result.returncode == 0 and bool(result.stdout.strip())
-    except Exception:
-        return False
 
 
 @app.route('/admin/publish_one')
