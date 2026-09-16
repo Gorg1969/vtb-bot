@@ -9,6 +9,8 @@
 # - Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2
 #   ВАЖНО: sort=dateDesc ЛОМАЕТ пагинацию, поэтому его НЕТ
 # - info.txt = для публикации, report.txt = для отчёта
+# - Round-robin: при лимите N берём ~N/кол-во_категорий из каждой,
+#   затем добираем из тех, где остались карточки
 # ============================================================
 
 import os
@@ -167,8 +169,7 @@ class VTBParser:
           - стр. N  →  <base>/?PAGEN_1=N              (N >= 2)
 
         ВАЖНО: параметр sort=dateDesc ЛОМАЕТ пагинацию — сайт
-        игнорирует PAGEN_1 и всегда отдаёт стр. 1. Поэтому sort
-        в URL больше НЕ добавляем.
+        игнорирует PAGEN_1 и всегда отдаёт стр. 1.
         """
         urls = []
         pagen = 1
@@ -181,15 +182,13 @@ class VTBParser:
         prev_first_url = None
 
         while pagen <= MAX_PAGES and len(urls) < max_cards:
-            # === ФОРМИРОВАНИЕ URL ===
             if pagen == 1:
-                page_url = base_url                       # чистый URL = стр. 1
+                page_url = base_url
             else:
-                page_url = f"{base_url}?PAGEN_1={pagen}"  # стр. 2, 3, 4, ...
+                page_url = f"{base_url}?PAGEN_1={pagen}"
 
             logger.info(f'📄 Страница {pagen}: {page_url}')
 
-            # === ЗАГРУЗКА ===
             try:
                 page.goto(page_url, wait_until='domcontentloaded', timeout=90000)
             except PlaywrightTimeout:
@@ -205,7 +204,6 @@ class VTBParser:
                 logger.info(f'⏹️ Стр. {pagen} — карточек нет (конец раздела)')
                 break
 
-            # === ЖДЁМ СМЕНЫ DOM (защита от старой страницы) ===
             if pagen > 1 and prev_first_url:
                 dom_updated = False
                 for attempt in range(15):
@@ -235,7 +233,6 @@ class VTBParser:
                     except Exception as e:
                         logger.warning(f'⚠️ reload не помог: {e}')
 
-            # === СКРОЛЛ ДЛЯ LAZY-LOAD ===
             try:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(1500)
@@ -244,7 +241,6 @@ class VTBParser:
             except Exception:
                 pass
 
-            # === СБОР ССЫЛОК ===
             cards = page.query_selector_all('a.t-market-item-slider-item')
             if not cards:
                 logger.info(f'⏹️ Стр. {pagen} пустая')
@@ -263,18 +259,12 @@ class VTBParser:
 
             prev_first_url = page_urls[0]
 
-            # === ПРОВЕРКА НА НОВЫЕ URL ===
             if pagen > 1:
                 new_on_page = [u for u in page_urls if u not in urls]
                 if len(new_on_page) == 0:
-                    logger.warning(
-                        f'⚠️ Стр. {pagen} — все URL дублируются, стоп'
-                    )
+                    logger.warning(f'⚠️ Стр. {pagen} — все URL дублируются, стоп')
                     break
-                logger.info(
-                    f'  → {len(page_urls)} карточек, '
-                    f'из них новых {len(new_on_page)}'
-                )
+                logger.info(f'  → {len(page_urls)} карточек, из них новых {len(new_on_page)}')
             else:
                 logger.info(f'  → {len(page_urls)} карточек')
 
@@ -540,6 +530,74 @@ class VTBParser:
 Пробег: {ad['mileage']}
 Цена: {ad['price']} руб"""
 
+    def _process_one_url(self, page: Page, url: str, section: dict,
+                          saved_count: int, limit: int) -> Tuple[bool, int]:
+        """
+        Обрабатывает одну ссылку:
+        - проверяет дубль
+        - парсит карточку
+        - проверяет флаги и цену
+        - сохраняет медиа
+        - кладёт в БД
+
+        Возвращает (success: bool, new_saved_count: int).
+        Если success=True — saved_count увеличился на 1.
+        """
+        logger.info(f'\n[{saved_count + 1}/{limit}] {url}')
+
+        if self.is_duplicate(url):
+            logger.info('  ⏭️ Дубль')
+            self.skipped_dup += 1
+            return False, saved_count
+
+        ad = self.parse_card(page, url)
+        if not ad:
+            self.errors += 1
+            return False, saved_count
+
+        ok, reason = self.check_flags(ad['flags'])
+        if not ok:
+            logger.info(f'  ⏭️ Флаги: {reason} ({ad["flags"]})')
+            self.skipped_flags += 1
+            return False, saved_count
+        logger.info(f'  ✅ Флаги ОК: {ad["flags"]}')
+
+        price_num = price_to_int(ad['price'])
+        if MIN_PRICE > 0 and price_num < MIN_PRICE:
+            logger.info(f'  ⏭️ Цена {price_num:,} < {MIN_PRICE:,} — пропуск'.replace(',', ' '))
+            self.skipped_price += 1
+            return False, saved_count
+        if MAX_PRICE > 0 and price_num > MAX_PRICE:
+            logger.info(f'  ⏭️ Цена {price_num:,} > {MAX_PRICE:,} — пропуск'.replace(',', ' '))
+            self.skipped_price += 1
+            return False, saved_count
+        logger.info(f'  💰 Цена ОК: {price_num:,} ₽'.replace(',', ' '))
+
+        logger.info(f'  📝 Название: "{ad["title"][:80]}"')
+        logger.info(f'  📋 Код: "{ad["code"]}"')
+
+        ad['category'] = section['name']
+        ad['chat_id'] = section['chat_id']
+        logger.info(f'  📂 {section["name"]} → {section["chat_id"]}')
+
+        self.processed += 1
+        folder = self.save_ad_media(ad, self.processed, section)
+        if not folder:
+            self.errors += 1
+            return False, saved_count
+
+        ad['folder_name'] = os.path.basename(folder)
+        ad['media_path'] = folder
+        inserted = self.db.add_parsed_ad(ad)
+
+        if inserted:
+            saved_count += 1
+            logger.info(f'  ✅ В очередь ({saved_count}/{limit})')
+            return True, saved_count
+        else:
+            logger.info(f'  ⚠️ Уже был в БД')
+            return False, saved_count
+
     def run(self, limit: int = INITIAL_LIMIT):
         logger.info('=' * 60)
         logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
@@ -547,11 +605,29 @@ class VTBParser:
         logger.info(f'   Фильтр цены: MIN={MIN_PRICE:,} MAX={MAX_PRICE or "∞"}'.replace(',', ' '))
         logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES and MASK_AVAILABLE else "ВЫКЛ"}')
         logger.info(f'   Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2')
+        logger.info(f'   Round-robin: ~{limit} по категориям с добором')
         logger.info('=' * 60)
 
         self.sheets.get_all_urls()
-        sections = get_sections_from_db(self.db)
+        sections = [s for s in get_sections_from_db(self.db)
+                    if s.get('enabled', True)]
+
+        if not sections:
+            logger.warning('⚠️ Нет активных разделов')
+            return 0
+
+        # === КВОТА НА КАТЕГОРИЮ ===
+        n_sections = len(sections)
+        quota = max(1, limit // n_sections)
+        logger.info(f'📊 Категорий: {n_sections}, квота на каждую: {quota}')
+
         saved_count = 0
+        # Собираем URL-ы по каждой категории ЗАРАНЕЕ
+        section_urls: Dict[str, List[str]] = {}
+        # Курсор по каждой категории (индекс текущего URL)
+        section_cursor: Dict[str, int] = {}
+        # Сколько уже взяли из каждой категории
+        section_taken: Dict[str, int] = {}
 
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -566,80 +642,99 @@ class VTBParser:
             page = context.new_page()
 
             try:
+                # === ЭТАП 1: СОБИРАЕМ URL-Ы ПО КАЖДОЙ КАТЕГОРИИ ===
                 for section in sections:
-                    if not section.get('enabled', True):
-                        continue
+                    name = section['name']
+                    logger.info(f'\n{"=" * 60}')
+                    logger.info(f'📂 Сбор URL: {name} ({section["title"]})')
+                    logger.info(f'{"=" * 60}')
+
+                    # Собираем "с запасом" — чтобы хватило на квоту + добор
+                    # (не все URL пройдут флаги/цену/дедуп)
+                    collect_limit = min(limit, MAX_CARDS_PER_SECTION)
+                    urls = self.collect_urls_from_section(
+                        page, section, collect_limit
+                    )
+                    section_urls[name] = urls
+                    section_cursor[name] = 0
+                    section_taken[name] = 0
+                    logger.info(f'  📋 Собрано {len(urls)} ссылок')
+
+                # === ЭТАП 2: ПЕРВЫЙ ПРОХОД — ПО КВОТЕ НА КАТЕГОРИЮ ===
+                logger.info(f'\n{"=" * 60}')
+                logger.info(f'🎯 ЭТАП 1: берём ~{quota} из каждой категории')
+                logger.info(f'{"=" * 60}')
+
+                for section in sections:
+                    name = section['name']
+                    urls = section_urls.get(name, [])
+                    taken_here = 0
+
+                    logger.info(f'\n📂 Категория: {name} (квота {quota})')
+
+                    while (taken_here < quota
+                           and saved_count < limit
+                           and section_cursor[name] < len(urls)):
+                        url = urls[section_cursor[name]]
+                        section_cursor[name] += 1
+
+                        success, saved_count = self._process_one_url(
+                            page, url, section, saved_count, limit
+                        )
+                        if success:
+                            taken_here += 1
+                            section_taken[name] += 1
+
+                    logger.info(
+                        f'  📊 Из "{name}": взято {taken_here} '
+                        f'(обработано {section_cursor[name]}/{len(urls)})'
+                    )
+
                     if saved_count >= limit:
                         break
 
+                # === ЭТАП 3: ДОБОР — ПО КАТЕГОРИЯМ, ГДЕ ОСТАЛИСЬ URL-Ы ===
+                if saved_count < limit:
                     logger.info(f'\n{"=" * 60}')
-                    logger.info(f'📂 Раздел: {section["name"]} ({section["title"]})')
-                    logger.info(f'   URL: {section["url"]}')
+                    logger.info(f'🔄 ЭТАП 2: добор (нужно ещё {limit - saved_count})')
                     logger.info(f'{"=" * 60}')
 
-                    remaining = limit - saved_count
-                    urls = self.collect_urls_from_section(page, section, remaining)
-                    logger.info(f'📋 Собрано {len(urls)} ссылок')
+                    # Крутимся по категориям, где ещё есть необработанные URL
+                    progress = True
+                    while saved_count < limit and progress:
+                        progress = False
 
-                    for i, url in enumerate(urls, 1):
-                        if saved_count >= limit:
-                            logger.info(f'⏹️ Лимит {limit} достигнут')
-                            break
+                        for section in sections:
+                            if saved_count >= limit:
+                                break
 
-                        logger.info(f'\n[{i}/{len(urls)}] {url}')
+                            name = section['name']
+                            urls = section_urls.get(name, [])
 
-                        if self.is_duplicate(url):
-                            logger.info('  ⏭️ Дубль')
-                            self.skipped_dup += 1
-                            continue
+                            if section_cursor[name] >= len(urls):
+                                continue  # в этой категории URL-ы кончились
 
-                        ad = self.parse_card(page, url)
-                        if not ad:
-                            self.errors += 1
-                            continue
+                            url = urls[section_cursor[name]]
+                            section_cursor[name] += 1
 
-                        ok, reason = self.check_flags(ad['flags'])
-                        if not ok:
-                            logger.info(f'  ⏭️ Флаги: {reason} ({ad["flags"]})')
-                            self.skipped_flags += 1
-                            continue
-                        logger.info(f'  ✅ Флаги ОК: {ad["flags"]}')
+                            success, saved_count = self._process_one_url(
+                                page, url, section, saved_count, limit
+                            )
+                            if success:
+                                section_taken[name] += 1
+                                progress = True  # был успех — продолжаем круг
 
-                        price_num = price_to_int(ad['price'])
-                        if MIN_PRICE > 0 and price_num < MIN_PRICE:
-                            logger.info(f'  ⏭️ Цена {price_num:,} < {MIN_PRICE:,} — пропуск'.replace(',', ' '))
-                            self.skipped_price += 1
-                            continue
-                        if MAX_PRICE > 0 and price_num > MAX_PRICE:
-                            logger.info(f'  ⏭️ Цена {price_num:,} > {MAX_PRICE:,} — пропуск'.replace(',', ' '))
-                            self.skipped_price += 1
-                            continue
-                        logger.info(f'  💰 Цена ОК: {price_num:,} ₽'.replace(',', ' '))
-
-                        logger.info(f'  📝 Название: "{ad["title"][:80]}"')
-                        logger.info(f'  📋 Код: "{ad["code"]}"')
-
-                        ad['category'] = section['name']
-                        ad['chat_id'] = section['chat_id']
-                        logger.info(f'  📂 {section["name"]} → {section["chat_id"]}')
-
-                        self.processed += 1
-                        folder = self.save_ad_media(ad, self.processed, section)
-                        if not folder:
-                            self.errors += 1
-                            continue
-
-                        ad['folder_name'] = os.path.basename(folder)
-                        ad['media_path'] = folder
-                        inserted = self.db.add_parsed_ad(ad)
-
-                        if inserted:
-                            saved_count += 1
-                            logger.info(f'  ✅ В очередь ({saved_count}/{limit})')
-                        else:
-                            logger.info(f'  ⚠️ Уже был в БД')
-
-                        time.sleep(CARD_DELAY)
+                # === ИТОГИ ===
+                logger.info(f'\n{"=" * 60}')
+                logger.info('📊 ИТОГИ ПО КАТЕГОРИЯМ:')
+                for section in sections:
+                    name = section['name']
+                    logger.info(
+                        f'  {name}: взято {section_taken.get(name, 0)}, '
+                        f'обработано URL {section_cursor.get(name, 0)}/'
+                        f'{len(section_urls.get(name, []))}'
+                    )
+                logger.info(f'  ВСЕГО в очередь: {saved_count}/{limit}')
 
             finally:
                 browser.close()
