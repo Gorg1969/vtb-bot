@@ -1,6 +1,6 @@
 # parser_runner.py
 # ============================================================
-# Обёртка для запуска парсера
+# Обёртка для запуска парсера (отдельный процесс)
 # Дедуп ВСЕГДА включён
 # ============================================================
 
@@ -10,7 +10,7 @@ import logging
 import argparse
 from datetime import datetime
 
-# Отключаем спам от urllib3 про непроверенные HTTPS
+# Отключаем спам urllib3 про непроверенные HTTPS
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -21,30 +21,43 @@ try:
 except AttributeError:
     pass
 
+# Лог пишем и в файл, и в stdout (родитель перенаправит stdout в файл)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
+    stream=sys.stdout,
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
 
 def run_parser(limit: int = 300) -> int:
     """Запускает парсер. Дедуп всегда включён."""
-    from config import SHEETS_URL, DB_PATH, OUTPUT_DIR
-    from sheets_client import SheetsClient
-    from db import BotDB
-    from vtb_parser import VTBParser
-
     logger.info('=' * 60)
     logger.info(f'🚀 ЗАПУСК ПАРСЕРА  (лимит: {limit})')
     logger.info(f'   Время: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     logger.info(f'   Дедуп: ВКЛ (Google Sheets + БД)')
     logger.info('=' * 60)
 
-    sheets = SheetsClient(url=SHEETS_URL)
-    db = BotDB(DB_PATH)
-    parser = VTBParser(sheets, db, OUTPUT_DIR)
+    try:
+        from config import SHEETS_URL, DB_PATH, OUTPUT_DIR
+        from sheets_client import SheetsClient
+        from db import BotDB
+        from vtb_parser import VTBParser
+        logger.info('✅ Импорты загружены')
+    except Exception as e:
+        logger.exception(f'❌ Ошибка импортов: {e}')
+        return 0
+
+    try:
+        sheets = SheetsClient(url=SHEETS_URL)
+        db = BotDB(DB_PATH)
+        parser = VTBParser(sheets, db, OUTPUT_DIR)
+        logger.info('✅ Объекты созданы, старт парсинга')
+    except Exception as e:
+        logger.exception(f'❌ Ошибка инициализации: {e}')
+        return 0
 
     try:
         saved = parser.run(limit=limit)
