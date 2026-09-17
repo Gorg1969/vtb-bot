@@ -1,6 +1,6 @@
-# vtb_parser.py 2
+# vtb_parser.py
 # ============================================================
-# Парсер VTB-лизинга
+# Парсер VTB-лизинга - 3
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
@@ -10,6 +10,7 @@
 #   ВАЖНО: sort=dateDesc ЛОМАЕТ пагинацию, поэтому его НЕТ
 # - info.txt = для публикации, report.txt = для отчёта
 # - ПОСТРАНИЧНЫЙ ОБХОД: стр.1 всех категорий → стр.2 всех → ...
+#   Стоп только когда ВСЕ категории вернули пустую страницу N
 # ============================================================
 
 import os
@@ -559,6 +560,7 @@ class VTBParser:
         logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES and MASK_AVAILABLE else "ВЫКЛ"}')
         logger.info(f'   Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2')
         logger.info(f'   Режим: ПОСТРАНИЧНЫЙ (стр.1 всех категорий → стр.2 всех → ...)')
+        logger.info(f'   Стоп: когда ВСЕ категории вернули пустую страницу')
         logger.info('=' * 60)
 
         self.sheets.get_all_urls()
@@ -593,7 +595,10 @@ class VTBParser:
                     logger.info(f'📄 СТРАНИЦА {pagen} ПО ВСЕМ КАТЕГОРИЯМ')
                     logger.info(f'{"=" * 60}')
 
-                    any_progress = False
+                    # Флаг: была ли ХОТЬ ОДНА карточка на этой странице
+                    # хотя бы в одной категории?
+                    # Если нет — значит, все категории кончились, стоп.
+                    any_cards_on_page = False
 
                     for section in sections:
                         if saved_count >= limit:
@@ -620,6 +625,11 @@ class VTBParser:
                             logger.info(f'  ⏹️ {name}: страница пуста — конец категории')
                             continue
 
+                        # ← КЛЮЧЕВОЕ ОТЛИЧИЕ:
+                        # Если карточки есть — значит, страница ещё не кончилась,
+                        # и надо будет перейти на следующую.
+                        any_cards_on_page = True
+
                         logger.info(f'  📋 {len(urls_on_page)} карточек')
 
                         # Обрабатываем карточки этой страницы
@@ -630,13 +640,18 @@ class VTBParser:
                             success, saved_count = self._process_one_url(
                                 page, url, section, saved_count, limit
                             )
-                            if success:
-                                any_progress = True
+                            # success больше НЕ используется для решения "идти дальше"
+                            # (иначе парсер останавливался после стр.1, если
+                            #  на ней не было ни одной публикации)
 
-                    if not any_progress:
-                        logger.info('\n⏹️ Ни одна категория не дала результата — стоп')
+                    # Стоп — только если НИ ОДНА категория не вернула карточек.
+                    if not any_cards_on_page:
+                        logger.info('\n⏹️ Все категории вернули пустую страницу — стоп')
                         break
 
+                    logger.info(
+                        f'\n📊 Итог стр. {pagen}: в очередь {saved_count}/{limit}'
+                    )
                     pagen += 1
 
             finally:
