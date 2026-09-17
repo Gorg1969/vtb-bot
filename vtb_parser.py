@@ -1,4 +1,4 @@
-# vtb_parser.py
+# vtb_parser.py 2
 # ============================================================
 # Парсер VTB-лизинга
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
@@ -9,8 +9,7 @@
 # - Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2
 #   ВАЖНО: sort=dateDesc ЛОМАЕТ пагинацию, поэтому его НЕТ
 # - info.txt = для публикации, report.txt = для отчёта
-# - Round-robin: при лимите N берём ~N/кол-во_категорий из каждой,
-#   затем добираем из тех, где остались карточки
+# - ПОСТРАНИЧНЫЙ ОБХОД: стр.1 всех категорий → стр.2 всех → ...
 # ============================================================
 
 import os
@@ -28,7 +27,7 @@ from PIL import Image
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
 
 from config import (
-    INITIAL_LIMIT, MAX_PHOTOS_PER_AD, MAX_PAGES, MAX_CARDS_PER_SECTION,
+    INITIAL_LIMIT, MAX_PHOTOS_PER_AD, MAX_PAGES,
     OUTPUT_DIR, FLAG_IN_STOCK, FLAG_LEASING, FLAG_REPAIR,
     FLAG_BUY_AVAILABLE, PAGE_TIMEOUT, CARD_DELAY, SHEETS_URL,
     get_sections_from_db,
@@ -159,126 +158,69 @@ class VTBParser:
         self.skipped_price = 0
         self.errors = 0
 
-    def collect_urls_from_section(self, page: Page, section: dict,
-                                   limit: int) -> List[str]:
-        """
-        Обходит страницы раздела.
+    # --------------------------------------------------------
+    # СБОР URL С ОДНОЙ СТРАНИЦЫ
+    # --------------------------------------------------------
 
-        Пагинация VTB-Лизинг (проверено вручную):
+    def collect_urls_from_one_page(self, page: Page, section: dict,
+                                    page_url: str) -> List[str]:
+        """
+        Собирает URL карточек ТОЛЬКО с одной страницы.
+
+        Пагинация VTB-Лизинг:
           - стр. 1  →  <base>/                        (чистый URL)
           - стр. N  →  <base>/?PAGEN_1=N              (N >= 2)
 
-        ВАЖНО: параметр sort=dateDesc ЛОМАЕТ пагинацию — сайт
+        ВАЖНО: sort=dateDesc ЛОМАЕТ пагинацию — сайт
         игнорирует PAGEN_1 и всегда отдаёт стр. 1.
         """
+        try:
+            page.goto(page_url, wait_until='domcontentloaded', timeout=90000)
+        except PlaywrightTimeout:
+            logger.warning(f'⚠️ Таймаут на {page_url}')
+            return []
+        except Exception as e:
+            logger.error(f'❌ Ошибка загрузки {page_url}: {e}')
+            return []
+
+        try:
+            page.wait_for_selector('a.t-market-item-slider-item', timeout=15000)
+        except PlaywrightTimeout:
+            logger.info(f'⏹️ Карточек нет на {page_url}')
+            return []
+
+        # Ждём немного, чтобы карточки точно отрисовались
+        page.wait_for_timeout(1000)
+
+        # Собираем URL
         urls = []
-        pagen = 1
-
-        base_url = section['url']
-        if not base_url.endswith('/'):
-            base_url += '/'
-
-        max_cards = max(limit * 3, MAX_CARDS_PER_SECTION)
-        prev_first_url = None
-
-        while pagen <= MAX_PAGES and len(urls) < max_cards:
-            if pagen == 1:
-                page_url = base_url
-            else:
-                page_url = f"{base_url}?PAGEN_1={pagen}"
-
-            logger.info(f'📄 Страница {pagen}: {page_url}')
-
-            try:
-                page.goto(page_url, wait_until='domcontentloaded', timeout=90000)
-            except PlaywrightTimeout:
-                logger.warning(f'⚠️ Таймаут на стр. {pagen}')
-                break
-            except Exception as e:
-                logger.error(f'❌ Ошибка загрузки стр. {pagen}: {e}')
-                break
-
-            try:
-                page.wait_for_selector('a.t-market-item-slider-item', timeout=30000)
-            except PlaywrightTimeout:
-                logger.info(f'⏹️ Стр. {pagen} — карточек нет (конец раздела)')
-                break
-
-            if pagen > 1 and prev_first_url:
-                dom_updated = False
-                for attempt in range(15):
-                    page.wait_for_timeout(1000)
-                    first_card = page.query_selector('a.t-market-item-slider-item')
-                    if first_card:
-                        href = first_card.get_attribute('href')
-                        if href:
-                            if href.startswith('/'):
-                                href = 'https://www.vtb-leasing.ru' + href
-                            if href != prev_first_url:
-                                logger.info(f'  ✓ DOM обновился (attempt {attempt + 1})')
-                                dom_updated = True
-                                break
-
-                if not dom_updated:
-                    logger.warning(
-                        f'⚠️ Стр. {pagen}: DOM не обновился за 15 сек, '
-                        f'пробуем reload'
-                    )
-                    try:
-                        page.reload(wait_until='domcontentloaded', timeout=60000)
-                        page.wait_for_selector(
-                            'a.t-market-item-slider-item', timeout=30000
-                        )
-                        page.wait_for_timeout(3000)
-                    except Exception as e:
-                        logger.warning(f'⚠️ reload не помог: {e}')
-
-            try:
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(1500)
-                page.evaluate("window.scrollTo(0, 0)")
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
-
-            cards = page.query_selector_all('a.t-market-item-slider-item')
-            if not cards:
-                logger.info(f'⏹️ Стр. {pagen} пустая')
-                break
-
-            page_urls = []
-            for card in cards:
-                href = card.get_attribute('href')
-                if href:
-                    if href.startswith('/'):
-                        href = 'https://www.vtb-leasing.ru' + href
-                    page_urls.append(href)
-
-            if not page_urls:
-                break
-
-            prev_first_url = page_urls[0]
-
-            if pagen > 1:
-                new_on_page = [u for u in page_urls if u not in urls]
-                if len(new_on_page) == 0:
-                    logger.warning(f'⚠️ Стр. {pagen} — все URL дублируются, стоп')
-                    break
-                logger.info(f'  → {len(page_urls)} карточек, из них новых {len(new_on_page)}')
-            else:
-                logger.info(f'  → {len(page_urls)} карточек')
-
-            urls.extend(page_urls)
-            pagen += 1
+        cards = page.query_selector_all('a.t-market-item-slider-item')
+        for card in cards:
+            href = card.get_attribute('href')
+            if href:
+                if href.startswith('/'):
+                    href = 'https://www.vtb-leasing.ru' + href
+                if href not in urls:
+                    urls.append(href)
 
         return urls
 
+    # --------------------------------------------------------
+    # ДЕДУП
+    # --------------------------------------------------------
+
     def is_duplicate(self, url: str) -> bool:
+        # 1) Google Sheets
         if self.sheets.is_duplicate(url):
             return True
+        # 2) Локальная БД
         if self.db.is_parsed(url):
             return True
         return False
+
+    # --------------------------------------------------------
+    # ПАРСИНГ ОДНОЙ КАРТОЧКИ
+    # --------------------------------------------------------
 
     def parse_card(self, page: Page, url: str) -> Optional[Dict]:
         try:
@@ -414,6 +356,10 @@ class VTBParser:
             return False, 'нет "в наличии"'
         return True, 'OK'
 
+    # --------------------------------------------------------
+    # СОХРАНЕНИЕ МЕДИА
+    # --------------------------------------------------------
+
     def save_ad_media(self, ad: Dict, index: int, section: dict) -> Optional[str]:
         cat_clean = section['name'].replace('truck_', '')
         folder_name = f'{index}_{cat_clean}'
@@ -530,18 +476,21 @@ class VTBParser:
 Пробег: {ad['mileage']}
 Цена: {ad['price']} руб"""
 
+    # --------------------------------------------------------
+    # ОБРАБОТКА ОДНОЙ КАРТОЧКИ
+    # --------------------------------------------------------
+
     def _process_one_url(self, page: Page, url: str, section: dict,
                           saved_count: int, limit: int) -> Tuple[bool, int]:
         """
         Обрабатывает одну ссылку:
-        - проверяет дубль
-        - парсит карточку
-        - проверяет флаги и цену
-        - сохраняет медиа
-        - кладёт в БД
+        - дедуп (Google Sheets + БД)
+        - парсинг карточки
+        - проверка флагов и цены
+        - сохранение медиа
+        - запись в БД
 
         Возвращает (success: bool, new_saved_count: int).
-        Если success=True — saved_count увеличился на 1.
         """
         logger.info(f'\n[{saved_count + 1}/{limit}] {url}')
 
@@ -598,6 +547,10 @@ class VTBParser:
             logger.info(f'  ⚠️ Уже был в БД')
             return False, saved_count
 
+    # --------------------------------------------------------
+    # ГЛАВНЫЙ МЕТОД: ПОСТРАНИЧНЫЙ ОБХОД
+    # --------------------------------------------------------
+
     def run(self, limit: int = INITIAL_LIMIT):
         logger.info('=' * 60)
         logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
@@ -605,7 +558,7 @@ class VTBParser:
         logger.info(f'   Фильтр цены: MIN={MIN_PRICE:,} MAX={MAX_PRICE or "∞"}'.replace(',', ' '))
         logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES and MASK_AVAILABLE else "ВЫКЛ"}')
         logger.info(f'   Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2')
-        logger.info(f'   Round-robin: ~{limit} по категориям с добором')
+        logger.info(f'   Режим: ПОСТРАНИЧНЫЙ (стр.1 всех категорий → стр.2 всех → ...)')
         logger.info('=' * 60)
 
         self.sheets.get_all_urls()
@@ -616,18 +569,9 @@ class VTBParser:
             logger.warning('⚠️ Нет активных разделов')
             return 0
 
-        # === КВОТА НА КАТЕГОРИЮ ===
-        n_sections = len(sections)
-        quota = max(1, limit // n_sections)
-        logger.info(f'📊 Категорий: {n_sections}, квота на каждую: {quota}')
+        logger.info(f'📊 Категорий: {len(sections)}')
 
         saved_count = 0
-        # Собираем URL-ы по каждой категории ЗАРАНЕЕ
-        section_urls: Dict[str, List[str]] = {}
-        # Курсор по каждой категории (индекс текущего URL)
-        section_cursor: Dict[str, int] = {}
-        # Сколько уже взяли из каждой категории
-        section_taken: Dict[str, int] = {}
 
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -642,99 +586,58 @@ class VTBParser:
             page = context.new_page()
 
             try:
-                # === ЭТАП 1: СОБИРАЕМ URL-Ы ПО КАЖДОЙ КАТЕГОРИИ ===
-                for section in sections:
-                    name = section['name']
+                pagen = 1
+
+                while saved_count < limit and pagen <= MAX_PAGES:
                     logger.info(f'\n{"=" * 60}')
-                    logger.info(f'📂 Сбор URL: {name} ({section["title"]})')
+                    logger.info(f'📄 СТРАНИЦА {pagen} ПО ВСЕМ КАТЕГОРИЯМ')
                     logger.info(f'{"=" * 60}')
 
-                    # Собираем "с запасом" — чтобы хватило на квоту + добор
-                    # (не все URL пройдут флаги/цену/дедуп)
-                    collect_limit = min(limit, MAX_CARDS_PER_SECTION)
-                    urls = self.collect_urls_from_section(
-                        page, section, collect_limit
-                    )
-                    section_urls[name] = urls
-                    section_cursor[name] = 0
-                    section_taken[name] = 0
-                    logger.info(f'  📋 Собрано {len(urls)} ссылок')
+                    any_progress = False
 
-                # === ЭТАП 2: ПЕРВЫЙ ПРОХОД — ПО КВОТЕ НА КАТЕГОРИЮ ===
-                logger.info(f'\n{"=" * 60}')
-                logger.info(f'🎯 ЭТАП 1: берём ~{quota} из каждой категории')
-                logger.info(f'{"=" * 60}')
+                    for section in sections:
+                        if saved_count >= limit:
+                            break
 
-                for section in sections:
-                    name = section['name']
-                    urls = section_urls.get(name, [])
-                    taken_here = 0
+                        name = section['name']
+                        title = section.get('title', name)
+                        base_url = section['url']
+                        if not base_url.endswith('/'):
+                            base_url += '/'
 
-                    logger.info(f'\n📂 Категория: {name} (квота {quota})')
+                        if pagen == 1:
+                            page_url = base_url
+                        else:
+                            page_url = f"{base_url}?PAGEN_1={pagen}"
 
-                    while (taken_here < quota
-                           and saved_count < limit
-                           and section_cursor[name] < len(urls)):
-                        url = urls[section_cursor[name]]
-                        section_cursor[name] += 1
+                        logger.info(f'\n📂 {name} ({title}): {page_url}')
 
-                        success, saved_count = self._process_one_url(
-                            page, url, section, saved_count, limit
+                        urls_on_page = self.collect_urls_from_one_page(
+                            page, section, page_url
                         )
-                        if success:
-                            taken_here += 1
-                            section_taken[name] += 1
 
-                    logger.info(
-                        f'  📊 Из "{name}": взято {taken_here} '
-                        f'(обработано {section_cursor[name]}/{len(urls)})'
-                    )
+                        if not urls_on_page:
+                            logger.info(f'  ⏹️ {name}: страница пуста — конец категории')
+                            continue
 
-                    if saved_count >= limit:
-                        break
+                        logger.info(f'  📋 {len(urls_on_page)} карточек')
 
-                # === ЭТАП 3: ДОБОР — ПО КАТЕГОРИЯМ, ГДЕ ОСТАЛИСЬ URL-Ы ===
-                if saved_count < limit:
-                    logger.info(f'\n{"=" * 60}')
-                    logger.info(f'🔄 ЭТАП 2: добор (нужно ещё {limit - saved_count})')
-                    logger.info(f'{"=" * 60}')
-
-                    # Крутимся по категориям, где ещё есть необработанные URL
-                    progress = True
-                    while saved_count < limit and progress:
-                        progress = False
-
-                        for section in sections:
+                        # Обрабатываем карточки этой страницы
+                        for url in urls_on_page:
                             if saved_count >= limit:
                                 break
-
-                            name = section['name']
-                            urls = section_urls.get(name, [])
-
-                            if section_cursor[name] >= len(urls):
-                                continue  # в этой категории URL-ы кончились
-
-                            url = urls[section_cursor[name]]
-                            section_cursor[name] += 1
 
                             success, saved_count = self._process_one_url(
                                 page, url, section, saved_count, limit
                             )
                             if success:
-                                section_taken[name] += 1
-                                progress = True  # был успех — продолжаем круг
+                                any_progress = True
 
-                # === ИТОГИ ===
-                logger.info(f'\n{"=" * 60}')
-                logger.info('📊 ИТОГИ ПО КАТЕГОРИЯМ:')
-                for section in sections:
-                    name = section['name']
-                    logger.info(
-                        f'  {name}: взято {section_taken.get(name, 0)}, '
-                        f'обработано URL {section_cursor.get(name, 0)}/'
-                        f'{len(section_urls.get(name, []))}'
-                    )
-                logger.info(f'  ВСЕГО в очередь: {saved_count}/{limit}')
+                    if not any_progress:
+                        logger.info('\n⏹️ Ни одна категория не дала результата — стоп')
+                        break
+
+                    pagen += 1
 
             finally:
                 browser.close()
