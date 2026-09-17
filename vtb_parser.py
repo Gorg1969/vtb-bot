@@ -1,20 +1,22 @@
 # vtb_parser.py
 # ============================================================
-# Парсер VTB-лизинга - 3
+# Парсер VTB-лизинга -4
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
 # - Категория по URL раздела
 # - Название обрезается перед годом
 # - Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2
-#   ВАЖНО: sort=dateDesc ЛОМАЕТ пагинацию, поэтому его НЕТ
 # - info.txt = для публикации, report.txt = для отчёта
 # - ПОСТРАНИЧНЫЙ ОБХОД: стр.1 всех категорий → стр.2 всех → ...
-#   Стоп только когда ВСЕ категории вернули пустую страницу N
+# - Стоп: когда ВСЕ категории вернули пустую страницу
+# - ПЕРЕЗАПУСК БРАУЗЕРА каждые 20 карточек (борьба с OOM)
+# - gc.collect() после каждой карточки
 # ============================================================
 
 import os
 import re
+import gc
 import json
 import time
 import shutil
@@ -57,6 +59,9 @@ except ImportError:
 
 MAX_IMAGE_SIZE = 1080
 JPEG_QUALITY = 85
+
+# === Перезапуск браузера ===
+CARDS_BEFORE_RESTART = 20
 
 
 # ============================================================
@@ -101,7 +106,12 @@ def price_to_int(price_str: str) -> int:
 
 def compress_image(input_path: str,
                     max_size: int = MAX_IMAGE_SIZE,
-                    quality: int = JPEG_QUALITY) -> str:
+                    quality: int = JPEG_QUALITY) -> Optional[str]:
+    """
+    Сжимает изображение до max_size px и сохраняет как JPEG.
+    Возвращает путь к сжатому файлу или None при ошибке.
+    ВСЕГДА удаляет исходный файл (input_path), если он отличается от результата.
+    """
     try:
         img = Image.open(input_path)
 
@@ -129,8 +139,15 @@ def compress_image(input_path: str,
         jpeg_path = input_path.rsplit('.', 1)[0] + '.jpg'
         img.save(jpeg_path, 'JPEG', quality=quality, optimize=True)
 
+        # Явно закрываем изображение, чтобы освободить память
+        img.close()
+
+        # Удаляем исходный файл, если он отличается от результата
         if jpeg_path != input_path and os.path.exists(input_path):
-            os.remove(input_path)
+            try:
+                os.remove(input_path)
+            except Exception:
+                pass
 
         new_size = os.path.getsize(jpeg_path)
         logger.info(f'  🗜️ Сжато → {os.path.basename(jpeg_path)} ({new_size // 1024} КБ)')
@@ -138,7 +155,13 @@ def compress_image(input_path: str,
 
     except Exception as e:
         logger.warning(f'⚠️ Ошибка сжатия {input_path}: {e}')
-        return input_path
+        # Пытаемся удалить исходник
+        try:
+            if os.path.exists(input_path):
+                os.remove(input_path)
+        except Exception:
+            pass
+        return None
 
 
 # ============================================================
@@ -167,13 +190,6 @@ class VTBParser:
                                     page_url: str) -> List[str]:
         """
         Собирает URL карточек ТОЛЬКО с одной страницы.
-
-        Пагинация VTB-Лизинг:
-          - стр. 1  →  <base>/                        (чистый URL)
-          - стр. N  →  <base>/?PAGEN_1=N              (N >= 2)
-
-        ВАЖНО: sort=dateDesc ЛОМАЕТ пагинацию — сайт
-        игнорирует PAGEN_1 и всегда отдаёт стр. 1.
         """
         try:
             page.goto(page_url, wait_until='domcontentloaded', timeout=90000)
@@ -190,10 +206,8 @@ class VTBParser:
             logger.info(f'⏹️ Карточек нет на {page_url}')
             return []
 
-        # Ждём немного, чтобы карточки точно отрисовались
         page.wait_for_timeout(1000)
 
-        # Собираем URL
         urls = []
         cards = page.query_selector_all('a.t-market-item-slider-item')
         for card in cards:
@@ -211,10 +225,8 @@ class VTBParser:
     # --------------------------------------------------------
 
     def is_duplicate(self, url: str) -> bool:
-        # 1) Google Sheets
         if self.sheets.is_duplicate(url):
             return True
-        # 2) Локальная БД
         if self.db.is_parsed(url):
             return True
         return False
@@ -387,35 +399,59 @@ class VTBParser:
                 ext = '.webp'
 
             temp_path = os.path.join(folder_path, f'photo_{i}_temp{ext}')
+            final_path = os.path.join(folder_path, f'photo_{i}.jpg')
 
-            if self._download_file(photo_url, temp_path, min_size=10000):
-                jpeg_path = compress_image(temp_path)
-                final_path = os.path.join(folder_path, f'photo_{i}.jpg')
+            ok = self._download_file(photo_url, temp_path, min_size=10000)
+            if not ok:
+                # На всякий случай удаляем временный файл
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+                logger.warning(f'  ⚠️ Фото {i} не скачалось')
+                continue
+
+            # Сжимаем во временный jpg
+            jpeg_path = compress_image(temp_path)
+            if not jpeg_path:
+                # compress_image уже удалил temp_path при ошибке
+                logger.warning(f'  ⚠️ Фото {i} не сжалось')
+                continue
+
+            # Перемещаем в final
+            try:
                 if jpeg_path != final_path:
                     if os.path.exists(final_path):
                         os.remove(final_path)
                     os.rename(jpeg_path, final_path)
+            except Exception as e:
+                logger.warning(f'  ⚠️ Не удалось переместить {jpeg_path}: {e}')
+                continue
 
-                if MASK_PLATES and MASK_AVAILABLE:
-                    try:
-                        with open(final_path, 'rb') as f:
-                            original = f.read()
-                        masked = mask_plate(
-                            original,
-                            model_path=PLATE_MODEL_PATH,
-                            confidence=PLATE_CONFIDENCE,
-                            padding=PLATE_PADDING,
-                        )
-                        with open(final_path, 'wb') as f:
-                            f.write(masked)
-                    except Exception as e:
-                        logger.warning(f'⚠️ Ошибка закраски {final_path}: {e}')
+            # === Закраска номеров ===
+            if MASK_PLATES and MASK_AVAILABLE:
+                try:
+                    with open(final_path, 'rb') as f:
+                        original = f.read()
+                    masked = mask_plate(
+                        original,
+                        model_path=PLATE_MODEL_PATH,
+                        confidence=PLATE_CONFIDENCE,
+                        padding=PLATE_PADDING,
+                    )
+                    with open(final_path, 'wb') as f:
+                        f.write(masked)
+                    # Освобождаем память
+                    del original
+                    del masked
+                except Exception as e:
+                    logger.warning(f'⚠️ Ошибка закраски {final_path}: {e}')
 
-                downloaded += 1
-            else:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                logger.warning(f'  ⚠️ Фото {i} не скачалось')
+            downloaded += 1
+
+            # ВАЖНО: даём Python освободить память после каждого фото
+            gc.collect()
 
             time.sleep(0.3)
 
@@ -483,16 +519,6 @@ class VTBParser:
 
     def _process_one_url(self, page: Page, url: str, section: dict,
                           saved_count: int, limit: int) -> Tuple[bool, int]:
-        """
-        Обрабатывает одну ссылку:
-        - дедуп (Google Sheets + БД)
-        - парсинг карточки
-        - проверка флагов и цены
-        - сохранение медиа
-        - запись в БД
-
-        Возвращает (success: bool, new_saved_count: int).
-        """
         logger.info(f'\n[{saved_count + 1}/{limit}] {url}')
 
         if self.is_duplicate(url):
@@ -549,8 +575,41 @@ class VTBParser:
             return False, saved_count
 
     # --------------------------------------------------------
-    # ГЛАВНЫЙ МЕТОД: ПОСТРАНИЧНЫЙ ОБХОД
+    # ГЛАВНЫЙ МЕТОД: ПОСТРАНИЧНЫЙ ОБХОД + ПЕРЕЗАПУСК БРАУЗЕРА
     # --------------------------------------------------------
+
+    def _create_browser(self, p):
+        """Создаёт браузер, контекст и страницу."""
+        browser = p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox',
+                  '--disable-dev-shm-usage']
+        )
+        context = browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        )
+        page = context.new_page()
+        return browser, context, page
+
+    def _close_browser(self, browser, context, page):
+        """Аккуратно закрывает всё."""
+        try:
+            if page:
+                page.close()
+        except Exception:
+            pass
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        gc.collect()
 
     def run(self, limit: int = INITIAL_LIMIT):
         logger.info('=' * 60)
@@ -560,6 +619,7 @@ class VTBParser:
         logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES and MASK_AVAILABLE else "ВЫКЛ"}')
         logger.info(f'   Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2')
         logger.info(f'   Режим: ПОСТРАНИЧНЫЙ (стр.1 всех категорий → стр.2 всех → ...)')
+        logger.info(f'   Перезапуск браузера: каждые {CARDS_BEFORE_RESTART} карточек')
         logger.info(f'   Стоп: когда ВСЕ категории вернули пустую страницу')
         logger.info('=' * 60)
 
@@ -576,16 +636,10 @@ class VTBParser:
         saved_count = 0
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox',
-                      '--disable-dev-shm-usage']
-            )
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            )
-            page = context.new_page()
+            browser, context, page = self._create_browser(p)
+            logger.info('✅ Браузер запущен')
+
+            cards_since_restart = 0
 
             try:
                 pagen = 1
@@ -595,9 +649,6 @@ class VTBParser:
                     logger.info(f'📄 СТРАНИЦА {pagen} ПО ВСЕМ КАТЕГОРИЯМ')
                     logger.info(f'{"=" * 60}')
 
-                    # Флаг: была ли ХОТЬ ОДНА карточка на этой странице
-                    # хотя бы в одной категории?
-                    # Если нет — значит, все категории кончились, стоп.
                     any_cards_on_page = False
 
                     for section in sections:
@@ -625,26 +676,34 @@ class VTBParser:
                             logger.info(f'  ⏹️ {name}: страница пуста — конец категории')
                             continue
 
-                        # ← КЛЮЧЕВОЕ ОТЛИЧИЕ:
-                        # Если карточки есть — значит, страница ещё не кончилась,
-                        # и надо будет перейти на следующую.
                         any_cards_on_page = True
 
                         logger.info(f'  📋 {len(urls_on_page)} карточек')
 
-                        # Обрабатываем карточки этой страницы
                         for url in urls_on_page:
                             if saved_count >= limit:
                                 break
 
+                            # === ПЕРЕЗАПУСК БРАУЗЕРА ===
+                            if cards_since_restart >= CARDS_BEFORE_RESTART:
+                                logger.info(
+                                    f'\n♻️ Перезапуск браузера '
+                                    f'(обработано {cards_since_restart} карточек с прошлого раза)'
+                                )
+                                self._close_browser(browser, context, page)
+
+                                browser, context, page = self._create_browser(p)
+                                cards_since_restart = 0
+                                logger.info('✅ Браузер перезапущен, память освобождена')
+
                             success, saved_count = self._process_one_url(
                                 page, url, section, saved_count, limit
                             )
-                            # success больше НЕ используется для решения "идти дальше"
-                            # (иначе парсер останавливался после стр.1, если
-                            #  на ней не было ни одной публикации)
+                            cards_since_restart += 1
 
-                    # Стоп — только если НИ ОДНА категория не вернула карточек.
+                            # Освобождаем память после каждой карточки
+                            gc.collect()
+
                     if not any_cards_on_page:
                         logger.info('\n⏹️ Все категории вернули пустую страницу — стоп')
                         break
@@ -655,7 +714,8 @@ class VTBParser:
                     pagen += 1
 
             finally:
-                browser.close()
+                self._close_browser(browser, context, page)
+                logger.info('🛑 Браузер закрыт')
 
         logger.info('\n' + '=' * 60)
         logger.info('📊 ИТОГИ ПАРСИНГА:')
