@@ -408,6 +408,9 @@ def seconds_until_window_start():
 
 
 def _sleep_with_check(seconds: int):
+    # Защита от нулевого/отрицательного сна (баг 05:59:59)
+    if seconds is None or seconds <= 0:
+        seconds = 1
     elapsed = 0
     while elapsed < seconds and AUTOPUBLISH_ENABLED[0]:
         chunk = min(5, seconds - elapsed)
@@ -422,6 +425,8 @@ def auto_publish_loop():
         try:
             if not is_in_schedule_window():
                 wait_sec = min(seconds_until_window_start(), 3600)
+                if wait_sec <= 0:
+                    wait_sec = 1
                 logger.info(f'⏰ Вне окна расписания. Ждём {wait_sec} сек')
                 _sleep_with_check(wait_sec)
                 continue
@@ -431,6 +436,8 @@ def auto_publish_loop():
             if today_count >= limit:
                 logger.info(f'⏹ Дневной лимит {limit} достигнут. Ждём до 06:00')
                 wait_sec = min(seconds_until_window_start(), 3600)
+                if wait_sec <= 0:
+                    wait_sec = 1
                 _sleep_with_check(wait_sec)
                 continue
 
@@ -551,6 +558,9 @@ BASE_STYLE = """
     .counter-big { font-size: 36px; font-weight: bold; color: #28a745; }
     .status-on { color: #28a745; font-weight: bold; }
     .status-off { color: #dc3545; font-weight: bold; }
+    pre.log { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 5px;
+              overflow-x: auto; font-size: 12px; line-height: 1.4; max-height: 700px;
+              overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
 </style>
 """
 
@@ -700,6 +710,7 @@ def admin_page():
         <a href="/admin/settings" class="btn">⚙️ Настройки</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
         <a href="/admin/queue" class="btn">📋 Очередь</a>
+        <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
         <a href="/setup_webhook" class="btn btn-gray">🔄 Вебхук</a>
     </div>
 
@@ -768,6 +779,56 @@ def admin_toggle_autopublish():
 
 
 # ============================================================
+# АДМИНКА — статус парсера (НОВОЕ)
+# ============================================================
+
+@app.route('/admin/parser_status')
+@require_admin
+def admin_parser_status():
+    log_path = '/tmp/parser_subprocess.log'
+    running = parser_is_running()
+
+    log_tail = ''
+    log_size = 0
+    if os.path.exists(log_path):
+        try:
+            log_size = os.path.getsize(log_path)
+            with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+                log_tail = ''.join(lines[-200:])
+        except Exception as e:
+            log_tail = f'⚠️ Не удалось прочитать лог: {e}'
+
+    if not log_tail:
+        log_tail = '(лог пуст)'
+
+    status_class = 'status-on' if running else 'status-off'
+    status_text = '🟢 РАБОТАЕТ' if running else '🔴 ОСТАНОВЛЕН'
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🚀 Статус парсера</h1>
+        <p>Состояние: <span class="{status_class}">{status_text}</span></p>
+        <p>Лог: <code>{log_path}</code> ({log_size} байт)</p>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+        <a href="/admin/parser_status" class="btn">🔄 Обновить</a>
+        <a href="/admin/run_parser?limit=300" class="btn btn-green" onclick="return confirm('Запустить парсер (300)?')">🚀 Запустить парсер</a>
+    </div>
+    <div class="card">
+        <h2>📜 Последние 200 строк лога</h2>
+        <pre class="log">{log_tail}</pre>
+    </div>
+    <script>
+        // Автообновление каждые 10 сек, если парсер работает
+        const running = {str(running).lower()};
+        if (running) {{
+            setTimeout(() => location.reload(), 10000);
+        }}
+    </script>
+    """
+
+
+# ============================================================
 # АДМИНКА — настройки
 # ============================================================
 
@@ -828,7 +889,9 @@ def admin_settings():
         </div>
     </form>
     """
-    # ============================================================
+
+
+# ============================================================
 # АДМИНКА — Опубликовано сегодня
 # ============================================================
 
@@ -1101,6 +1164,7 @@ def admin_queue():
     <div class="card">
         <h1>📋 Очередь парсинга ({len(rows)})</h1>
         <a href="/admin" class="btn">← Назад</a>
+        <a href="/admin/queue" class="btn btn-gray">🔄 Обновить</a>
         <table>
             <tr>
                 <th>ID</th><th>Папка</th><th>media_path</th>
@@ -1249,22 +1313,23 @@ def admin_clear_all():
 # Защита от двойного запуска парсера
 # ============================================================
 
-_PARSER_PID = [None]
+_PARSER_PROC = [None]   # храним объект Popen, а не PID
 
 
 def parser_is_running() -> bool:
-    """Жив ли процесс парсера, запущенный ИМЕННО этим Flask-процессом."""
-    pid = _PARSER_PID[0]
-    if pid is None:
+    """
+    Жив ли процесс парсера, запущенный ИМЕННО этим Flask-процессом.
+    Используем proc.poll() — надёжнее, чем os.kill(pid, 0),
+    потому что исключает случай с переиспользованием PID.
+    """
+    proc = _PARSER_PROC[0]
+    if proc is None:
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        _PARSER_PID[0] = None
+    if proc.poll() is not None:
+        # процесс завершился — сбрасываем
+        _PARSER_PROC[0] = None
         return False
-    except PermissionError:
-        return True
+    return True
 
 
 @app.route('/admin/run_parser')
@@ -1282,6 +1347,7 @@ def admin_run_parser():
             <h1>⚠️ Парсер уже запущен</h1>
             <p>Дождитесь завершения текущего процесса.</p>
             <a href="/admin" class="btn btn-gray">← В админку</a>
+            <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
         </div>
         """
 
@@ -1296,8 +1362,18 @@ def admin_run_parser():
             cwd=os.path.dirname(os.path.abspath(__file__)),
             bufsize=1,
         )
-        _PARSER_PID[0] = proc.pid
+        _PARSER_PROC[0] = proc
         logger.info(f'🚀 Парсер запущен PID={proc.pid}, лимит={limit}, лог={log_path}')
+
+        # Закрываем log_file, когда процесс завершится (в отдельном потоке)
+        def _close_log_when_done():
+            proc.wait()
+            try:
+                log_file.close()
+            except Exception:
+                pass
+
+        threading.Thread(target=_close_log_when_done, daemon=True).start()
 
         return BASE_STYLE + f"""
         <div class="card">
@@ -1305,7 +1381,8 @@ def admin_run_parser():
             <p>PID: <b>{proc.pid}</b></p>
             <p>Лимит: <b>{limit}</b></p>
             <p>Лог: <code>{log_path}</code></p>
-            <p class="hint">После завершения процесс умрёт, и вся память вернётся ОС. Это не помешает другим ботам на Bothost.</p>
+            <p class="hint">После завершения процесс умрёт, и вся память вернётся ОС.</p>
+            <a href="/admin/parser_status" class="btn">🚀 Смотреть прогресс</a>
             <a href="/admin/queue" class="btn">📋 Проверить очередь</a>
             <a href="/admin" class="btn btn-gray">← В админку</a>
         </div>
@@ -1409,6 +1486,7 @@ def webhook():
                     f"📅 **Опубликовано:**\n{PUBLIC_URL}/admin/today\n\n"
                     f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
                     f"📋 **Очередь:**\n{PUBLIC_URL}/admin/queue\n\n"
+                    f"🚀 **Статус парсера:**\n{PUBLIC_URL}/admin/parser_status\n\n"
                     "🔒 Пароль спросит браузер."
                 )
                 return jsonify({"ok": True}), 200
@@ -1464,6 +1542,7 @@ if __name__ == '__main__':
     logger.info(f'🚀 Запуск vtb-bot на порту {PORT}')
     logger.info(f'   TOKEN: {"✅" if TOKEN else "❌"}')
     logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
+    logger.info(f'   ADMIN_USER: {ADMIN_USER}')
     logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌"}')
     logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌"}')
 
