@@ -1,8 +1,9 @@
-# app.py 2
+# app.py
 # ============================================================
 # vtb-bot — Flask-сервер (проект 1)
 # + автопубликация по расписанию
 # + парсер в отдельном процессе (экономия RAM)
+# + очередь с предпросмотром, сортировкой, удалением
 # ============================================================
 
 import os
@@ -408,7 +409,6 @@ def seconds_until_window_start():
 
 
 def _sleep_with_check(seconds: int):
-    # Защита от нулевого/отрицательного сна (баг 05:59:59)
     if seconds is None or seconds <= 0:
         seconds = 1
     elapsed = 0
@@ -593,6 +593,7 @@ def index():
     <div class="card">
         <h2>⚙️ Управление</h2>
         <a href="/admin" class="btn">🛠 Админка</a>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
     </div>
     """
@@ -730,12 +731,14 @@ def admin_page():
         <a href="/admin/run_parser?limit=50" class="btn btn-green">50</a>
         <a href="/admin/run_parser?limit=300" class="btn btn-green">300</a>
         <p class="hint">Парсер запускается в отдельном процессе — после завершения память освобождается</p>
+        <p class="hint">После парсинга зайдите в <a href="/admin/queue">📋 Очередь</a>, чтобы проверить, отредактировать и упорядочить объявления перед публикацией.</p>
     </div>
 
     <div class="card">
         <h2>📤 Ручная публикация</h2>
         <p>В очереди: <b>{pending}</b></p>
-        <a href="/admin/publish_one" class="btn btn-orange" onclick="return confirm('Опубликовать 1?')">📤 Опубликовать 1</a>
+        <a href="/admin/publish_one" class="btn btn-orange" onclick="return confirm('Опубликовать 1 (первое по очереди)?')">📤 Опубликовать 1 (первое)</a>
+        <a href="/admin/queue" class="btn">📋 Открыть очередь</a>
     </div>
 
     <div class="card">
@@ -779,7 +782,7 @@ def admin_toggle_autopublish():
 
 
 # ============================================================
-# АДМИНКА — статус парсера (НОВОЕ)
+# АДМИНКА — статус парсера
 # ============================================================
 
 @app.route('/admin/parser_status')
@@ -813,13 +816,13 @@ def admin_parser_status():
         <a href="/admin" class="btn btn-gray">← В админку</a>
         <a href="/admin/parser_status" class="btn">🔄 Обновить</a>
         <a href="/admin/run_parser?limit=300" class="btn btn-green" onclick="return confirm('Запустить парсер (300)?')">🚀 Запустить парсер</a>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
     </div>
     <div class="card">
         <h2>📜 Последние 200 строк лога</h2>
         <pre class="log">{log_tail}</pre>
     </div>
     <script>
-        // Автообновление каждые 10 сек, если парсер работает
         const running = {str(running).lower()};
         if (running) {{
             setTimeout(() => location.reload(), 10000);
@@ -1120,62 +1123,393 @@ def api_today_export():
 
 
 # ============================================================
-# АДМИНКА — очередь, пути, папки, очистка, run_parser
+# АДМИНКА — ОЧЕРЕДЬ (НОВОЕ: предпросмотр, сортировка, удаление)
 # ============================================================
 
 @app.route('/admin/queue')
 @require_admin
 def admin_queue():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute('SELECT * FROM parsed_ads ORDER BY id DESC LIMIT 100')
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
+    ads = bot_db.get_all_pending_ads()
 
-    for r in rows:
-        mp = r.get('media_path')
-        if mp:
-            r['path_exists'] = os.path.exists(mp)
+    cards_html = ""
+    for i, ad in enumerate(ads, 1):
+        ad_id = ad['id']
+        media_path = ad.get('media_path') or ''
+        folder_name = ad.get('folder_name') or '—'
+        title = ad.get('title') or '—'
+        category = ad.get('category') or '—'
+        chat_id = ad.get('chat_id') or '—'
+        price = ad.get('price') or '—'
+        code = ad.get('code') or '—'
+        city = ad.get('city') or '—'
+        year = ad.get('year') or '—'
+        mileage = ad.get('mileage') or '—'
+        source_url = ad.get('source_url') or ''
+        created = ad.get('created_at') or ''
+
+        # === Фото ===
+        photos_html = ""
+        if media_path and os.path.exists(media_path):
             try:
-                r['path_files'] = ', '.join(os.listdir(mp)[:10]) if r['path_exists'] else '—'
-            except Exception:
-                r['path_files'] = 'ошибка'
+                photo_files = sorted([
+                    f for f in os.listdir(media_path)
+                    if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))
+                ])
+                for pf in photo_files[:5]:
+                    photos_html += f'''
+                        <img src="/admin/queue_photo/{ad_id}/{pf}"
+                             style="width:120px;height:90px;object-fit:cover;
+                                    border-radius:4px;margin:2px;cursor:pointer"
+                             onclick="window.open(this.src, '_blank')">
+                    '''
+            except Exception as e:
+                photos_html = f'<span style="color:#999">Ошибка: {e}</span>'
         else:
-            r['path_exists'] = False
-            r['path_files'] = '—'
+            photos_html = '<span style="color:#dc3545">❌ Папка не найдена</span>'
 
-    table_rows = ""
-    for r in rows:
-        exists_icon = '✅' if r['path_exists'] else '❌'
-        table_rows += f"""
-        <tr>
-            <td>{r.get('id')}</td>
-            <td>{r.get('folder_name', '—')}</td>
-            <td style="font-size:11px;color:#666">{r.get('media_path', '—')}</td>
-            <td>{exists_icon}</td>
-            <td style="font-size:11px">{r.get('path_files', '—')}</td>
-            <td>{r.get('category', '—')}</td>
-            <td>{r.get('status', '—')}</td>
-        </tr>
-        """
+        # === Краткий текст (первые 300 символов info.txt) ===
+        text_preview = ''
+        if media_path:
+            info_path = os.path.join(media_path, 'info.txt')
+            if os.path.exists(info_path):
+                try:
+                    with open(info_path, 'r', encoding='utf-8') as f:
+                        text_preview = f.read()[:300]
+                    text_preview = text_preview.replace('\n', '<br>')
+                except Exception:
+                    text_preview = '⚠️ Не читается'
+            else:
+                text_preview = '⚠️ Нет info.txt'
+
+        # === Кнопки ===
+        up_disabled = (i == 1)
+        down_disabled = (i == len(ads))
+
+        up_style = 'font-size:13px;padding:6px 10px;text-align:center'
+        down_style = 'font-size:13px;padding:6px 10px;text-align:center'
+        if up_disabled:
+            up_style += ';pointer-events:none;opacity:0.4'
+        if down_disabled:
+            down_style += ';pointer-events:none;opacity:0.4'
+
+        cards_html += f'''
+        <div class="card" id="ad_{ad_id}" style="padding:15px">
+            <div style="display:flex;gap:15px;flex-wrap:wrap">
+                <div style="flex:0 0 140px">
+                    <div style="background:#f8f9fa;padding:8px;border-radius:5px;
+                                text-align:center;font-weight:bold;font-size:20px">
+                        #{i}
+                    </div>
+                    <div style="font-size:11px;color:#666;margin-top:5px;text-align:center">
+                        ID {ad_id}
+                    </div>
+                </div>
+
+                <div style="flex:0 0 400px">
+                    {photos_html}
+                </div>
+
+                <div style="flex:1;min-width:300px">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:bold">
+                        {title}
+                    </p>
+                    <p style="margin:0 0 4px 0;font-size:13px;color:#555">
+                        📂 <b>{category}</b> → <code>{chat_id}</code>
+                    </p>
+                    <p style="margin:0 0 4px 0;font-size:13px;color:#555">
+                        💰 {price} ₽ · 📋 {code} · 📍 {city} · 📅 {year} · 🛣️ {mileage} км
+                    </p>
+                    <p style="margin:8px 0 4px 0;font-size:12px;color:#666">
+                        <a href="{source_url}" target="_blank">🔗 Источник VTB</a>
+                        · <a href="/admin/ad_detail/{ad_id}">👁️ Детали</a>
+                        · <span style="color:#999">создано: {created}</span>
+                    </p>
+                    <details style="margin-top:8px">
+                        <summary style="cursor:pointer;font-size:13px;color:#007bff">
+                            Показать текст поста
+                        </summary>
+                        <div style="background:#f8f9fa;padding:10px;border-radius:5px;
+                                    margin-top:5px;font-size:12px;line-height:1.5;
+                                    max-height:200px;overflow-y:auto">
+                            {text_preview}
+                        </div>
+                    </details>
+                </div>
+
+                <div style="flex:0 0 180px;display:flex;flex-direction:column;gap:5px">
+                    <a href="/admin/queue_move/{ad_id}/up"
+                       class="btn" style="{up_style}">
+                        ⬆️ Вверх
+                    </a>
+                    <a href="/admin/queue_move/{ad_id}/down"
+                       class="btn" style="{down_style}">
+                        ⬇️ Вниз
+                    </a>
+                    <a href="/admin/publish_ad/{ad_id}"
+                       class="btn btn-orange"
+                       style="font-size:13px;padding:6px 10px;text-align:center"
+                       onclick="return confirm('Опубликовать это объявление СЕЙЧАС?')">
+                        📤 Опубликовать
+                    </a>
+                    <a href="/admin/queue_delete/{ad_id}"
+                       class="btn btn-red"
+                       style="font-size:13px;padding:6px 10px;text-align:center"
+                       onclick="return confirm('Удалить объявление #{i} ({title})? Папка с медиа тоже будет удалена.')">
+                        🗑️ Удалить
+                    </a>
+                </div>
+            </div>
+        </div>
+        '''
+
+    if not cards_html:
+        cards_html = '''
+        <div class="card">
+            <p style="text-align:center;color:#999;font-size:16px">
+                Очередь пуста. Запустите парсер, чтобы наполнить её.
+            </p>
+            <div style="text-align:center;margin-top:15px">
+                <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Запустить парсер (5)</a>
+                <a href="/admin/run_parser?limit=50" class="btn btn-green">🚀 Запустить парсер (50)</a>
+            </div>
+        </div>
+        '''
 
     return BASE_STYLE + f"""
     <div class="card">
-        <h1>📋 Очередь парсинга ({len(rows)})</h1>
+        <h1>📋 Очередь на публикацию ({len(ads)})</h1>
+        <p class="hint">
+            Порядок публикации соответствует порядку карточек (сверху вниз).
+            Меняйте кнопками ⬆️/⬇️. Автопубликация берёт <b>самое верхнее</b> объявление.
+        </p>
         <a href="/admin" class="btn">← Назад</a>
         <a href="/admin/queue" class="btn btn-gray">🔄 Обновить</a>
+        <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
+        <a href="/admin/queue_clear" class="btn btn-red"
+           onclick="return confirm('Удалить ВСЮ очередь и все папки? Отменить нельзя.')">
+            🗑️ Очистить всю очередь
+        </a>
+    </div>
+    {cards_html}
+    """
+
+
+@app.route('/admin/queue_photo/<int:ad_id>/<path:filename>')
+@require_admin
+def admin_queue_photo(ad_id, filename):
+    """Отдаёт фото из папки объявления для предпросмотра."""
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return 'Not found', 404
+
+    media_path = ad.get('media_path')
+    if not media_path or not os.path.exists(media_path):
+        return 'Not found', 404
+
+    safe_name = os.path.basename(filename)
+    file_path = os.path.join(media_path, safe_name)
+
+    if not os.path.exists(file_path):
+        return 'Not found', 404
+
+    return send_file(file_path, mimetype='image/jpeg')
+
+
+@app.route('/admin/queue_delete/<int:ad_id>')
+@require_admin
+def admin_queue_delete(ad_id):
+    """Удаляет объявление из очереди + папку с медиа."""
+    bot_db.delete_ad(ad_id, delete_files=True)
+    return redirect('/admin/queue')
+
+
+@app.route('/admin/queue_move/<int:ad_id>/<direction>')
+@require_admin
+def admin_queue_move(ad_id, direction):
+    """Перемещает объявление вверх/вниз в очереди."""
+    bot_db.move_ad(ad_id, direction)
+    return redirect('/admin/queue')
+
+
+@app.route('/admin/queue_clear')
+@require_admin
+def admin_queue_clear():
+    """Удаляет ВСЮ очередь и все папки."""
+    ads = bot_db.get_all_pending_ads()
+    deleted_folders = 0
+    deleted_records = 0
+
+    for ad in ads:
+        media_path = ad.get('media_path')
+        if media_path and os.path.exists(media_path):
+            try:
+                shutil.rmtree(media_path)
+                deleted_folders += 1
+            except Exception as e:
+                logger.warning(f'⚠️ Не удалить {media_path}: {e}')
+
+        bot_db.delete_ad(ad['id'], delete_files=False)
+        deleted_records += 1
+
+    logger.info(f'🗑️ Очередь очищена: {deleted_records} записей, {deleted_folders} папок')
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🗑️ Очередь очищена</h1>
+        <p>Удалено записей: <b>{deleted_records}</b></p>
+        <p>Удалено папок: <b>{deleted_folders}</b></p>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>
+    """
+
+
+@app.route('/admin/ad_detail/<int:ad_id>')
+@require_admin
+def admin_ad_detail(ad_id):
+    """Детальный предпросмотр объявления: полный текст + все фото."""
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return BASE_STYLE + '''
+        <div class="card"><h1>❌ Не найдено</h1>
+        <a href="/admin/queue" class="btn">← К очереди</a></div>
+        '''
+
+    media_path = ad.get('media_path') or ''
+    text = ''
+    photos_html = ''
+    photos_count = 0
+
+    if media_path and os.path.exists(media_path):
+        info_path = os.path.join(media_path, 'info.txt')
+        if os.path.exists(info_path):
+            try:
+                with open(info_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+            except Exception as e:
+                text = f'⚠️ Ошибка чтения: {e}'
+
+        try:
+            photo_files = sorted([
+                f for f in os.listdir(media_path)
+                if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))
+            ])
+            photos_count = len(photo_files)
+            for pf in photo_files:
+                photos_html += f'''
+                    <img src="/admin/queue_photo/{ad_id}/{pf}"
+                         style="width:300px;height:auto;border-radius:6px;
+                                margin:5px;cursor:pointer"
+                         onclick="window.open(this.src, '_blank')">
+                '''
+        except Exception as e:
+            photos_html = f'<p style="color:red">Ошибка: {e}</p>'
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>👁️ Предпросмотр #{ad_id}</h1>
+        <a href="/admin/queue" class="btn">← К очереди</a>
+        <a href="/admin/publish_ad/{ad_id}" class="btn btn-orange"
+           onclick="return confirm('Опубликовать сейчас?')">📤 Опубликовать сейчас</a>
+        <a href="/admin/queue_delete/{ad_id}" class="btn btn-red"
+           onclick="return confirm('Удалить?')">🗑️ Удалить</a>
+    </div>
+
+    <div class="card">
+        <h2>📷 Фото ({photos_count})</h2>
+        <div>{photos_html or '<p style="color:#999">Нет фото</p>'}</div>
+    </div>
+
+    <div class="card">
+        <h2>📝 Текст поста (info.txt)</h2>
+        <pre style="background:#f8f9fa;padding:15px;border-radius:5px;
+                    white-space:pre-wrap;font-size:13px;line-height:1.6">{text}</pre>
+    </div>
+
+    <div class="card">
+        <h2>📊 Метаданные</h2>
         <table>
-            <tr>
-                <th>ID</th><th>Папка</th><th>media_path</th>
-                <th>Есть?</th><th>Файлы</th>
-                <th>Категория</th><th>Статус</th>
-            </tr>
-            {table_rows}
+            <tr><td>ID</td><td>{ad_id}</td></tr>
+            <tr><td>Категория</td><td>{ad.get('category', '')}</td></tr>
+            <tr><td>chat_id</td><td>{ad.get('chat_id', '')}</td></tr>
+            <tr><td>Название</td><td>{ad.get('title', '')}</td></tr>
+            <tr><td>Код</td><td>{ad.get('code', '')}</td></tr>
+            <tr><td>Цена</td><td>{ad.get('price', '')}</td></tr>
+            <tr><td>Город</td><td>{ad.get('city', '')}</td></tr>
+            <tr><td>Год</td><td>{ad.get('year', '')}</td></tr>
+            <tr><td>Пробег</td><td>{ad.get('mileage', '')}</td></tr>
+            <tr><td>Папка</td><td><code>{media_path}</code></td></tr>
+            <tr><td>Источник</td><td><a href="{ad.get('source_url', '')}" target="_blank">🔗 VTB</a></td></tr>
+            <tr><td>Создано</td><td>{ad.get('created_at', '')}</td></tr>
+            <tr><td>sort_order</td><td>{ad.get('sort_order', '')}</td></tr>
         </table>
     </div>
     """
 
+
+@app.route('/admin/publish_ad/<int:ad_id>')
+@require_admin
+def admin_publish_ad(ad_id):
+    """Публикует КОНКРЕТНОЕ объявление (по id), минуя очередь."""
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return BASE_STYLE + '''
+        <div class="card"><h1>❌ Не найдено</h1>
+        <a href="/admin/queue" class="btn">← К очереди</a></div>
+        '''
+
+    if ad.get('status') != 'pending':
+        return BASE_STYLE + f'''
+        <div class="card">
+            <h1>⚠️ Объявление уже не в очереди</h1>
+            <p>Статус: <b>{ad.get('status')}</b></p>
+            <a href="/admin/queue" class="btn">← К очереди</a>
+        </div>
+        '''
+
+    logger.info(f'📤 Публикация # {ad_id}: {ad.get("folder_name")}')
+
+    try:
+        ok, message, post_link = publish_one_ad(ad)
+        if ok:
+            link_html = (f'<p>🔗 <a href="{post_link}" target="_blank">{post_link}</a></p>'
+                         if post_link else '')
+            return BASE_STYLE + f"""
+            <div class="card">
+                <h1>✅ Опубликовано</h1>
+                <p><b>{ad.get('title', '')}</b></p>
+                <p>Категория: <code>{ad.get('category', '')}</code></p>
+                {link_html}
+                <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
+                <a href="/admin/queue" class="btn">📋 К очереди</a>
+                <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
+                <a href="/admin" class="btn btn-gray">← В админку</a>
+            </div>
+            """
+        else:
+            bot_db.mark_ad_failed(ad['id'], message)
+            return BASE_STYLE + f"""
+            <div class="card">
+                <h1>❌ Ошибка публикации</h1>
+                <p><b>{ad.get('title', '')}</b></p>
+                <div class="error-msg">{message}</div>
+                <a href="/admin/queue" class="btn">← К очереди</a>
+                <a href="/admin/publish_ad/{ad_id}" class="btn btn-orange">Попробовать ещё</a>
+            </div>
+            """
+    except Exception as e:
+        logger.exception(f'❌ Ошибка публикации: {e}')
+        bot_db.mark_ad_failed(ad['id'], str(e))
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>❌ Ошибка</h1>
+            <div class="error-msg">{e}</div>
+            <a href="/admin/queue" class="btn">← К очереди</a>
+        </div>
+        """
+        # ============================================================
+# АДМИНКА — прочие роуты (check_paths, list_folders, cleanup, clear_all)
+# ============================================================
 
 @app.route('/admin/check_paths')
 @require_admin
@@ -1313,20 +1647,15 @@ def admin_clear_all():
 # Защита от двойного запуска парсера
 # ============================================================
 
-_PARSER_PROC = [None]   # храним объект Popen, а не PID
+_PARSER_PROC = [None]
 
 
 def parser_is_running() -> bool:
-    """
-    Жив ли процесс парсера, запущенный ИМЕННО этим Flask-процессом.
-    Используем proc.poll() — надёжнее, чем os.kill(pid, 0),
-    потому что исключает случай с переиспользованием PID.
-    """
+    """Жив ли процесс парсера, запущенный ИМЕННО этим Flask-процессом."""
     proc = _PARSER_PROC[0]
     if proc is None:
         return False
     if proc.poll() is not None:
-        # процесс завершился — сбрасываем
         _PARSER_PROC[0] = None
         return False
     return True
@@ -1335,10 +1664,7 @@ def parser_is_running() -> bool:
 @app.route('/admin/run_parser')
 @require_admin
 def admin_run_parser():
-    """
-    Запуск парсера в ОТДЕЛЬНОМ процессе.
-    После завершения память полностью освобождается ОС.
-    """
+    """Запуск парсера в ОТДЕЛЬНОМ процессе."""
     limit = int(request.args.get('limit', 50))
 
     if parser_is_running():
@@ -1365,7 +1691,6 @@ def admin_run_parser():
         _PARSER_PROC[0] = proc
         logger.info(f'🚀 Парсер запущен PID={proc.pid}, лимит={limit}, лог={log_path}')
 
-        # Закрываем log_file, когда процесс завершится (в отдельном потоке)
         def _close_log_when_done():
             proc.wait()
             try:
@@ -1383,7 +1708,7 @@ def admin_run_parser():
             <p>Лог: <code>{log_path}</code></p>
             <p class="hint">После завершения процесс умрёт, и вся память вернётся ОС.</p>
             <a href="/admin/parser_status" class="btn">🚀 Смотреть прогресс</a>
-            <a href="/admin/queue" class="btn">📋 Проверить очередь</a>
+            <a href="/admin/queue" class="btn">📋 Очередь</a>
             <a href="/admin" class="btn btn-gray">← В админку</a>
         </div>
         """
@@ -1401,12 +1726,14 @@ def admin_run_parser():
 @app.route('/admin/publish_one')
 @require_admin
 def admin_publish_one():
+    """Ручная публикация: берёт ПЕРВОЕ по очереди (sort_order ASC)."""
     ads = bot_db.get_pending_ads(limit=1)
     if not ads:
         return BASE_STYLE + """
         <div class="card">
             <h1>⚠️ Очередь пуста</h1>
             <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Запустить парсер (5)</a>
+            <a href="/admin/queue" class="btn">📋 Очередь</a>
             <a href="/admin" class="btn btn-gray">← В админку</a>
         </div>
         """
@@ -1426,6 +1753,7 @@ def admin_publish_one():
                 {link_html}
                 <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
                 <a href="/admin/publish_one" class="btn btn-orange">📤 Опубликовать ещё 1</a>
+                <a href="/admin/queue" class="btn">📋 К очереди</a>
                 <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
                 <a href="/admin" class="btn btn-gray">← В админку</a>
             </div>
@@ -1438,6 +1766,7 @@ def admin_publish_one():
                 <p><b>{ad.get('title', '')}</b></p>
                 <div class="error-msg">{message}</div>
                 <a href="/admin/publish_one" class="btn btn-orange">Попробовать ещё</a>
+                <a href="/admin/queue" class="btn">← К очереди</a>
                 <a href="/admin" class="btn btn-gray">← В админку</a>
             </div>
             """
@@ -1483,9 +1812,9 @@ def webhook():
                     user_id,
                     "🏠 **VTB Bot**\n\n"
                     f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
+                    f"📋 **Очередь (предпросмотр):**\n{PUBLIC_URL}/admin/queue\n\n"
                     f"📅 **Опубликовано:**\n{PUBLIC_URL}/admin/today\n\n"
                     f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
-                    f"📋 **Очередь:**\n{PUBLIC_URL}/admin/queue\n\n"
                     f"🚀 **Статус парсера:**\n{PUBLIC_URL}/admin/parser_status\n\n"
                     "🔒 Пароль спросит браузер."
                 )
