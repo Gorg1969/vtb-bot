@@ -516,7 +516,7 @@ class VTBParser:
 **За покупкой и согласованием скидки обращайтесь в личные сообщения ⏩️ [Евгений](https://max.ru/u/f9LHodD0cOL4IXTfONTL9Ju-y7ShR5IHNPGNZ1MFYHPHImA10EgOQcxQWto)
 Если не отвечаю в течение 30 мин, обратитесь к [Надежда](https://max.ru/u/f9LHodD0cOIcl8J8friWk-iFWzi9jy7lJql-IMInGvvX_hM8s1w4klx-F0k)**
 
-*ПОМОЖЕМ В ПОДБОРЕ ПО ВАШИМ ПОЖЕЛАНИЯМ*
+*ПОДБОР ТЕХНИКИ ПОД ВАШУ ЗАДАЧУ С ОПЛАТОЙ ЗА РЕЗУЛЬТАТ*
 
 #изъятая #изъятка #конфискат"""
 
