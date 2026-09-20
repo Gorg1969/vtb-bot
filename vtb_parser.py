@@ -1,6 +1,6 @@
 # vtb_parser.py
 # ============================================================
-# Парсер VTB-лизинга -4
+# Парсер VTB-лизинга
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
@@ -12,6 +12,8 @@
 # - Стоп: когда ВСЕ категории вернули пустую страницу
 # - ПЕРЕЗАПУСК БРАУЗЕРА каждые 20 карточек (борьба с OOM)
 # - gc.collect() после каждой карточки
+# - ОТКЛОНЯЕМ объявления БЕЗ пробега И БЕЗ моточасов
+# - Парсим моточасы (для спецтехники)
 # ============================================================
 
 import os
@@ -139,10 +141,8 @@ def compress_image(input_path: str,
         jpeg_path = input_path.rsplit('.', 1)[0] + '.jpg'
         img.save(jpeg_path, 'JPEG', quality=quality, optimize=True)
 
-        # Явно закрываем изображение, чтобы освободить память
         img.close()
 
-        # Удаляем исходный файл, если он отличается от результата
         if jpeg_path != input_path and os.path.exists(input_path):
             try:
                 os.remove(input_path)
@@ -155,7 +155,6 @@ def compress_image(input_path: str,
 
     except Exception as e:
         logger.warning(f'⚠️ Ошибка сжатия {input_path}: {e}')
-        # Пытаемся удалить исходник
         try:
             if os.path.exists(input_path):
                 os.remove(input_path)
@@ -180,6 +179,7 @@ class VTBParser:
         self.skipped_flags = 0
         self.skipped_category = 0
         self.skipped_price = 0
+        self.skipped_no_mileage = 0
         self.errors = 0
 
     # --------------------------------------------------------
@@ -294,7 +294,8 @@ class VTBParser:
             if not price:
                 logger.warning('  ⚠️ Цена не найдена')
 
-            city = year = mileage = ''
+            # === ПАРСИМ ГОРОД, ГОД, ПРОБЕГ, МОТОЧАСЫ ===
+            city = year = mileage = motohours = ''
             items = page.query_selector_all(
                 'div.t-tab-content.active div.t-tab-content-column-item'
             )
@@ -313,9 +314,12 @@ class VTBParser:
                         year = value
                     elif 'пробег' in label and not mileage:
                         mileage = value
+                    elif 'моточас' in label and not motohours:
+                        motohours = value
                 except Exception:
                     continue
 
+            # === ФЛАГИ ===
             flags = set()
             for el in page.query_selector_all('div.t-market-item-flags-item'):
                 cls = el.get_attribute('class') or ''
@@ -328,6 +332,7 @@ class VTBParser:
                 if FLAG_REPAIR in cls:
                     flags.add('repair')
 
+            # === ФОТО ===
             photos = []
             for slider in page.query_selector_all('div.t-main-slider-slide[data-images]'):
                 data_images = slider.get_attribute('data-images')
@@ -351,6 +356,7 @@ class VTBParser:
                 'city': city,
                 'year': year,
                 'mileage': mileage,
+                'motohours': motohours,
                 'flags': list(flags),
                 'photos': photos[:MAX_PHOTOS_PER_AD],
             }
@@ -403,7 +409,6 @@ class VTBParser:
 
             ok = self._download_file(photo_url, temp_path, min_size=10000)
             if not ok:
-                # На всякий случай удаляем временный файл
                 if os.path.exists(temp_path):
                     try:
                         os.remove(temp_path)
@@ -412,14 +417,11 @@ class VTBParser:
                 logger.warning(f'  ⚠️ Фото {i} не скачалось')
                 continue
 
-            # Сжимаем во временный jpg
             jpeg_path = compress_image(temp_path)
             if not jpeg_path:
-                # compress_image уже удалил temp_path при ошибке
                 logger.warning(f'  ⚠️ Фото {i} не сжалось')
                 continue
 
-            # Перемещаем в final
             try:
                 if jpeg_path != final_path:
                     if os.path.exists(final_path):
@@ -429,7 +431,6 @@ class VTBParser:
                 logger.warning(f'  ⚠️ Не удалось переместить {jpeg_path}: {e}')
                 continue
 
-            # === Закраска номеров ===
             if MASK_PLATES and MASK_AVAILABLE:
                 try:
                     with open(final_path, 'rb') as f:
@@ -442,17 +443,13 @@ class VTBParser:
                     )
                     with open(final_path, 'wb') as f:
                         f.write(masked)
-                    # Освобождаем память
                     del original
                     del masked
                 except Exception as e:
                     logger.warning(f'⚠️ Ошибка закраски {final_path}: {e}')
 
             downloaded += 1
-
-            # ВАЖНО: даём Python освободить память после каждого фото
             gc.collect()
-
             time.sleep(0.3)
 
         if downloaded == 0:
@@ -486,6 +483,25 @@ class VTBParser:
             return False
 
     def _build_info_text(self, ad: Dict) -> str:
+        """
+        Собирает текст поста для публикации.
+        Пробег — если есть.
+        Моточасы — если есть.
+        Если ничего нет — блок с пробегом/моточасами пропускается
+        (но такие объявления отсеиваются РАНЬШЕ, в _process_one_url).
+        """
+        # Формируем блок "Пробег / Моточасы"
+        mileage = ad.get('mileage') or ''
+        motohours = ad.get('motohours') or ''
+
+        spec_lines = []
+        if mileage:
+            spec_lines.append(f"Пробег: {mileage} км.")
+        if motohours:
+            spec_lines.append(f"Моточасы: {motohours}")
+
+        spec_block = '\n'.join(spec_lines)
+
         return f"""**{ad['title']}**
 
 **Цена в лизинг: {ad['price']} руб с НДС**
@@ -493,7 +509,7 @@ class VTBParser:
 *возможна скидка после осмотра*
 Изъятая техника ЛК -  ✅
 
-Пробег: {ad['mileage']} км.
+{spec_block}
 Год: {ad['year']}
 Место нахождения: {ad['city']}
 
@@ -505,12 +521,22 @@ class VTBParser:
 #изъятая #изъятка #конфискат"""
 
     def _build_report_text(self, ad: Dict) -> str:
+        mileage = ad.get('mileage') or ''
+        motohours = ad.get('motohours') or ''
+
+        spec_lines = []
+        if mileage:
+            spec_lines.append(f"Пробег: {mileage}")
+        if motohours:
+            spec_lines.append(f"Моточасы: {motohours}")
+        spec_block = '\n'.join(spec_lines)
+
         return f"""Название: {ad['title']}
 Ссылка: {ad['source_url']}
 Код предложения: {ad['code']}
 Город: {ad['city']}
 Год: {ad['year']}
-Пробег: {ad['mileage']}
+{spec_block}
 Цена: {ad['price']} руб"""
 
     # --------------------------------------------------------
@@ -531,6 +557,21 @@ class VTBParser:
             self.errors += 1
             return False, saved_count
 
+        # === НОВОЕ: проверка наличия пробега ИЛИ моточасов ===
+        mileage = (ad.get('mileage') or '').strip()
+        motohours = (ad.get('motohours') or '').strip()
+
+        if not mileage and not motohours:
+            logger.info('  ⏭️ Нет ни пробега, ни моточасов — пропуск')
+            self.skipped_no_mileage += 1
+            return False, saved_count
+
+        if mileage:
+            logger.info(f'  🛣️ Пробег: {mileage} км')
+        if motohours:
+            logger.info(f'  ⏱️ Моточасы: {motohours}')
+
+        # === Флаги ===
         ok, reason = self.check_flags(ad['flags'])
         if not ok:
             logger.info(f'  ⏭️ Флаги: {reason} ({ad["flags"]})')
@@ -538,6 +579,7 @@ class VTBParser:
             return False, saved_count
         logger.info(f'  ✅ Флаги ОК: {ad["flags"]}')
 
+        # === Цена ===
         price_num = price_to_int(ad['price'])
         if MIN_PRICE > 0 and price_num < MIN_PRICE:
             logger.info(f'  ⏭️ Цена {price_num:,} < {MIN_PRICE:,} — пропуск'.replace(',', ' '))
@@ -579,7 +621,6 @@ class VTBParser:
     # --------------------------------------------------------
 
     def _create_browser(self, p):
-        """Создаёт браузер, контекст и страницу."""
         browser = p.chromium.launch(
             headless=True,
             args=['--no-sandbox', '--disable-setuid-sandbox',
@@ -593,7 +634,6 @@ class VTBParser:
         return browser, context, page
 
     def _close_browser(self, browser, context, page):
-        """Аккуратно закрывает всё."""
         try:
             if page:
                 page.close()
@@ -620,6 +660,7 @@ class VTBParser:
         logger.info(f'   Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2')
         logger.info(f'   Режим: ПОСТРАНИЧНЫЙ (стр.1 всех категорий → стр.2 всех → ...)')
         logger.info(f'   Перезапуск браузера: каждые {CARDS_BEFORE_RESTART} карточек')
+        logger.info(f'   Отклоняем: без пробега И без моточасов')
         logger.info(f'   Стоп: когда ВСЕ категории вернули пустую страницу')
         logger.info('=' * 60)
 
@@ -701,7 +742,6 @@ class VTBParser:
                             )
                             cards_since_restart += 1
 
-                            # Освобождаем память после каждой карточки
                             gc.collect()
 
                     if not any_cards_on_page:
@@ -723,6 +763,7 @@ class VTBParser:
         logger.info(f'  ⏭️ Дублей: {self.skipped_dup}')
         logger.info(f'  🚫 Флаги: {self.skipped_flags}')
         logger.info(f'  💰 Цена не подошла: {self.skipped_price}')
+        logger.info(f'  🛣️ Без пробега/моточасов: {self.skipped_no_mileage}')
         logger.info(f'  📂 Категория не определена: {self.skipped_category}')
         logger.info(f'  ❌ Ошибок: {self.errors}')
         logger.info(f'  💾 В очередь: {saved_count}')
