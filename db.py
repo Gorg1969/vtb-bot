@@ -42,6 +42,7 @@ class BotDB:
                 media_path TEXT,
                 status TEXT DEFAULT 'pending',
                 error TEXT,
+                sort_order INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 published_at TIMESTAMP
             )
@@ -75,6 +76,15 @@ class BotDB:
             )
         ''')
 
+        # === Миграция: добавить sort_order, если её нет ===
+        c.execute("PRAGMA table_info(parsed_ads)")
+        columns = [row[1] for row in c.fetchall()]
+        if 'sort_order' not in columns:
+            c.execute('ALTER TABLE parsed_ads ADD COLUMN sort_order INTEGER DEFAULT 0')
+            # Заполняем sort_order = id для существующих записей
+            c.execute('UPDATE parsed_ads SET sort_order = id WHERE sort_order = 0')
+            logger.info('✅ Добавлена колонка sort_order в parsed_ads')
+
         conn.commit()
         conn.close()
         logger.info(f'✅ БД инициализирована: {self.db_path}')
@@ -84,14 +94,24 @@ class BotDB:
     # --------------------------------------------------------
 
     def add_parsed_ad(self, ad: Dict) -> bool:
+        """
+        Добавляет объявление в очередь.
+        sort_order выставляется в конец очереди (max + 1).
+        """
         try:
             conn = self._connect()
             c = conn.cursor()
+
+            # Вычисляем sort_order = max + 1
+            c.execute("SELECT COALESCE(MAX(sort_order), 0) FROM parsed_ads")
+            max_order = c.fetchone()[0]
+            new_order = max_order + 1
+
             c.execute('''
                 INSERT OR IGNORE INTO parsed_ads
                 (source_url, title, code, price, city, year, mileage,
-                 category, chat_id, folder_name, media_path, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                 category, chat_id, folder_name, media_path, status, sort_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             ''', (
                 ad.get('source_url'),
                 ad.get('title'),
@@ -104,6 +124,7 @@ class BotDB:
                 ad.get('chat_id'),
                 ad.get('folder_name'),
                 ad.get('media_path'),
+                new_order,
             ))
             conn.commit()
             inserted = c.rowcount > 0
@@ -130,17 +151,42 @@ class BotDB:
         return found
 
     def get_pending_ads(self, limit: int = 10) -> List[Dict]:
+        """
+        Возвращает pending-объявления в порядке sort_order ASC, created_at ASC.
+        Именно в этом порядке автопубликация берёт объявления.
+        """
         conn = self._connect()
         c = conn.cursor()
         c.execute('''
             SELECT * FROM parsed_ads
             WHERE status = 'pending'
-            ORDER BY created_at ASC
+            ORDER BY sort_order ASC, created_at ASC
             LIMIT ?
         ''', (limit,))
         rows = [dict(r) for r in c.fetchall()]
         conn.close()
         return rows
+
+    def get_all_pending_ads(self) -> List[Dict]:
+        """Все pending-объявления в порядке очереди."""
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute('''
+            SELECT * FROM parsed_ads
+            WHERE status = 'pending'
+            ORDER BY sort_order ASC, created_at ASC
+        ''')
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return rows
+
+    def get_ad_by_id(self, ad_id: int) -> Optional[Dict]:
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute('SELECT * FROM parsed_ads WHERE id = ?', (ad_id,))
+        row = c.fetchone()
+        conn.close()
+        return dict(row) if row else None
 
     def mark_ad_published(self, ad_id: int, max_post_url: str = None):
         conn = self._connect()
@@ -163,6 +209,88 @@ class BotDB:
         ''', (error, ad_id))
         conn.commit()
         conn.close()
+
+    def delete_ad(self, ad_id: int, delete_files: bool = True) -> bool:
+        """
+        Удаляет объявление из БД. Если delete_files=True — удаляет папку с медиа.
+        Возвращает True, если запись найдена и удалена.
+        """
+        import shutil
+        import os
+
+        ad = self.get_ad_by_id(ad_id)
+        if not ad:
+            return False
+
+        media_path = ad.get('media_path')
+
+        # Удаляем папку
+        if delete_files and media_path and os.path.exists(media_path):
+            try:
+                shutil.rmtree(media_path)
+                logger.info(f'🗑️ Папка удалена: {media_path}')
+            except Exception as e:
+                logger.warning(f'⚠️ Не удалить {media_path}: {e}')
+
+        # Удаляем запись
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute('DELETE FROM parsed_ads WHERE id = ?', (ad_id,))
+        conn.commit()
+        conn.close()
+
+        logger.info(f'🗑️ Объявление #{ad_id} удалено из БД')
+        return True
+
+    def move_ad(self, ad_id: int, direction: str) -> bool:
+        """
+        Меняет порядок публикации.
+        direction='up'   — поменять sort_order с предыдущим pending
+        direction='down' — поменять sort_order со следующим pending
+        """
+        if direction not in ('up', 'down'):
+            return False
+
+        conn = self._connect()
+        c = conn.cursor()
+
+        c.execute('SELECT id, sort_order FROM parsed_ads WHERE id = ?', (ad_id,))
+        current = c.fetchone()
+        if not current:
+            conn.close()
+            return False
+
+        current_order = current[1]
+
+        if direction == 'up':
+            c.execute('''
+                SELECT id, sort_order FROM parsed_ads
+                WHERE status = 'pending' AND sort_order < ?
+                ORDER BY sort_order DESC LIMIT 1
+            ''', (current_order,))
+        else:
+            c.execute('''
+                SELECT id, sort_order FROM parsed_ads
+                WHERE status = 'pending' AND sort_order > ?
+                ORDER BY sort_order ASC LIMIT 1
+            ''', (current_order,))
+
+        neighbor = c.fetchone()
+        if not neighbor:
+            conn.close()
+            return False
+
+        neighbor_id, neighbor_order = neighbor
+
+        # Меняем местами
+        c.execute('UPDATE parsed_ads SET sort_order = ? WHERE id = ?',
+                  (neighbor_order, ad_id))
+        c.execute('UPDATE parsed_ads SET sort_order = ? WHERE id = ?',
+                  (current_order, neighbor_id))
+
+        conn.commit()
+        conn.close()
+        return True
 
     def count_by_status(self) -> Dict:
         conn = self._connect()
@@ -203,7 +331,6 @@ class BotDB:
         return pub_id
 
     def get_publications_today(self) -> List[Dict]:
-        """Публикации за сегодня (простые)."""
         conn = self._connect()
         c = conn.cursor()
         c.execute('''
@@ -216,10 +343,6 @@ class BotDB:
         return rows
 
     def get_publications_today_full(self) -> List[Dict]:
-        """
-        Публикации за сегодня (расширенные — с датой, временем МСК, ценой).
-        Используется на странице /admin/today и для экспорта в Excel.
-        """
         import pytz
         moscow_tz = pytz.timezone('Europe/Moscow')
 
