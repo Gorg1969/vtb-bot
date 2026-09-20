@@ -13,6 +13,7 @@
 # - ПЕРЕЗАПУСК БРАУЗЕРА каждые 20 карточек (борьба с OOM)
 # - gc.collect() после каждой карточки
 # - ОТКЛОНЯЕМ объявления БЕЗ пробега И БЕЗ моточасов
+#   (ИСКЛЮЧЕНИЕ: trailer — у прицепов этих полей нет по определению)
 # - Парсим моточасы (для спецтехники)
 # ============================================================
 
@@ -64,6 +65,10 @@ JPEG_QUALITY = 85
 
 # === Перезапуск браузера ===
 CARDS_BEFORE_RESTART = 20
+
+# === Категории, где пробег/моточасы НЕ обязательны ===
+# (прицепы по определению не имеют ни пробега, ни моточасов)
+CATEGORIES_WITHOUT_MILEAGE = {'trailer'}
 
 
 # ============================================================
@@ -487,10 +492,8 @@ class VTBParser:
         Собирает текст поста для публикации.
         Пробег — если есть.
         Моточасы — если есть.
-        Если ничего нет — блок с пробегом/моточасами пропускается
-        (но такие объявления отсеиваются РАНЬШЕ, в _process_one_url).
+        Если ничего нет (например, прицеп) — блок пропускается.
         """
-        # Формируем блок "Пробег / Моточасы"
         mileage = ad.get('mileage') or ''
         motohours = ad.get('motohours') or ''
 
@@ -557,19 +560,24 @@ class VTBParser:
             self.errors += 1
             return False, saved_count
 
-        # === НОВОЕ: проверка наличия пробега ИЛИ моточасов ===
+        # === Проверка наличия пробега ИЛИ моточасов ===
+        # ИСКЛЮЧЕНИЕ: категории из CATEGORIES_WITHOUT_MILEAGE (прицепы)
+        # у них этих полей нет по определению — не отсеиваем.
         mileage = (ad.get('mileage') or '').strip()
         motohours = (ad.get('motohours') or '').strip()
+        cat_name = section.get('name', '')
 
-        if not mileage and not motohours:
-            logger.info('  ⏭️ Нет ни пробега, ни моточасов — пропуск')
-            self.skipped_no_mileage += 1
-            return False, saved_count
-
-        if mileage:
-            logger.info(f'  🛣️ Пробег: {mileage} км')
-        if motohours:
-            logger.info(f'  ⏱️ Моточасы: {motohours}')
+        if cat_name not in CATEGORIES_WITHOUT_MILEAGE:
+            if not mileage and not motohours:
+                logger.info('  ⏭️ Нет ни пробега, ни моточасов — пропуск')
+                self.skipped_no_mileage += 1
+                return False, saved_count
+            if mileage:
+                logger.info(f'  🛣️ Пробег: {mileage} км')
+            if motohours:
+                logger.info(f'  ⏱️ Моточасы: {motohours}')
+        else:
+            logger.info(f'  ℹ️ Категория "{cat_name}": проверка пробега/моточасов пропущена')
 
         # === Флаги ===
         ok, reason = self.check_flags(ad['flags'])
@@ -661,6 +669,7 @@ class VTBParser:
         logger.info(f'   Режим: ПОСТРАНИЧНЫЙ (стр.1 всех категорий → стр.2 всех → ...)')
         logger.info(f'   Перезапуск браузера: каждые {CARDS_BEFORE_RESTART} карточек')
         logger.info(f'   Отклоняем: без пробега И без моточасов')
+        logger.info(f'   Исключения: {sorted(CATEGORIES_WITHOUT_MILEAGE)}')
         logger.info(f'   Стоп: когда ВСЕ категории вернули пустую страницу')
         logger.info('=' * 60)
 
