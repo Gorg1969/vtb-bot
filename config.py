@@ -88,7 +88,7 @@ MAX_PAGES = 200
 MAX_CARDS_PER_SECTION = 300    # максимум карточек с одного раздела
 
 # === Фильтр по цене ===
-MIN_PRICE = 2_500_000
+MIN_PRICE = 2_200_000
 MAX_PRICE = 0
 
 # === Флаги ===
@@ -103,14 +103,14 @@ SCHEDULE_END = "20:00"
 DAILY_LIMIT = 150
 
 # === Таймауты ===
-PAGE_TIMEOUT = 60000
+PAGE_TIMEOUT = 80000
 CARD_DELAY = 0.5
 
 # === Закраска номеров ===
 MASK_PLATES = True
 PLATE_MODEL_PATH = '/app/yolov8_plate_fp16.onnx'
-PLATE_CONFIDENCE = 0.4
-PLATE_PADDING = 3
+PLATE_CONFIDENCE = 0.25
+PLATE_PADDING = 5
 
 
 def get_sections_from_db(db=None):
