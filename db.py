@@ -81,7 +81,6 @@ class BotDB:
         columns = [row[1] for row in c.fetchall()]
         if 'sort_order' not in columns:
             c.execute('ALTER TABLE parsed_ads ADD COLUMN sort_order INTEGER DEFAULT 0')
-            # Заполняем sort_order = id для существующих записей
             c.execute('UPDATE parsed_ads SET sort_order = id WHERE sort_order = 0')
             logger.info('✅ Добавлена колонка sort_order в parsed_ads')
 
@@ -102,7 +101,6 @@ class BotDB:
             conn = self._connect()
             c = conn.cursor()
 
-            # Вычисляем sort_order = max + 1
             c.execute("SELECT COALESCE(MAX(sort_order), 0) FROM parsed_ads")
             max_order = c.fetchone()[0]
             new_order = max_order + 1
@@ -224,7 +222,6 @@ class BotDB:
 
         media_path = ad.get('media_path')
 
-        # Удаляем папку
         if delete_files and media_path and os.path.exists(media_path):
             try:
                 shutil.rmtree(media_path)
@@ -232,7 +229,6 @@ class BotDB:
             except Exception as e:
                 logger.warning(f'⚠️ Не удалить {media_path}: {e}')
 
-        # Удаляем запись
         conn = self._connect()
         c = conn.cursor()
         c.execute('DELETE FROM parsed_ads WHERE id = ?', (ad_id,))
@@ -282,7 +278,6 @@ class BotDB:
 
         neighbor_id, neighbor_order = neighbor
 
-        # Меняем местами
         c.execute('UPDATE parsed_ads SET sort_order = ? WHERE id = ?',
                   (neighbor_order, ad_id))
         c.execute('UPDATE parsed_ads SET sort_order = ? WHERE id = ?',
@@ -291,6 +286,109 @@ class BotDB:
         conn.commit()
         conn.close()
         return True
+
+    # --------------------------------------------------------
+    # ПЕРЕМЕЖЕНИЕ КАТЕГОРИЙ В ОЧЕРЕДИ
+    # --------------------------------------------------------
+
+    # Порядок групп категорий для перемежения.
+    # Внутри одной группы (например, "дорожная техника") —
+    # несколько категорий, которые идут как одна "полка".
+    CATEGORY_GROUPS = [
+        ['truck_samosval'],                                  # 1. Самосвалы
+        ['truck_sedelny'],                                   # 2. Седельные тягачи
+        ['buldozer', 'excavator', 'grader'],                 # 3. Дорожная техника
+        ['trailer'],                                         # 4. Прицепы
+        ['car'],                                             # 5. Легковые
+    ]
+
+    def resort_queue_by_categories(self) -> int:
+        """
+        Пересчитывает sort_order у всех pending-объявлений так,
+        чтобы категории шли ПО ОЧЕРЕДИ (перемежались).
+
+        Логика:
+          - Группируем все pending по "полкам" (CATEGORY_GROUPS).
+          - Внутри каждой полки объявления сортируются по created_at.
+          - Затем "каруселью" берём по одному из каждой полки по кругу:
+              полка1[0], полка2[0], полка3[0], полка4[0], полка5[0],
+              полка1[1], полка2[1], ...
+          - Присваиваем sort_order 1, 2, 3, ...
+
+        Возвращает количество обновлённых записей.
+        """
+        conn = self._connect()
+        c = conn.cursor()
+
+        c.execute('''
+            SELECT id, category FROM parsed_ads
+            WHERE status = 'pending'
+            ORDER BY created_at ASC, id ASC
+        ''')
+        rows = c.fetchall()
+
+        if not rows:
+            conn.close()
+            return 0
+
+        # Раскладываем по полкам
+        buckets = {i: [] for i in range(len(self.CATEGORY_GROUPS))}
+        uncategorized = []
+
+        for row in rows:
+            ad_id = row[0]
+            cat = row[1] or ''
+            placed = False
+            for i, group in enumerate(self.CATEGORY_GROUPS):
+                if cat in group:
+                    buckets[i].append(ad_id)
+                    placed = True
+                    break
+            if not placed:
+                uncategorized.append(ad_id)
+
+        # Крутим "карусель"
+        ordered_ids = []
+        max_len = max((len(b) for b in buckets.values()), default=0)
+
+        for idx in range(max_len):
+            for bucket_idx in range(len(self.CATEGORY_GROUPS)):
+                bucket = buckets[bucket_idx]
+                if idx < len(bucket):
+                    ordered_ids.append(bucket[idx])
+
+        # В конец — всё, что не попало в группы
+        ordered_ids.extend(uncategorized)
+
+        # Присваиваем sort_order 1..N
+        for new_order, ad_id in enumerate(ordered_ids, start=1):
+            c.execute(
+                'UPDATE parsed_ads SET sort_order = ? WHERE id = ?',
+                (new_order, ad_id)
+            )
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f'🔀 Очередь перемежена: {len(ordered_ids)} записей, '
+                    f'полок: {len(self.CATEGORY_GROUPS)}')
+        return len(ordered_ids)
+
+    def get_queue_category_summary(self) -> Dict:
+        """
+        Возвращает сводку: сколько pending-объявлений в каждой категории.
+        """
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute('''
+            SELECT category, COUNT(*) FROM parsed_ads
+            WHERE status = 'pending'
+            GROUP BY category
+            ORDER BY COUNT(*) DESC
+        ''')
+        result = {row[0]: row[1] for row in c.fetchall()}
+        conn.close()
+        return result
 
     def count_by_status(self) -> Dict:
         conn = self._connect()
