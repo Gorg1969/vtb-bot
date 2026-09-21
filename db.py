@@ -238,6 +238,90 @@ class BotDB:
         logger.info(f'🗑️ Объявление #{ad_id} удалено из БД')
         return True
 
+    # --------------------------------------------------------
+    # УДАЛЕНИЕ ОТДЕЛЬНОГО ФОТО
+    # --------------------------------------------------------
+
+    def delete_ad_photo(self, ad_id: int, filename: str, keep_min: int = 1) -> tuple:
+        """
+        Удаляет ОДНО фото из папки объявления.
+
+        keep_min — минимальное количество фото, которое должно остаться.
+                   По умолчанию 1: если после удаления не останется ни одного
+                   фото, удаление НЕ выполняется.
+
+        Возвращает (success: bool, message: str, remaining: int).
+        """
+        import os
+
+        ad = self.get_ad_by_id(ad_id)
+        if not ad:
+            return False, 'Объявление не найдено', 0
+
+        media_path = ad.get('media_path')
+        if not media_path or not os.path.exists(media_path):
+            return False, 'Папка с медиа не найдена', 0
+
+        # Защита от path traversal
+        safe_name = os.path.basename(filename)
+        file_path = os.path.join(media_path, safe_name)
+
+        if not os.path.exists(file_path):
+            return False, f'Файл не найден: {safe_name}', 0
+
+        # Считаем, сколько фото сейчас
+        try:
+            photos = [
+                f for f in os.listdir(media_path)
+                if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))
+            ]
+        except Exception as e:
+            return False, f'Ошибка чтения папки: {e}', 0
+
+        if len(photos) <= keep_min:
+            return (
+                False,
+                f'Нельзя удалить: осталось {len(photos)} фото (минимум {keep_min})',
+                len(photos),
+            )
+
+        # Удаляем
+        try:
+            os.remove(file_path)
+            logger.info(f'🗑️ Удалено фото: {file_path}')
+        except Exception as e:
+            return False, f'Ошибка удаления: {e}', len(photos)
+
+        remaining = len(photos) - 1
+        return True, f'Удалено: {safe_name}', remaining
+
+    def get_ad_photos(self, ad_id: int) -> list:
+        """
+        Возвращает список имён фото в папке объявления (отсортированный).
+        """
+        import os
+
+        ad = self.get_ad_by_id(ad_id)
+        if not ad:
+            return []
+
+        media_path = ad.get('media_path')
+        if not media_path or not os.path.exists(media_path):
+            return []
+
+        try:
+            photos = sorted([
+                f for f in os.listdir(media_path)
+                if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))
+            ])
+            return photos
+        except Exception:
+            return []
+
+    # --------------------------------------------------------
+    # ПЕРЕМЕЩЕНИЕ В ОЧЕРЕДИ
+    # --------------------------------------------------------
+
     def move_ad(self, ad_id: int, direction: str) -> bool:
         """
         Меняет порядок публикации.
@@ -291,9 +375,6 @@ class BotDB:
     # ПЕРЕМЕЖЕНИЕ КАТЕГОРИЙ В ОЧЕРЕДИ
     # --------------------------------------------------------
 
-    # Порядок групп категорий для перемежения.
-    # Внутри одной группы (например, "дорожная техника") —
-    # несколько категорий, которые идут как одна "полка".
     CATEGORY_GROUPS = [
         ['truck_samosval'],                                  # 1. Самосвалы
         ['truck_sedelny'],                                   # 2. Седельные тягачи
@@ -306,16 +387,6 @@ class BotDB:
         """
         Пересчитывает sort_order у всех pending-объявлений так,
         чтобы категории шли ПО ОЧЕРЕДИ (перемежались).
-
-        Логика:
-          - Группируем все pending по "полкам" (CATEGORY_GROUPS).
-          - Внутри каждой полки объявления сортируются по created_at.
-          - Затем "каруселью" берём по одному из каждой полки по кругу:
-              полка1[0], полка2[0], полка3[0], полка4[0], полка5[0],
-              полка1[1], полка2[1], ...
-          - Присваиваем sort_order 1, 2, 3, ...
-
-        Возвращает количество обновлённых записей.
         """
         conn = self._connect()
         c = conn.cursor()
@@ -331,7 +402,6 @@ class BotDB:
             conn.close()
             return 0
 
-        # Раскладываем по полкам
         buckets = {i: [] for i in range(len(self.CATEGORY_GROUPS))}
         uncategorized = []
 
@@ -347,7 +417,6 @@ class BotDB:
             if not placed:
                 uncategorized.append(ad_id)
 
-        # Крутим "карусель"
         ordered_ids = []
         max_len = max((len(b) for b in buckets.values()), default=0)
 
@@ -357,10 +426,8 @@ class BotDB:
                 if idx < len(bucket):
                     ordered_ids.append(bucket[idx])
 
-        # В конец — всё, что не попало в группы
         ordered_ids.extend(uncategorized)
 
-        # Присваиваем sort_order 1..N
         for new_order, ad_id in enumerate(ordered_ids, start=1):
             c.execute(
                 'UPDATE parsed_ads SET sort_order = ? WHERE id = ?',
