@@ -4,6 +4,7 @@
 # + автопубликация по расписанию
 # + парсер в отдельном процессе (экономия RAM)
 # + очередь с предпросмотром, сортировкой, удалением
+# + перемежение категорий в очереди
 # ============================================================
 
 import os
@@ -663,6 +664,12 @@ def ingest_ads():
             except Exception as e:
                 logger.error(f'❌ {e}')
                 skipped += 1
+        # После массовой загрузки — перемешать
+        if added > 0:
+            try:
+                bot_db.resort_queue_by_categories()
+            except Exception as e:
+                logger.warning(f'⚠️ resort: {e}')
         return jsonify({'success': True, 'added': added, 'skipped': skipped})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1123,7 +1130,7 @@ def api_today_export():
 
 
 # ============================================================
-# АДМИНКА — ОЧЕРЕДЬ (НОВОЕ: предпросмотр, сортировка, удаление)
+# АДМИНКА — ОЧЕРЕДЬ (предпросмотр, сортировка, удаление)
 # ============================================================
 
 @app.route('/admin/queue')
@@ -1147,7 +1154,6 @@ def admin_queue():
         source_url = ad.get('source_url') or ''
         created = ad.get('created_at') or ''
 
-        # === Фото ===
         photos_html = ""
         if media_path and os.path.exists(media_path):
             try:
@@ -1167,7 +1173,6 @@ def admin_queue():
         else:
             photos_html = '<span style="color:#dc3545">❌ Папка не найдена</span>'
 
-        # === Краткий текст (первые 300 символов info.txt) ===
         text_preview = ''
         if media_path:
             info_path = os.path.join(media_path, 'info.txt')
@@ -1181,7 +1186,6 @@ def admin_queue():
             else:
                 text_preview = '⚠️ Нет info.txt'
 
-        # === Кнопки ===
         up_disabled = (i == 1)
         down_disabled = (i == len(ads))
 
@@ -1275,6 +1279,15 @@ def admin_queue():
         </div>
         '''
 
+    # === Сводка по категориям ===
+    summary = bot_db.get_queue_category_summary()
+    summary_html = ""
+    if summary:
+        summary_items = " · ".join(
+            f"<b>{cat}</b>: {cnt}" for cat, cnt in summary.items()
+        )
+        summary_html = f'<p class="hint">📊 По категориям: {summary_items}</p>'
+
     return BASE_STYLE + f"""
     <div class="card">
         <h1>📋 Очередь на публикацию ({len(ads)})</h1>
@@ -1282,8 +1295,13 @@ def admin_queue():
             Порядок публикации соответствует порядку карточек (сверху вниз).
             Меняйте кнопками ⬆️/⬇️. Автопубликация берёт <b>самое верхнее</b> объявление.
         </p>
+        {summary_html}
         <a href="/admin" class="btn">← Назад</a>
         <a href="/admin/queue" class="btn btn-gray">🔄 Обновить</a>
+        <a href="/admin/queue_resort" class="btn"
+           onclick="return confirm('Пересчитать порядок: перемешать категории? Текущий ручной порядок будет сброшен.')">
+            🔀 Перемешать по категориям
+        </a>
         <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
         <a href="/admin/queue_clear" class="btn btn-red"
            onclick="return confirm('Удалить ВСЮ очередь и все папки? Отменить нельзя.')">
@@ -1329,6 +1347,35 @@ def admin_queue_move(ad_id, direction):
     """Перемещает объявление вверх/вниз в очереди."""
     bot_db.move_ad(ad_id, direction)
     return redirect('/admin/queue')
+
+
+@app.route('/admin/queue_resort')
+@require_admin
+def admin_queue_resort():
+    """Пересчитывает sort_order: перемежает категории в очереди."""
+    try:
+        count = bot_db.resort_queue_by_categories()
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>🔀 Очередь перемежена</h1>
+            <p>Обработано записей: <b>{count}</b></p>
+            <p class="hint">
+                Теперь публикация пойдёт по очереди в разные категории:
+                <b>Самосвал → Тягач → Дорожная → Прицеп → Легковые → снова...</b>
+            </p>
+            <a href="/admin/queue" class="btn">📋 К очереди</a>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
+    except Exception as e:
+        logger.exception(f'❌ Ошибка перемежения: {e}')
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>❌ Ошибка</h1>
+            <div class="error-msg">{e}</div>
+            <a href="/admin/queue" class="btn">← К очереди</a>
+        </div>
+        """
 
 
 @app.route('/admin/queue_clear')
