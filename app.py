@@ -5,6 +5,7 @@
 # + парсер в отдельном процессе (экономия RAM)
 # + очередь с предпросмотром, сортировкой, удалением
 # + перемежение категорий в очереди
+# + удаление отдельного фото из карточки
 # ============================================================
 
 import os
@@ -562,6 +563,25 @@ BASE_STYLE = """
     pre.log { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 5px;
               overflow-x: auto; font-size: 12px; line-height: 1.4; max-height: 700px;
               overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+    .photo-wrap { position: relative; display: inline-block; margin: 5px; }
+    .photo-del {
+        position: absolute; top: 8px; right: 8px;
+        background: rgba(220,53,69,0.9); color: white;
+        padding: 4px 8px; border-radius: 4px;
+        font-size: 12px; text-decoration: none;
+        cursor: pointer; font-weight: bold;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        line-height: 1;
+    }
+    .photo-del:hover { background: #dc3545; color: white; }
+    .photo-del-locked {
+        position: absolute; top: 8px; right: 8px;
+        background: rgba(108,117,125,0.7); color: white;
+        padding: 4px 8px; border-radius: 4px;
+        font-size: 12px; font-weight: bold;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        line-height: 1;
+    }
 </style>
 """
 
@@ -1130,7 +1150,7 @@ def api_today_export():
 
 
 # ============================================================
-# АДМИНКА — ОЧЕРЕДЬ (предпросмотр, сортировка, удаление)
+# АДМИНКА — ОЧЕРЕДЬ (предпросмотр, сортировка, удаление, фото)
 # ============================================================
 
 @app.route('/admin/queue')
@@ -1154,6 +1174,7 @@ def admin_queue():
         source_url = ad.get('source_url') or ''
         created = ad.get('created_at') or ''
 
+        # === Фото с крестиком ===
         photos_html = ""
         if media_path and os.path.exists(media_path):
             try:
@@ -1163,10 +1184,23 @@ def admin_queue():
                 ])
                 for pf in photo_files[:5]:
                     photos_html += f'''
-                        <img src="/admin/queue_photo/{ad_id}/{pf}"
-                             style="width:120px;height:90px;object-fit:cover;
-                                    border-radius:4px;margin:2px;cursor:pointer"
-                             onclick="window.open(this.src, '_blank')">
+                        <div style="position:relative;display:inline-block;margin:2px">
+                            <img src="/admin/queue_photo/{ad_id}/{pf}"
+                                 style="width:120px;height:90px;object-fit:cover;
+                                        border-radius:4px;cursor:pointer;display:block"
+                                 onclick="window.open(this.src, '_blank')">
+                            <a href="/admin/queue_photo_delete/{ad_id}/{pf}"
+                               style="position:absolute;top:2px;right:2px;
+                                      background:rgba(220,53,69,0.9);color:white;
+                                      padding:2px 6px;border-radius:3px;
+                                      font-size:11px;text-decoration:none;
+                                      cursor:pointer;font-weight:bold;
+                                      line-height:1"
+                               onclick="event.stopPropagation();return confirm('Удалить это фото?');"
+                               title="Удалить фото">
+                                ✕
+                            </a>
+                        </div>
                     '''
             except Exception as e:
                 photos_html = f'<span style="color:#999">Ошибка: {e}</span>'
@@ -1279,7 +1313,6 @@ def admin_queue():
         </div>
         '''
 
-    # === Сводка по категориям ===
     summary = bot_db.get_queue_category_summary()
     summary_html = ""
     if summary:
@@ -1294,6 +1327,7 @@ def admin_queue():
         <p class="hint">
             Порядок публикации соответствует порядку карточек (сверху вниз).
             Меняйте кнопками ⬆️/⬇️. Автопубликация берёт <b>самое верхнее</b> объявление.
+            Клик по ✕ на фото — удалить это фото.
         </p>
         {summary_html}
         <a href="/admin" class="btn">← Назад</a>
@@ -1331,6 +1365,24 @@ def admin_queue_photo(ad_id, filename):
         return 'Not found', 404
 
     return send_file(file_path, mimetype='image/jpeg')
+
+
+@app.route('/admin/queue_photo_delete/<int:ad_id>/<path:filename>')
+@require_admin
+def admin_queue_photo_delete(ad_id, filename):
+    """Удаляет одно фото из папки объявления."""
+    ok, message, remaining = bot_db.delete_ad_photo(ad_id, filename, keep_min=1)
+
+    if ok:
+        logger.info(f'🗑️ Фото удалено: {filename} (осталось {remaining})')
+    else:
+        logger.warning(f'⚠️ Не удалось удалить {filename}: {message}')
+
+    # Куда возвращаться: если пришли с детальной — назад, если с очереди — в очередь
+    ref = request.referrer or ''
+    if f'/admin/ad_detail/{ad_id}' in ref:
+        return redirect(f'/admin/ad_detail/{ad_id}')
+    return redirect('/admin/queue')
 
 
 @app.route('/admin/queue_delete/<int:ad_id>')
@@ -1426,6 +1478,7 @@ def admin_ad_detail(ad_id):
     text = ''
     photos_html = ''
     photos_count = 0
+    can_delete = False
 
     if media_path and os.path.exists(media_path):
         info_path = os.path.join(media_path, 'info.txt')
@@ -1442,12 +1495,30 @@ def admin_ad_detail(ad_id):
                 if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))
             ])
             photos_count = len(photo_files)
+            can_delete = (photos_count > 1)
+
             for pf in photo_files:
+                if can_delete:
+                    badge = f'''
+                        <a href="/admin/queue_photo_delete/{ad_id}/{pf}"
+                           class="photo-del"
+                           onclick="return confirm('Удалить это фото?')"
+                           title="Удалить это фото">🗑️</a>
+                    '''
+                else:
+                    badge = '''
+                        <span class="photo-del-locked"
+                              title="Нельзя удалить последнее фото">🔒</span>
+                    '''
+
                 photos_html += f'''
-                    <img src="/admin/queue_photo/{ad_id}/{pf}"
-                         style="width:300px;height:auto;border-radius:6px;
-                                margin:5px;cursor:pointer"
-                         onclick="window.open(this.src, '_blank')">
+                    <div class="photo-wrap">
+                        <img src="/admin/queue_photo/{ad_id}/{pf}"
+                             style="width:300px;height:auto;border-radius:6px;
+                                    cursor:pointer;display:block"
+                             onclick="window.open(this.src, '_blank')">
+                        {badge}
+                    </div>
                 '''
         except Exception as e:
             photos_html = f'<p style="color:red">Ошибка: {e}</p>'
@@ -1459,11 +1530,16 @@ def admin_ad_detail(ad_id):
         <a href="/admin/publish_ad/{ad_id}" class="btn btn-orange"
            onclick="return confirm('Опубликовать сейчас?')">📤 Опубликовать сейчас</a>
         <a href="/admin/queue_delete/{ad_id}" class="btn btn-red"
-           onclick="return confirm('Удалить?')">🗑️ Удалить</a>
+           onclick="return confirm('Удалить всё объявление?')">🗑️ Удалить всё</a>
     </div>
 
     <div class="card">
         <h2>📷 Фото ({photos_count})</h2>
+        <p class="hint">
+            Клик по фото — открыть в новой вкладке.
+            Клик по 🗑️ — удалить это фото.
+            {'Последнее фото удалить нельзя.' if not can_delete else ''}
+        </p>
         <div>{photos_html or '<p style="color:#999">Нет фото</p>'}</div>
     </div>
 
