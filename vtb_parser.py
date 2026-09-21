@@ -522,7 +522,6 @@ class VTBParser:
 *ПОДБОР ТЕХНИКИ ПОД ВАШУ ЗАДАЧУ С ОПЛАТОЙ ЗА РЕЗУЛЬТАТ*
 
 #изъятая #изъятка #конфискат"""
-
     def _build_report_text(self, ad: Dict) -> str:
         mileage = ad.get('mileage') or ''
         motohours = ad.get('motohours') or ''
