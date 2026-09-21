@@ -15,6 +15,8 @@
 # - ОТКЛОНЯЕМ объявления БЕЗ пробега И БЕЗ моточасов
 #   (ИСКЛЮЧЕНИЕ: trailer — у прицепов этих полей нет по определению)
 # - Парсим моточасы (для спецтехники)
+# - info.txt: строка "Марка, модель:  **{title}**"
+# - АВТОМАТИЧЕСКОЕ ПЕРЕМЕЖЕНИЕ категорий в очереди в конце run()
 # ============================================================
 
 import os
@@ -67,7 +69,6 @@ JPEG_QUALITY = 85
 CARDS_BEFORE_RESTART = 20
 
 # === Категории, где пробег/моточасы НЕ обязательны ===
-# (прицепы по определению не имеют ни пробега, ни моточасов)
 CATEGORIES_WITHOUT_MILEAGE = {'trailer'}
 
 
@@ -193,9 +194,6 @@ class VTBParser:
 
     def collect_urls_from_one_page(self, page: Page, section: dict,
                                     page_url: str) -> List[str]:
-        """
-        Собирает URL карточек ТОЛЬКО с одной страницы.
-        """
         try:
             page.goto(page_url, wait_until='domcontentloaded', timeout=90000)
         except PlaywrightTimeout:
@@ -505,7 +503,7 @@ class VTBParser:
 
         spec_block = '\n'.join(spec_lines)
 
-        return f"""**{ad['title']}**
+        return f"""Марка, модель:  **{ad['title']}**
 
 **Цена в лизинг: {ad['price']} руб с НДС**
 
@@ -522,6 +520,7 @@ class VTBParser:
 *ПОДБОР ТЕХНИКИ ПОД ВАШУ ЗАДАЧУ С ОПЛАТОЙ ЗА РЕЗУЛЬТАТ*
 
 #изъятая #изъятка #конфискат"""
+
     def _build_report_text(self, ad: Dict) -> str:
         mileage = ad.get('mileage') or ''
         motohours = ad.get('motohours') or ''
@@ -560,8 +559,6 @@ class VTBParser:
             return False, saved_count
 
         # === Проверка наличия пробега ИЛИ моточасов ===
-        # ИСКЛЮЧЕНИЕ: категории из CATEGORIES_WITHOUT_MILEAGE (прицепы)
-        # у них этих полей нет по определению — не отсеиваем.
         mileage = (ad.get('mileage') or '').strip()
         motohours = (ad.get('motohours') or '').strip()
         cat_name = section.get('name', '')
@@ -776,6 +773,15 @@ class VTBParser:
         logger.info(f'  ❌ Ошибок: {self.errors}')
         logger.info(f'  💾 В очередь: {saved_count}')
         logger.info('=' * 60)
+
+        # === АВТОМАТИЧЕСКОЕ ПЕРЕМЕЖЕНИЕ КАТЕГОРИЙ В ОЧЕРЕДИ ===
+        if saved_count > 0:
+            try:
+                logger.info('🔀 Перемежаем категории в очереди...')
+                reordered = self.db.resort_queue_by_categories()
+                logger.info(f'✅ Очередь перемежена по категориям: {reordered} записей')
+            except Exception as e:
+                logger.warning(f'⚠️ Не удалось перемешать очередь: {e}')
 
         stats = self.db.count_by_status()
         logger.info(f'📊 Очередь: {stats}')
