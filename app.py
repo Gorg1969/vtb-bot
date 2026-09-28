@@ -6,6 +6,7 @@
 # + очередь с предпросмотром, сортировкой, удалением
 # + перемежение категорий в очереди
 # + удаление отдельного фото из карточки
+# + импорт папок с объявлениями из ZIP
 # ============================================================
 
 import os
@@ -47,12 +48,13 @@ from config import (
 from db import BotDB
 from sheets_client import SheetsClient
 from parser_runner import run_parser
+from import_folder import import_zip, IMPORT_DIR
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 2000 * 1024 * 1024   # 2 GB (для zip)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -128,6 +130,9 @@ class APIClient:
             return False
 
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
+        """
+        file_type: 'image' или 'video'
+        """
         if not self.token:
             logger.error('❌ upload_file: нет токена')
             return None
@@ -160,12 +165,12 @@ class APIClient:
             ur = requests.post(
                 upload_url,
                 files={'data': (filename, file_bytes)},
-                timeout=180, verify=False,
+                timeout=300, verify=False,
             )
             logger.info(f'📨 Шаг 2: HTTP {ur.status_code}')
 
             if ur.status_code != 200:
-                logger.error(f'❌ Шаг 2: {ur.status_code}')
+                logger.error(f'❌ Шаг 2: {ur.status_code} - {ur.text[:200]}')
                 return None
 
             try:
@@ -184,6 +189,11 @@ class APIClient:
                         if isinstance(v, dict) and 'token' in v:
                             token = v['token']
                             break
+                if not token and 'videos' in result and isinstance(result['videos'], dict):
+                    for v in result['videos'].values():
+                        if isinstance(v, dict) and 'token' in v:
+                            token = v['token']
+                            break
 
             if token:
                 logger.info(f'✅ Токен: {str(token)[:30]}...')
@@ -196,14 +206,25 @@ class APIClient:
             logger.exception(f'❌ upload_file упал: {e}')
             return None
 
-    def send_post(self, chat_id, text, media_tokens):
+    def send_post(self, chat_id, text, media_tokens, media_types=None):
+        """
+        media_types: список 'image'/'video' той же длины, что media_tokens.
+        Если None — считаем все 'image'.
+        """
         if not self.token:
             return False, None
         try:
+            if media_types is None:
+                media_types = ['image'] * len(media_tokens)
+            # Выравниваем длины
+            if len(media_types) < len(media_tokens):
+                media_types = media_types + ['image'] * (len(media_tokens) - len(media_types))
+
             attachments = []
-            for token in media_tokens[:10]:
+            for i, token in enumerate(media_tokens[:10]):
+                mtype = media_types[i] if i < len(media_types) else 'image'
                 attachments.append({
-                    "type": "image",
+                    "type": mtype,
                     "payload": {"token": token},
                 })
 
@@ -214,13 +235,13 @@ class APIClient:
             chat_id_str = str(chat_id)
             chat_id_for_api = chat_id_str if chat_id_str.startswith('-') else f"-{chat_id_str}"
 
-            logger.info(f'📤 Отправка в {chat_id_for_api}, медиа: {len(attachments)}')
+            logger.info(f'📤 Отправка в {chat_id_for_api}, медиа: {len(attachments)} ({media_types})')
 
             r = requests.post(
                 f"{self.base_url}/messages",
                 headers={"Authorization": self.token, "Content-Type": "application/json"},
                 params={"chat_id": chat_id_for_api},
-                json=payload, timeout=60, verify=False,
+                json=payload, timeout=120, verify=False,
             )
 
             logger.info(f'📨 Ответ: {r.status_code}')
@@ -263,7 +284,15 @@ report_gen = ReportGenerator(fm, db)
 # Публикация одного объявления
 # ============================================================
 
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'}
+VIDEO_EXTS = {'.mp4', '.mov', '.webm'}
+
+
 def publish_one_ad(ad: dict) -> tuple:
+    """
+    Публикует одно объявление.
+    Поддерживает фото и видео.
+    """
     ad_id = ad['id']
     folder_name = ad.get('folder_name')
     chat_id = ad.get('chat_id')
@@ -280,31 +309,64 @@ def publish_one_ad(ad: dict) -> tuple:
         return False, f'Нет info.txt в {media_path}', None
 
     with open(info_path, 'r', encoding='utf-8') as f:
-        text = f.read()
+        raw_text = f.read()
 
+    # Для импортированных папок — публикуем текст как есть
+    # (в info.txt уже готовый пост)
+    text = raw_text
+
+    # === Собираем медиа ===
+    all_files = sorted(os.listdir(media_path))
+
+    photos = []
+    videos = []
+    for f in all_files:
+        ext = os.path.splitext(f)[1].lower()
+        if ext in IMAGE_EXTS:
+            photos.append(f)
+        elif ext in VIDEO_EXTS:
+            videos.append(f)
+
+    media_files = []   # список (имя_файла, тип)
+    if videos:
+        # Если есть видео — берём ПЕРВОЕ видео (по ТЗ — одно)
+        media_files.append((videos[0], 'video'))
+    elif photos:
+        for p in photos[:10]:
+            media_files.append((p, 'image'))
+    else:
+        return False, 'Нет ни фото, ни видео', None
+
+    logger.info(f'📷 Медиа: {len(media_files)} ({[t for _, t in media_files]})')
+
+    # === Загружаем в MAX ===
     media_tokens = []
-    photo_files = sorted([
-        f for f in os.listdir(media_path)
-        if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))
-    ])
-    logger.info(f'📷 Фото: {len(photo_files)}')
+    media_types = []
 
-    for photo_file in photo_files[:10]:
-        file_path = os.path.join(media_path, photo_file)
+    for fname, ftype in media_files:
+        fpath = os.path.join(media_path, fname)
         try:
-            with open(file_path, 'rb') as f:
+            with open(fpath, 'rb') as f:
                 file_bytes = f.read()
-            token = api.upload_file(file_bytes, photo_file, 'image')
+
+            if ftype == 'video':
+                token = api.upload_file(file_bytes, fname, 'video')
+            else:
+                token = api.upload_file(file_bytes, fname, 'image')
+
             if token:
                 media_tokens.append(token)
+                media_types.append(ftype)
+
             time.sleep(0.5)
         except Exception as e:
-            logger.error(f'❌ Ошибка загрузки {photo_file}: {e}')
+            logger.error(f'❌ Ошибка загрузки {fname}: {e}')
 
     if not media_tokens:
-        return False, 'Не удалось загрузить ни одно фото', None
+        return False, 'Не удалось загрузить ни одно медиа', None
 
-    success, post_link = api.send_post(chat_id, text, media_tokens)
+    # === Отправляем ===
+    success, post_link = api.send_post(chat_id, text, media_tokens, media_types)
     if not success:
         return False, 'Ошибка отправки поста в MAX', None
 
@@ -396,8 +458,7 @@ def is_in_schedule_window():
     sh, sm, eh, em, _ = get_schedule_params()
     start_min = sh * 60 + sm
     end_min = eh * 60 + em
-    now_min = now_msk.hour * 60 + now_msk.minute
-    return start_min <= now_min < end_min
+    now_min = now_msk.hour * 60 + now_msk.minute    return start_min <= now_min < end_min
 
 
 def seconds_until_window_start():
@@ -582,6 +643,16 @@ BASE_STYLE = """
         box-shadow: 0 2px 4px rgba(0,0,0,0.3);
         line-height: 1;
     }
+    .file-drop {
+        border: 2px dashed #007bff;
+        border-radius: 8px;
+        padding: 30px;
+        text-align: center;
+        background: #f8f9fa;
+        margin: 15px 0;
+        cursor: pointer;
+    }
+    .file-drop:hover { background: #e9ecef; }
 </style>
 """
 
@@ -684,7 +755,6 @@ def ingest_ads():
             except Exception as e:
                 logger.error(f'❌ {e}')
                 skipped += 1
-        # После массовой загрузки — перемешать
         if added > 0:
             try:
                 bot_db.resort_queue_by_categories()
@@ -738,6 +808,7 @@ def admin_page():
         <a href="/admin/settings" class="btn">⚙️ Настройки</a>
         <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
         <a href="/admin/queue" class="btn">📋 Очередь</a>
+        <a href="/admin/import_folder" class="btn">📥 Импорт папок (zip)</a>
         <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
         <a href="/setup_webhook" class="btn btn-gray">🔄 Вебхук</a>
     </div>
@@ -759,6 +830,12 @@ def admin_page():
         <a href="/admin/run_parser?limit=300" class="btn btn-green">300</a>
         <p class="hint">Парсер запускается в отдельном процессе — после завершения память освобождается</p>
         <p class="hint">После парсинга зайдите в <a href="/admin/queue">📋 Очередь</a>, чтобы проверить, отредактировать и упорядочить объявления перед публикацией.</p>
+    </div>
+
+    <div class="card">
+        <h2>📥 Импорт готовых папок</h2>
+        <p>Загрузите ZIP с одной головной папкой, внутри — подпапки с именами <code>&lt;префикс&gt;_&lt;chat_id&gt;</code>.</p>
+        <a href="/admin/import_folder" class="btn">📥 Перейти к импорту</a>
     </div>
 
     <div class="card">
@@ -809,6 +886,219 @@ def admin_toggle_autopublish():
 
 
 # ============================================================
+# АДМИНКА — Импорт папок (НОВОЕ)
+# ============================================================
+
+@app.route('/admin/import_folder', methods=['GET', 'POST'])
+@require_admin
+def admin_import_folder():
+    if request.method == 'POST':
+        # === Обработка загрузки ===
+        if 'zip_file' not in request.files:
+            return redirect('/admin/import_folder?error=no_file')
+
+        f = request.files['zip_file']
+        if not f or not f.filename:
+            return redirect('/admin/import_folder?error=no_file')
+
+        if not f.filename.lower().endswith('.zip'):
+            return redirect('/admin/import_folder?error=not_zip')
+
+        # Временный файл
+        tmp_dir = '/tmp/import_upload'
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_path = os.path.join(tmp_dir, f'upload_{int(time.time())}.zip')
+
+        try:
+            f.save(tmp_path)
+        except Exception as e:
+            logger.exception(f'❌ Не сохранить zip: {e}')
+            return redirect('/admin/import_folder?error=save_failed')
+
+        # === Импорт ===
+        try:
+            report = import_zip(tmp_path, bot_db)
+        except Exception as e:
+            logger.exception(f'❌ Ошибка импорта: {e}')
+            report = {
+                'total': 0, 'imported': 0, 'skipped': 0, 'errors': 1,
+                'details': [{'folder': '(архив)', 'status': 'error', 'reason': str(e)}],
+            }
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+        # === Отчёт ===
+        details_html = ""
+        for d in report['details']:
+            folder = d.get('folder', '')
+            status = d.get('status', '')
+            reason = d.get('reason', '')
+
+            if status == 'ok':
+                icon = '✅'
+                color = '#28a745'
+            elif status == 'skip':
+                icon = '⏭️'
+                color = '#fd7e14'
+            else:
+                icon = '❌'
+                color = '#dc3545'
+
+            details_html += f"""
+            <tr>
+                <td style="color:{color};font-weight:bold">{icon}</td>
+                <td><code>{folder}</code></td>
+                <td style="font-size:12px">{reason}</td>
+            </tr>
+            """
+
+        if not details_html:
+            details_html = "<tr><td colspan='3' style='text-align:center;color:#999'>Нет данных</td></tr>"
+
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>📥 Отчёт импорта</h1>
+            <div class="stats" style="margin:15px 0">
+                <div class="stat"><div>Всего</div><div class="num">{report['total']}</div></div>
+                <div class="stat"><div>Импортировано</div><div class="num" style="color:#28a745">{report['imported']}</div></div>
+                <div class="stat"><div>Пропущено</div><div class="num" style="color:#fd7e14">{report['skipped']}</div></div>
+                <div class="stat"><div>Ошибок</div><div class="num" style="color:#dc3545">{report['errors']}</div></div>
+            </div>
+            <a href="/admin/queue" class="btn btn-green">📋 Перейти в очередь</a>
+            <a href="/admin/import_folder" class="btn">📥 Загрузить ещё</a>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+
+        <div class="card">
+            <h2>📋 Детали</h2>
+            <div style="max-height:600px;overflow-y:auto">
+                <table>
+                    <thead>
+                        <tr><th>Статус</th><th>Папка</th><th>Причина</th></tr>
+                    </thead>
+                    <tbody>
+                        {details_html}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        """
+
+    # === GET — форма ===
+    error = request.args.get('error', '')
+    error_html = ''
+    if error == 'no_file':
+        error_html = '<div class="error-msg">⚠️ Файл не выбран</div>'
+    elif error == 'not_zip':
+        error_html = '<div class="error-msg">⚠️ Файл должен быть ZIP-архивом</div>'
+    elif error == 'save_failed':
+        error_html = '<div class="error-msg">⚠️ Не удалось сохранить файл</div>'
+
+    # Показываем, сколько уже импортировано
+    imported_count = 0
+    try:
+        imported_count = bot_db.count_by_status().get('pending', 0)
+    except Exception:
+        pass
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>📥 Импорт папок из ZIP</h1>
+        <a href="/admin" class="btn">← В админку</a>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
+    </div>
+
+    {error_html}
+
+    <div class="card">
+        <h2>📖 Как это работает</h2>
+        <ol style="line-height:1.8">
+            <li>Заархивируйте <b>одну головную папку</b> в ZIP.
+                <div class="hint">Например: <code>ОБЪЯВЛЕНИЯ.zip</code>, внутри — папка <code>ОБЪЯВЛЕНИЯ 2</code>.</div>
+            </li>
+            <li>Внутри головной папки — <b>подпапки</b> с объявлениями.</li>
+            <li>Имя подпапки: <b><code>&lt;префикс&gt;_&lt;chat_id&gt;</code></b>, где chat_id начинается с <code>-</code>.
+                <div class="hint">Например: <code>74_-69959827081745</code></div>
+            </li>
+            <li>В каждой подпапке:
+                <ul>
+                    <li><b><code>info.txt</code></b> — обязательно (текст объявления)</li>
+                    <li>Либо <b>одно видео</b> (<code>.mp4</code>), либо <b>несколько фото</b> (<code>.jpg</code>, <code>.png</code>…)</li>
+                </ul>
+            </li>
+            <li>Нажмите «Загрузить и распределить».</li>
+            <li>Все корректные подпапки попадут в <a href="/admin/queue">📋 Очередь</a> со статусом <b>pending</b>.</li>
+        </ol>
+    </div>
+
+    <div class="card">
+        <h2>📤 Загрузка</h2>
+        <form method="POST" enctype="multipart/form-data" id="uploadForm">
+            <div class="file-drop" onclick="document.getElementById('zipInput').click()">
+                <div style="font-size:48px">📦</div>
+                <div style="margin-top:10px;font-size:16px" id="fileName">
+                    Нажмите, чтобы выбрать ZIP-архив
+                </div>
+                <div class="hint">или перетащите файл сюда</div>
+            </div>
+            <input type="file" name="zip_file" id="zipInput" accept=".zip" style="display:none"
+                   onchange="document.getElementById('fileName').textContent = this.files[0] ? this.files[0].name : 'Нажмите, чтобы выбрать ZIP-архив'">
+
+            <button type="submit" class="btn btn-green" style="font-size:16px;padding:12px 30px"
+                    id="submitBtn" onclick="return confirmUpload()">
+                🚀 Загрузить и распределить
+            </button>
+            <p class="hint">Импорт может занять время (копирование файлов). Не закрывайте страницу.</p>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>📊 Состояние</h2>
+        <p>Сейчас в очереди: <b>{imported_count}</b> pending-объявлений.</p>
+        <a href="/admin/queue" class="btn">📋 Открыть очередь</a>
+    </div>
+
+    <script>
+        // Drag & drop
+        const drop = document.querySelector('.file-drop');
+        const input = document.getElementById('zipInput');
+
+        ['dragenter', 'dragover'].forEach(ev =>
+            drop.addEventListener(ev, e => {{
+                e.preventDefault();
+                drop.style.background = '#e3f2fd';
+            }})
+        );
+        ['dragleave', 'drop'].forEach(ev =>
+            drop.addEventListener(ev, e => {{
+                e.preventDefault();
+                drop.style.background = '#f8f9fa';
+            }})
+        );
+        drop.addEventListener('drop', e => {{
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {{
+                input.files = files;
+                document.getElementById('fileName').textContent = files[0].name;
+            }}
+        }});
+
+        function confirmUpload() {{
+            if (!input.files || input.files.length === 0) {{
+                alert('Выберите ZIP-файл!');
+                return false;
+            }}
+            const btn = document.getElementById('submitBtn');
+            btn.disabled = true;
+            btn.textContent = '⏳ Обработка... (не закрывайте страницу)';
+            return true;
+        }}
+    </script>
+    """
+    # ============================================================
 # АДМИНКА — статус парсера
 # ============================================================
 
@@ -1150,7 +1440,7 @@ def api_today_export():
 
 
 # ============================================================
-# АДМИНКА — ОЧЕРЕДЬ (предпросмотр, сортировка, удаление, фото)
+# АДМИНКА — ОЧЕРЕДЬ
 # ============================================================
 
 @app.route('/admin/queue')
@@ -1174,34 +1464,59 @@ def admin_queue():
         source_url = ad.get('source_url') or ''
         created = ad.get('created_at') or ''
 
-        # === Фото с крестиком ===
+        # === Определяем медиа (фото/видео) ===
         photos_html = ""
         if media_path and os.path.exists(media_path):
             try:
-                photo_files = sorted([
-                    f for f in os.listdir(media_path)
-                    if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))
-                ])
-                for pf in photo_files[:5]:
-                    photos_html += f'''
-                        <div style="position:relative;display:inline-block;margin:2px">
-                            <img src="/admin/queue_photo/{ad_id}/{pf}"
-                                 style="width:120px;height:90px;object-fit:cover;
-                                        border-radius:4px;cursor:pointer;display:block"
-                                 onclick="window.open(this.src, '_blank')">
-                            <a href="/admin/queue_photo_delete/{ad_id}/{pf}"
-                               style="position:absolute;top:2px;right:2px;
-                                      background:rgba(220,53,69,0.9);color:white;
-                                      padding:2px 6px;border-radius:3px;
-                                      font-size:11px;text-decoration:none;
-                                      cursor:pointer;font-weight:bold;
-                                      line-height:1"
-                               onclick="event.stopPropagation();return confirm('Удалить это фото?');"
-                               title="Удалить фото">
-                                ✕
-                            </a>
-                        </div>
-                    '''
+                files = sorted(os.listdir(media_path))
+                photos = []
+                videos = []
+                for f in files:
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in IMAGE_EXTS:
+                        photos.append(f)
+                    elif ext in VIDEO_EXTS:
+                        videos.append(f)
+
+                if videos:
+                    # Показываем видео-превью (первый кадр нельзя — показываем иконку)
+                    for v in videos[:1]:
+                        photos_html += f'''
+                            <div style="position:relative;display:inline-block;margin:2px">
+                                <div style="width:120px;height:90px;background:#000;
+                                            border-radius:4px;display:flex;
+                                            align-items:center;justify-content:center;
+                                            color:white;font-size:32px">🎬</div>
+                                <a href="/admin/queue_photo/{ad_id}/{v}"
+                                   style="position:absolute;top:2px;right:2px;
+                                          background:rgba(220,53,69,0.9);color:white;
+                                          padding:2px 6px;border-radius:3px;
+                                          font-size:11px;text-decoration:none;
+                                          cursor:pointer;font-weight:bold;
+                                          line-height:1"
+                                   onclick="event.stopPropagation();return confirm('Удалить видео?');"
+                                   title="Удалить видео">✕</a>
+                            </div>
+                        '''
+                elif photos:
+                    for pf in photos[:5]:
+                        photos_html += f'''
+                            <div style="position:relative;display:inline-block;margin:2px">
+                                <img src="/admin/queue_photo/{ad_id}/{pf}"
+                                     style="width:120px;height:90px;object-fit:cover;
+                                            border-radius:4px;cursor:pointer;display:block"
+                                     onclick="window.open(this.src, '_blank')">
+                                <a href="/admin/queue_photo_delete/{ad_id}/{pf}"
+                                   style="position:absolute;top:2px;right:2px;
+                                          background:rgba(220,53,69,0.9);color:white;
+                                          padding:2px 6px;border-radius:3px;
+                                          font-size:11px;text-decoration:none;
+                                          cursor:pointer;font-weight:bold;
+                                          line-height:1"
+                                   onclick="event.stopPropagation();return confirm('Удалить это фото?');"
+                                   title="Удалить фото">✕</a>
+                            </div>
+                        '''
             except Exception as e:
                 photos_html = f'<span style="color:#999">Ошибка: {e}</span>'
         else:
@@ -1258,7 +1573,7 @@ def admin_queue():
                         💰 {price} ₽ · 📋 {code} · 📍 {city} · 📅 {year} · 🛣️ {mileage} км
                     </p>
                     <p style="margin:8px 0 4px 0;font-size:12px;color:#666">
-                        <a href="{source_url}" target="_blank">🔗 Источник VTB</a>
+                        <a href="{source_url}" target="_blank">🔗 Источник</a>
                         · <a href="/admin/ad_detail/{ad_id}">👁️ Детали</a>
                         · <span style="color:#999">создано: {created}</span>
                     </p>
@@ -1304,11 +1619,11 @@ def admin_queue():
         cards_html = '''
         <div class="card">
             <p style="text-align:center;color:#999;font-size:16px">
-                Очередь пуста. Запустите парсер, чтобы наполнить её.
+                Очередь пуста. Запустите парсер или импортируйте папки.
             </p>
             <div style="text-align:center;margin-top:15px">
-                <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Запустить парсер (5)</a>
-                <a href="/admin/run_parser?limit=50" class="btn btn-green">🚀 Запустить парсер (50)</a>
+                <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Парсер (5)</a>
+                <a href="/admin/import_folder" class="btn btn-green">📥 Импорт папок</a>
             </div>
         </div>
         '''
@@ -1327,7 +1642,6 @@ def admin_queue():
         <p class="hint">
             Порядок публикации соответствует порядку карточек (сверху вниз).
             Меняйте кнопками ⬆️/⬇️. Автопубликация берёт <b>самое верхнее</b> объявление.
-            Клик по ✕ на фото — удалить это фото.
         </p>
         {summary_html}
         <a href="/admin" class="btn">← Назад</a>
@@ -1336,6 +1650,7 @@ def admin_queue():
            onclick="return confirm('Пересчитать порядок: перемешать категории? Текущий ручной порядок будет сброшен.')">
             🔀 Перемешать по категориям
         </a>
+        <a href="/admin/import_folder" class="btn btn-green">📥 Импорт папок</a>
         <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
         <a href="/admin/queue_clear" class="btn btn-red"
            onclick="return confirm('Удалить ВСЮ очередь и все папки? Отменить нельзя.')">
@@ -1349,7 +1664,7 @@ def admin_queue():
 @app.route('/admin/queue_photo/<int:ad_id>/<path:filename>')
 @require_admin
 def admin_queue_photo(ad_id, filename):
-    """Отдаёт фото из папки объявления для предпросмотра."""
+    """Отдаёт файл (фото или видео) из папки объявления."""
     ad = bot_db.get_ad_by_id(ad_id)
     if not ad:
         return 'Not found', 404
@@ -1364,21 +1679,36 @@ def admin_queue_photo(ad_id, filename):
     if not os.path.exists(file_path):
         return 'Not found', 404
 
-    return send_file(file_path, mimetype='image/jpeg')
+    ext = os.path.splitext(safe_name)[1].lower()
+    if ext == '.mp4':
+        mimetype = 'video/mp4'
+    elif ext == '.mov':
+        mimetype = 'video/quicktime'
+    elif ext == '.webm':
+        mimetype = 'video/webm'
+    elif ext == '.png':
+        mimetype = 'image/png'
+    elif ext == '.gif':
+        mimetype = 'image/gif'
+    elif ext == '.webp':
+        mimetype = 'image/webp'
+    else:
+        mimetype = 'image/jpeg'
+
+    return send_file(file_path, mimetype=mimetype)
 
 
 @app.route('/admin/queue_photo_delete/<int:ad_id>/<path:filename>')
 @require_admin
 def admin_queue_photo_delete(ad_id, filename):
-    """Удаляет одно фото из папки объявления."""
+    """Удаляет один файл (фото или видео) из папки объявления."""
     ok, message, remaining = bot_db.delete_ad_photo(ad_id, filename, keep_min=1)
 
     if ok:
-        logger.info(f'🗑️ Фото удалено: {filename} (осталось {remaining})')
+        logger.info(f'🗑️ Файл удалён: {filename} (осталось {remaining})')
     else:
         logger.warning(f'⚠️ Не удалось удалить {filename}: {message}')
 
-    # Куда возвращаться: если пришли с детальной — назад, если с очереди — в очередь
     ref = request.referrer or ''
     if f'/admin/ad_detail/{ad_id}' in ref:
         return redirect(f'/admin/ad_detail/{ad_id}')
@@ -1388,7 +1718,6 @@ def admin_queue_photo_delete(ad_id, filename):
 @app.route('/admin/queue_delete/<int:ad_id>')
 @require_admin
 def admin_queue_delete(ad_id):
-    """Удаляет объявление из очереди + папку с медиа."""
     bot_db.delete_ad(ad_id, delete_files=True)
     return redirect('/admin/queue')
 
@@ -1396,7 +1725,6 @@ def admin_queue_delete(ad_id):
 @app.route('/admin/queue_move/<int:ad_id>/<direction>')
 @require_admin
 def admin_queue_move(ad_id, direction):
-    """Перемещает объявление вверх/вниз в очереди."""
     bot_db.move_ad(ad_id, direction)
     return redirect('/admin/queue')
 
@@ -1404,7 +1732,6 @@ def admin_queue_move(ad_id, direction):
 @app.route('/admin/queue_resort')
 @require_admin
 def admin_queue_resort():
-    """Пересчитывает sort_order: перемежает категории в очереди."""
     try:
         count = bot_db.resort_queue_by_categories()
         return BASE_STYLE + f"""
@@ -1433,7 +1760,6 @@ def admin_queue_resort():
 @app.route('/admin/queue_clear')
 @require_admin
 def admin_queue_clear():
-    """Удаляет ВСЮ очередь и все папки."""
     ads = bot_db.get_all_pending_ads()
     deleted_folders = 0
     deleted_records = 0
@@ -1466,7 +1792,7 @@ def admin_queue_clear():
 @app.route('/admin/ad_detail/<int:ad_id>')
 @require_admin
 def admin_ad_detail(ad_id):
-    """Детальный предпросмотр объявления: полный текст + все фото."""
+    """Детальный предпросмотр: полный текст + все медиа (фото/видео)."""
     ad = bot_db.get_ad_by_id(ad_id)
     if not ad:
         return BASE_STYLE + '''
@@ -1478,6 +1804,7 @@ def admin_ad_detail(ad_id):
     text = ''
     photos_html = ''
     photos_count = 0
+    videos_count = 0
     can_delete = False
 
     if media_path and os.path.exists(media_path):
@@ -1490,14 +1817,44 @@ def admin_ad_detail(ad_id):
                 text = f'⚠️ Ошибка чтения: {e}'
 
         try:
-            photo_files = sorted([
-                f for f in os.listdir(media_path)
-                if f.startswith('photo_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))
-            ])
-            photos_count = len(photo_files)
-            can_delete = (photos_count > 1)
+            files = sorted(os.listdir(media_path))
+            photos = []
+            videos = []
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in IMAGE_EXTS:
+                    photos.append(f)
+                elif ext in VIDEO_EXTS:
+                    videos.append(f)
 
-            for pf in photo_files:
+            photos_count = len(photos)
+            videos_count = len(videos)
+            total_media = photos_count + videos_count
+            can_delete = (total_media > 1)
+
+            # Видео
+            for vf in videos:
+                if can_delete:
+                    badge = f'''
+                        <a href="/admin/queue_photo_delete/{ad_id}/{vf}"
+                           class="photo-del"
+                           onclick="return confirm('Удалить это видео?')"
+                           title="Удалить видео">🗑️</a>
+                    '''
+                else:
+                    badge = '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
+
+                photos_html += f'''
+                    <div class="photo-wrap">
+                        <video src="/admin/queue_photo/{ad_id}/{vf}"
+                               controls
+                               style="width:400px;height:auto;border-radius:6px;display:block"></video>
+                        {badge}
+                    </div>
+                '''
+
+            # Фото
+            for pf in photos:
                 if can_delete:
                     badge = f'''
                         <a href="/admin/queue_photo_delete/{ad_id}/{pf}"
@@ -1506,10 +1863,7 @@ def admin_ad_detail(ad_id):
                            title="Удалить это фото">🗑️</a>
                     '''
                 else:
-                    badge = '''
-                        <span class="photo-del-locked"
-                              title="Нельзя удалить последнее фото">🔒</span>
-                    '''
+                    badge = '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
 
                 photos_html += f'''
                     <div class="photo-wrap">
@@ -1534,13 +1888,13 @@ def admin_ad_detail(ad_id):
     </div>
 
     <div class="card">
-        <h2>📷 Фото ({photos_count})</h2>
+        <h2>🎬 Медиа (фото: {photos_count}, видео: {videos_count})</h2>
         <p class="hint">
             Клик по фото — открыть в новой вкладке.
-            Клик по 🗑️ — удалить это фото.
-            {'Последнее фото удалить нельзя.' if not can_delete else ''}
+            Клик по 🗑️ — удалить это медиа.
+            {'Последнее медиа удалить нельзя.' if not can_delete else ''}
         </p>
-        <div>{photos_html or '<p style="color:#999">Нет фото</p>'}</div>
+        <div>{photos_html or '<p style="color:#999">Нет медиа</p>'}</div>
     </div>
 
     <div class="card">
@@ -1562,7 +1916,7 @@ def admin_ad_detail(ad_id):
             <tr><td>Год</td><td>{ad.get('year', '')}</td></tr>
             <tr><td>Пробег</td><td>{ad.get('mileage', '')}</td></tr>
             <tr><td>Папка</td><td><code>{media_path}</code></td></tr>
-            <tr><td>Источник</td><td><a href="{ad.get('source_url', '')}" target="_blank">🔗 VTB</a></td></tr>
+            <tr><td>Источник</td><td><a href="{ad.get('source_url', '')}" target="_blank">🔗 Открыть</a></td></tr>
             <tr><td>Создано</td><td>{ad.get('created_at', '')}</td></tr>
             <tr><td>sort_order</td><td>{ad.get('sort_order', '')}</td></tr>
         </table>
@@ -1573,7 +1927,6 @@ def admin_ad_detail(ad_id):
 @app.route('/admin/publish_ad/<int:ad_id>')
 @require_admin
 def admin_publish_ad(ad_id):
-    """Публикует КОНКРЕТНОЕ объявление (по id), минуя очередь."""
     ad = bot_db.get_ad_by_id(ad_id)
     if not ad:
         return BASE_STYLE + '''
@@ -1630,8 +1983,10 @@ def admin_publish_ad(ad_id):
             <a href="/admin/queue" class="btn">← К очереди</a>
         </div>
         """
-        # ============================================================
-# АДМИНКА — прочие роуты (check_paths, list_folders, cleanup, clear_all)
+
+
+# ============================================================
+# Прочие роуты
 # ============================================================
 
 @app.route('/admin/check_paths')
@@ -1734,6 +2089,7 @@ def admin_clear_all():
     except Exception as e:
         logger.exception(f'❌ Ошибка очистки БД: {e}')
 
+    # Чистим VTB_Объявления
     try:
         if os.path.exists(OUTPUT_DIR):
             for item in os.listdir(OUTPUT_DIR):
@@ -1747,6 +2103,21 @@ def admin_clear_all():
                         logger.warning(f'⚠️ Не удалить {item_path}: {e}')
     except Exception as e:
         logger.exception(f'❌ Ошибка очистки папок: {e}')
+
+    # Чистим import_ads
+    try:
+        if os.path.exists(IMPORT_DIR):
+            for item in os.listdir(IMPORT_DIR):
+                item_path = os.path.join(IMPORT_DIR, item)
+                if os.path.isdir(item_path):
+                    try:
+                        shutil.rmtree(item_path)
+                        result['folders_deleted'] += 1
+                    except Exception as e:
+                        result['folder_errors'] += 1
+                        logger.warning(f'⚠️ Не удалить {item_path}: {e}')
+    except Exception as e:
+        logger.exception(f'❌ Ошибка очистки import_ads: {e}')
 
     return BASE_STYLE + f"""
     <div class="card">
@@ -1774,7 +2145,6 @@ _PARSER_PROC = [None]
 
 
 def parser_is_running() -> bool:
-    """Жив ли процесс парсера, запущенный ИМЕННО этим Flask-процессом."""
     proc = _PARSER_PROC[0]
     if proc is None:
         return False
@@ -1787,7 +2157,6 @@ def parser_is_running() -> bool:
 @app.route('/admin/run_parser')
 @require_admin
 def admin_run_parser():
-    """Запуск парсера в ОТДЕЛЬНОМ процессе."""
     limit = int(request.args.get('limit', 50))
 
     if parser_is_running():
@@ -1849,13 +2218,13 @@ def admin_run_parser():
 @app.route('/admin/publish_one')
 @require_admin
 def admin_publish_one():
-    """Ручная публикация: берёт ПЕРВОЕ по очереди (sort_order ASC)."""
     ads = bot_db.get_pending_ads(limit=1)
     if not ads:
         return BASE_STYLE + """
         <div class="card">
             <h1>⚠️ Очередь пуста</h1>
-            <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Запустить парсер (5)</a>
+            <a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Парсер (5)</a>
+            <a href="/admin/import_folder" class="btn btn-green">📥 Импорт папок</a>
             <a href="/admin/queue" class="btn">📋 Очередь</a>
             <a href="/admin" class="btn btn-gray">← В админку</a>
         </div>
@@ -1935,7 +2304,8 @@ def webhook():
                     user_id,
                     "🏠 **VTB Bot**\n\n"
                     f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
-                    f"📋 **Очередь (предпросмотр):**\n{PUBLIC_URL}/admin/queue\n\n"
+                    f"📋 **Очередь:**\n{PUBLIC_URL}/admin/queue\n\n"
+                    f"📥 **Импорт папок:**\n{PUBLIC_URL}/admin/import_folder\n\n"
                     f"📅 **Опубликовано:**\n{PUBLIC_URL}/admin/today\n\n"
                     f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
                     f"🚀 **Статус парсера:**\n{PUBLIC_URL}/admin/parser_status\n\n"
