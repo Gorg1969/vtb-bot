@@ -1,12 +1,12 @@
 # app.py
 # ============================================================
-# vtb-bot — Flask-сервер (проект 1)
+# vtb-bot — Flask-сервер
 # + автопубликация по расписанию
-# + парсер в отдельном процессе (экономия RAM)
+# + парсер в отдельном процессе
 # + очередь с предпросмотром, сортировкой, удалением
-# + перемежение категорий в очереди
-# + удаление отдельного фото из карточки
-# + импорт папок с объявлениями из ZIP
+# + перемежение категорий
+# + удаление отдельного фото
+# + импорт папок из ZIP
 # ============================================================
 
 import os
@@ -48,13 +48,23 @@ from config import (
 from db import BotDB
 from sheets_client import SheetsClient
 from parser_runner import run_parser
-from import_folder import import_zip, IMPORT_DIR
+
+# Импорт модуля импорта папок — обёрнут в try/except,
+# чтобы отсутствие файла НЕ ломало весь Flask
+try:
+    from import_folder import import_zip, IMPORT_DIR
+    IMPORT_FOLDER_AVAILABLE = True
+except ImportError as e:
+    IMPORT_FOLDER_AVAILABLE = False
+    IMPORT_DIR = '/app/data/import_ads'
+    def import_zip(*args, **kwargs):
+        raise RuntimeError(f'import_folder.py не найден: {e}')
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
-app.config['MAX_CONTENT_LENGTH'] = 2000 * 1024 * 1024   # 2 GB (для zip)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024   # 500 MB (для zip)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -130,9 +140,6 @@ class APIClient:
             return False
 
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
-        """
-        file_type: 'image' или 'video'
-        """
         if not self.token:
             logger.error('❌ upload_file: нет токена')
             return None
@@ -207,16 +214,11 @@ class APIClient:
             return None
 
     def send_post(self, chat_id, text, media_tokens, media_types=None):
-        """
-        media_types: список 'image'/'video' той же длины, что media_tokens.
-        Если None — считаем все 'image'.
-        """
         if not self.token:
             return False, None
         try:
             if media_types is None:
                 media_types = ['image'] * len(media_tokens)
-            # Выравниваем длины
             if len(media_types) < len(media_tokens):
                 media_types = media_types + ['image'] * (len(media_tokens) - len(media_types))
 
@@ -289,10 +291,6 @@ VIDEO_EXTS = {'.mp4', '.mov', '.webm'}
 
 
 def publish_one_ad(ad: dict) -> tuple:
-    """
-    Публикует одно объявление.
-    Поддерживает фото и видео.
-    """
     ad_id = ad['id']
     folder_name = ad.get('folder_name')
     chat_id = ad.get('chat_id')
@@ -309,13 +307,8 @@ def publish_one_ad(ad: dict) -> tuple:
         return False, f'Нет info.txt в {media_path}', None
 
     with open(info_path, 'r', encoding='utf-8') as f:
-        raw_text = f.read()
+        text = f.read()
 
-    # Для импортированных папок — публикуем текст как есть
-    # (в info.txt уже готовый пост)
-    text = raw_text
-
-    # === Собираем медиа ===
     all_files = sorted(os.listdir(media_path))
 
     photos = []
@@ -327,9 +320,8 @@ def publish_one_ad(ad: dict) -> tuple:
         elif ext in VIDEO_EXTS:
             videos.append(f)
 
-    media_files = []   # список (имя_файла, тип)
+    media_files = []
     if videos:
-        # Если есть видео — берём ПЕРВОЕ видео (по ТЗ — одно)
         media_files.append((videos[0], 'video'))
     elif photos:
         for p in photos[:10]:
@@ -339,7 +331,6 @@ def publish_one_ad(ad: dict) -> tuple:
 
     logger.info(f'📷 Медиа: {len(media_files)} ({[t for _, t in media_files]})')
 
-    # === Загружаем в MAX ===
     media_tokens = []
     media_types = []
 
@@ -365,7 +356,6 @@ def publish_one_ad(ad: dict) -> tuple:
     if not media_tokens:
         return False, 'Не удалось загрузить ни одно медиа', None
 
-    # === Отправляем ===
     success, post_link = api.send_post(chat_id, text, media_tokens, media_types)
     if not success:
         return False, 'Ошибка отправки поста в MAX', None
@@ -395,7 +385,7 @@ def publish_one_ad(ad: dict) -> tuple:
 
 
 # ============================================================
-# Автопубликация по расписанию (фоновый поток)
+# Автопубликация
 # ============================================================
 
 AUTOPUBLISH_ENABLED = [False]
@@ -458,7 +448,8 @@ def is_in_schedule_window():
     sh, sm, eh, em, _ = get_schedule_params()
     start_min = sh * 60 + sm
     end_min = eh * 60 + em
-    now_min = now_msk.hour * 60 + now_msk.minute    return start_min <= now_min < end_min
+    now_min = now_msk.hour * 60 + now_msk.minute
+    return start_min <= now_min < end_min
 
 
 def seconds_until_window_start():
@@ -801,6 +792,11 @@ def admin_page():
         mins = ap_status['next_in_seconds'] // 60
         ap_next = f' (следующий пост через ~{mins} мин)'
 
+    # Предупреждение, если import_folder.py нет
+    import_warn = ''
+    if not IMPORT_FOLDER_AVAILABLE:
+        import_warn = '<div class="warn">⚠️ Файл <code>import_folder.py</code> не найден. Импорт папок не работает.</div>'
+
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🛠 Админка</h1>
@@ -812,6 +808,8 @@ def admin_page():
         <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
         <a href="/setup_webhook" class="btn btn-gray">🔄 Вебхук</a>
     </div>
+
+    {import_warn}
 
     <div class="card">
         <h2>🕒 Автопубликация</h2>
@@ -886,14 +884,25 @@ def admin_toggle_autopublish():
 
 
 # ============================================================
-# АДМИНКА — Импорт папок (НОВОЕ)
+# АДМИНКА — Импорт папок (ZIP)
 # ============================================================
 
 @app.route('/admin/import_folder', methods=['GET', 'POST'])
 @require_admin
 def admin_import_folder():
+    if not IMPORT_FOLDER_AVAILABLE:
+        return BASE_STYLE + """
+        <div class="card">
+            <h1>❌ Модуль импорта недоступен</h1>
+            <div class="error-msg">
+                Файл <code>import_folder.py</code> не найден рядом с <code>app.py</code>.<br>
+                Загрузите его и перезапустите контейнер.
+            </div>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
+
     if request.method == 'POST':
-        # === Обработка загрузки ===
         if 'zip_file' not in request.files:
             return redirect('/admin/import_folder?error=no_file')
 
@@ -904,7 +913,6 @@ def admin_import_folder():
         if not f.filename.lower().endswith('.zip'):
             return redirect('/admin/import_folder?error=not_zip')
 
-        # Временный файл
         tmp_dir = '/tmp/import_upload'
         os.makedirs(tmp_dir, exist_ok=True)
         tmp_path = os.path.join(tmp_dir, f'upload_{int(time.time())}.zip')
@@ -915,7 +923,6 @@ def admin_import_folder():
             logger.exception(f'❌ Не сохранить zip: {e}')
             return redirect('/admin/import_folder?error=save_failed')
 
-        # === Импорт ===
         try:
             report = import_zip(tmp_path, bot_db)
         except Exception as e:
@@ -930,7 +937,6 @@ def admin_import_folder():
             except Exception:
                 pass
 
-        # === Отчёт ===
         details_html = ""
         for d in report['details']:
             folder = d.get('folder', '')
@@ -987,7 +993,7 @@ def admin_import_folder():
         </div>
         """
 
-    # === GET — форма ===
+    # === GET ===
     error = request.args.get('error', '')
     error_html = ''
     if error == 'no_file':
@@ -997,7 +1003,6 @@ def admin_import_folder():
     elif error == 'save_failed':
         error_html = '<div class="error-msg">⚠️ Не удалось сохранить файл</div>'
 
-    # Показываем, сколько уже импортировано
     imported_count = 0
     try:
         imported_count = bot_db.count_by_status().get('pending', 0)
@@ -1062,7 +1067,6 @@ def admin_import_folder():
     </div>
 
     <script>
-        // Drag & drop
         const drop = document.querySelector('.file-drop');
         const input = document.getElementById('zipInput');
 
@@ -1224,7 +1228,7 @@ def admin_today():
     for i, p in enumerate(pubs, 1):
         max_cell = (f'<a href="{p["max_post_url"]}" target="_blank">🔗 MAX</a>'
                     if p.get('max_post_url') else '—')
-        src_cell = (f'<a href="{p["source_url"]}" target="_blank">🔗 VTB</a>'
+        src_cell = (f'<a href="{p["source_url"]}" target="_blank">🔗 Источник</a>'
                     if p.get('source_url') and str(p['source_url']).startswith('http') else '—')
         rows_html += f"""
         <tr>
@@ -1305,7 +1309,7 @@ def admin_today():
                             ? `<a href="${{escapeHtml(p.max_post_url)}}" target="_blank">🔗 MAX</a>`
                             : '—';
                         const srcCell = (p.source_url && p.source_url.startsWith('http'))
-                            ? `<a href="${{escapeHtml(p.source_url)}}" target="_blank">🔗 VTB</a>`
+                            ? `<a href="${{escapeHtml(p.source_url)}}" target="_blank">🔗 Источник</a>`
                             : '—';
                         return `<tr>
                             <td>${{i+1}}</td>
@@ -1452,7 +1456,6 @@ def admin_queue():
     for i, ad in enumerate(ads, 1):
         ad_id = ad['id']
         media_path = ad.get('media_path') or ''
-        folder_name = ad.get('folder_name') or '—'
         title = ad.get('title') or '—'
         category = ad.get('category') or '—'
         chat_id = ad.get('chat_id') or '—'
@@ -1464,7 +1467,6 @@ def admin_queue():
         source_url = ad.get('source_url') or ''
         created = ad.get('created_at') or ''
 
-        # === Определяем медиа (фото/видео) ===
         photos_html = ""
         if media_path and os.path.exists(media_path):
             try:
@@ -1479,7 +1481,6 @@ def admin_queue():
                         videos.append(f)
 
                 if videos:
-                    # Показываем видео-превью (первый кадр нельзя — показываем иконку)
                     for v in videos[:1]:
                         photos_html += f'''
                             <div style="position:relative;display:inline-block;margin:2px">
@@ -1487,7 +1488,7 @@ def admin_queue():
                                             border-radius:4px;display:flex;
                                             align-items:center;justify-content:center;
                                             color:white;font-size:32px">🎬</div>
-                                <a href="/admin/queue_photo/{ad_id}/{v}"
+                                <a href="/admin/queue_photo_delete/{ad_id}/{v}"
                                    style="position:absolute;top:2px;right:2px;
                                           background:rgba(220,53,69,0.9);color:white;
                                           padding:2px 6px;border-radius:3px;
@@ -1664,7 +1665,6 @@ def admin_queue():
 @app.route('/admin/queue_photo/<int:ad_id>/<path:filename>')
 @require_admin
 def admin_queue_photo(ad_id, filename):
-    """Отдаёт файл (фото или видео) из папки объявления."""
     ad = bot_db.get_ad_by_id(ad_id)
     if not ad:
         return 'Not found', 404
@@ -1701,7 +1701,6 @@ def admin_queue_photo(ad_id, filename):
 @app.route('/admin/queue_photo_delete/<int:ad_id>/<path:filename>')
 @require_admin
 def admin_queue_photo_delete(ad_id, filename):
-    """Удаляет один файл (фото или видео) из папки объявления."""
     ok, message, remaining = bot_db.delete_ad_photo(ad_id, filename, keep_min=1)
 
     if ok:
@@ -1792,7 +1791,6 @@ def admin_queue_clear():
 @app.route('/admin/ad_detail/<int:ad_id>')
 @require_admin
 def admin_ad_detail(ad_id):
-    """Детальный предпросмотр: полный текст + все медиа (фото/видео)."""
     ad = bot_db.get_ad_by_id(ad_id)
     if not ad:
         return BASE_STYLE + '''
@@ -1832,7 +1830,6 @@ def admin_ad_detail(ad_id):
             total_media = photos_count + videos_count
             can_delete = (total_media > 1)
 
-            # Видео
             for vf in videos:
                 if can_delete:
                     badge = f'''
@@ -1853,7 +1850,6 @@ def admin_ad_detail(ad_id):
                     </div>
                 '''
 
-            # Фото
             for pf in photos:
                 if can_delete:
                     badge = f'''
@@ -2089,35 +2085,20 @@ def admin_clear_all():
     except Exception as e:
         logger.exception(f'❌ Ошибка очистки БД: {e}')
 
-    # Чистим VTB_Объявления
-    try:
-        if os.path.exists(OUTPUT_DIR):
-            for item in os.listdir(OUTPUT_DIR):
-                item_path = os.path.join(OUTPUT_DIR, item)
-                if os.path.isdir(item_path):
-                    try:
-                        shutil.rmtree(item_path)
-                        result['folders_deleted'] += 1
-                    except Exception as e:
-                        result['folder_errors'] += 1
-                        logger.warning(f'⚠️ Не удалить {item_path}: {e}')
-    except Exception as e:
-        logger.exception(f'❌ Ошибка очистки папок: {e}')
-
-    # Чистим import_ads
-    try:
-        if os.path.exists(IMPORT_DIR):
-            for item in os.listdir(IMPORT_DIR):
-                item_path = os.path.join(IMPORT_DIR, item)
-                if os.path.isdir(item_path):
-                    try:
-                        shutil.rmtree(item_path)
-                        result['folders_deleted'] += 1
-                    except Exception as e:
-                        result['folder_errors'] += 1
-                        logger.warning(f'⚠️ Не удалить {item_path}: {e}')
-    except Exception as e:
-        logger.exception(f'❌ Ошибка очистки import_ads: {e}')
+    for folder in [OUTPUT_DIR, IMPORT_DIR]:
+        try:
+            if os.path.exists(folder):
+                for item in os.listdir(folder):
+                    item_path = os.path.join(folder, item)
+                    if os.path.isdir(item_path):
+                        try:
+                            shutil.rmtree(item_path)
+                            result['folders_deleted'] += 1
+                        except Exception as e:
+                            result['folder_errors'] += 1
+                            logger.warning(f'⚠️ Не удалить {item_path}: {e}')
+        except Exception as e:
+            logger.exception(f'❌ Ошибка очистки {folder}: {e}')
 
     return BASE_STYLE + f"""
     <div class="card">
@@ -2367,6 +2348,7 @@ if __name__ == '__main__':
     logger.info(f'   ADMIN_USER: {ADMIN_USER}')
     logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌"}')
     logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌"}')
+    logger.info(f'   IMPORT_FOLDER: {"✅" if IMPORT_FOLDER_AVAILABLE else "❌"}')
 
     init_autopublish()
 
