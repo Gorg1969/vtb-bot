@@ -5,8 +5,9 @@
 # Логика:
 #   - Пользователь загружает ZIP с ОДНОЙ головной папкой.
 #   - Внутри головной папки — подпапки.
-#   - Имя подпапки: "<префикс>_<chat_id>", где chat_id начинается с '-'.
-#     Например: "74_-69959827081745".
+#   - Имя подпапки: "<префикс>_<chat_id>" ИЛИ "<префикс> <chat_id>",
+#     где chat_id начинается с '-'.
+#     Например: "74_-69959827081745" или "77 -73112596204049".
 #   - В каждой подпапке:
 #       * info.txt — обязательно (текст объявления)
 #       * либо ОДНО видео (.mp4), либо несколько фото (.jpg/.png/...)
@@ -75,8 +76,6 @@ def parse_info_txt(text: str) -> Dict:
             break
 
     # Отделяем основную часть от служебной
-    # Служебная начинается с "#изъятая #изъятка #конфискат"
-    # (или похожего набора хэштегов)
     marker = '#изъятая'
     idx = text.find(marker)
     if idx == -1:
@@ -84,7 +83,7 @@ def parse_info_txt(text: str) -> Dict:
         result['post_text'] = text.strip()
         return result
 
-    # Основная часть — до маркера, но перед ним обычно пустая строка
+    # Основная часть — до маркера
     main_part = text[:idx].rstrip()
     result['post_text'] = main_part
 
@@ -105,41 +104,52 @@ def parse_info_txt(text: str) -> Dict:
 
 
 # ============================================================
-# Парсинг chat_id из имени подпапки
+# Парсинг chat_id из имени подпапки (УНИВЕРСАЛЬНЫЙ)
 # ============================================================
+
+# Регулярка для chat_id: минус, затем 10+ цифр. Может быть в конце имени.
+# Примеры:
+#   "77_-73112596204049"  → "-73112596204049"
+#   "77 -73112596204049"  → "-73112596204049"
+#   "74_-69959827081745"  → "-69959827081745"
+#   "группа самосвалы -73112596204049" → "-73112596204049"
+CHAT_ID_RE = re.compile(r'(-\d{10,})\s*$')
+
 
 def extract_chat_id(folder_name: str) -> Optional[str]:
     """
-    Имя папки: "<префикс>_<chat_id>", chat_id начинается с '-'.
-    Например: "74_-69959827081745" → "-69959827081745".
-    Возвращает None, если chat_id не найден.
+    Извлекает chat_id из имени подпапки.
+    Работает с ЛЮБЫМ разделителем между префиксом и chat_id:
+    подчёркивание, пробел, дефис, ничего.
+
+    chat_id — это последнее вхождение "-<10+ цифр>" в конце имени.
+    Если не найдено — возвращает None.
     """
-    if not folder_name or '_' not in folder_name:
+    if not folder_name:
         return None
 
-    # Часть после последнего "_"
-    tail = folder_name.rsplit('_', 1)[-1].strip()
+    name = folder_name.strip()
 
-    # Должна начинаться с '-' и содержать только цифры после
-    if not tail.startswith('-'):
-        return None
-    if not tail[1:].isdigit():
-        return None
+    # Ищем chat_id: минус + 10 и более цифр в КОНЦЕ строки
+    m = CHAT_ID_RE.search(name)
+    if m:
+        return m.group(1)
 
-    return tail
+    return None
 
 
 def extract_prefix(folder_name: str) -> Optional[int]:
     """
-    Префикс — число до первого '_'.
-    "74_-69959827081745" → 74.
-    Если не число — None.
+    Префикс — число в начале имени (до любого разделителя).
+    Возвращает int или None, если префикс не число.
     """
-    if not folder_name or '_' not in folder_name:
+    if not folder_name:
         return None
-    head = folder_name.split('_', 1)[0].strip()
-    if head.isdigit():
-        return int(head)
+
+    name = folder_name.strip()
+    m = re.match(r'^(\d+)', name)
+    if m:
+        return int(m.group(1))
     return None
 
 
@@ -201,7 +211,6 @@ def analyze_subfolder(folder_path: str) -> Dict:
     result['videos'] = videos
 
     if videos and photos:
-        # Смешанные — приоритет видео, но помечаем
         result['media_type'] = 'video'
         result['reason'] = 'смешанные фото+видео (берём видео)'
         result['ok'] = True
@@ -232,8 +241,8 @@ def import_zip(zip_path: str, bot_db, output_dir: str = IMPORT_DIR) -> Dict:
     Импортирует ZIP с одной головной папкой.
     Возвращает отчёт:
       {
-        'total': int,             # всего подпапок найдено
-        'imported': int,          # добавлено в очередь
+        'total': int,
+        'imported': int,
         'skipped': int,
         'errors': int,
         'details': [
@@ -252,7 +261,6 @@ def import_zip(zip_path: str, bot_db, output_dir: str = IMPORT_DIR) -> Dict:
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Временная папка для распаковки
     tmp_dir = tempfile.mkdtemp(prefix='import_zip_')
 
     try:
@@ -271,8 +279,6 @@ def import_zip(zip_path: str, bot_db, output_dir: str = IMPORT_DIR) -> Dict:
             return report
 
         # === 2. Поиск головной папки ===
-        # Головная — единственная папка верхнего уровня.
-        # Если файлы лежат прямо в корне zip — берём корень.
         top_entries = os.listdir(tmp_dir)
         top_dirs = [
             d for d in top_entries
@@ -290,11 +296,9 @@ def import_zip(zip_path: str, bot_db, output_dir: str = IMPORT_DIR) -> Dict:
             head_dir = os.path.join(tmp_dir, top_dirs[0])
             logger.info(f'📁 Головная папка: {top_dirs[0]}')
         elif len(top_dirs) == 0 and top_files:
-            # Файлы в корне — считаем корень головной
             head_dir = tmp_dir
             logger.info('📁 Головная папка: (корень архива)')
         elif len(top_dirs) >= 1:
-            # Несколько папок — берём первую, но предупреждаем
             head_dir = os.path.join(tmp_dir, top_dirs[0])
             logger.warning(
                 f'⚠️ В архиве несколько папок верхнего уровня, '
@@ -339,7 +343,7 @@ def import_zip(zip_path: str, bot_db, output_dir: str = IMPORT_DIR) -> Dict:
         def sort_key(name):
             p = extract_prefix(name)
             if p is None:
-                return (1, name)  # без префикса — в конец
+                return (1, name)
             return (0, p, name)
 
         subfolders.sort(key=sort_key)
@@ -358,7 +362,7 @@ def import_zip(zip_path: str, bot_db, output_dir: str = IMPORT_DIR) -> Dict:
                 report['details'].append({
                     'folder': sub_name,
                     'status': 'skip',
-                    'reason': 'некорректное имя (нужно: <префикс>_<-chat_id>)',
+                    'reason': 'некорректное имя (нужно: <префикс>_<-chat_id> или <префикс> <-chat_id>)',
                 })
                 continue
 
@@ -434,7 +438,6 @@ def import_zip(zip_path: str, bot_db, output_dir: str = IMPORT_DIR) -> Dict:
             try:
                 inserted = bot_db.add_parsed_ad(ad_data)
             except Exception as e:
-                # Если не вставилось — чистим скопированное
                 shutil.rmtree(target_path, ignore_errors=True)
                 report['errors'] += 1
                 report['details'].append({
@@ -445,7 +448,6 @@ def import_zip(zip_path: str, bot_db, output_dir: str = IMPORT_DIR) -> Dict:
                 continue
 
             if not inserted:
-                # Уже была такая запись — чистим
                 shutil.rmtree(target_path, ignore_errors=True)
                 report['skipped'] += 1
                 report['details'].append({
@@ -472,7 +474,6 @@ def import_zip(zip_path: str, bot_db, output_dir: str = IMPORT_DIR) -> Dict:
         return report
 
     finally:
-        # === 5. Чистим временную папку ===
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
