@@ -121,9 +121,9 @@ class APIClient:
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
         """
         Загрузка файла в MAX.
-        - Для фото: multipart/form-data
-        - Для видео: raw body с Content-Type: application/octet-stream
-          (multipart для видео даёт HTTP 400 от MAX API)
+        Для фото и для видео используется multipart/form-data,
+        но для видео дополнительно передаём Content-Length (иначе сервер отдаёт 412).
+        Токен для видео берётся из ответа Шага 1 (POST /uploads).
         """
         if not self.token:
             logger.error('❌ upload_file: нет токена')
@@ -153,17 +153,17 @@ class APIClient:
                 logger.info(f'🎬 Видео: токен из Шага 1: '
                             f'{str(token_from_step1)[:30] + "..." if token_from_step1 else "НЕТ"}')
 
-                # Загружаем RAW body (НЕ multipart)
-                logger.info(f'📤 Шаг 2: загрузка видео (raw) на {upload_url[:100]}')
+                # Загружаем через multipart, но с явным Content-Length
+                logger.info(f'📤 Шаг 2: загрузка видео (multipart) на {upload_url[:100]}')
                 ur = requests.post(
                     upload_url,
-                    data=file_bytes,
-                    headers={'Content-Type': 'application/octet-stream'},
+                    files={'data': (filename, file_bytes, 'application/octet-stream')},
+                    headers={'Content-Length': str(len(file_bytes))},
                     timeout=600, verify=False,
                 )
-                logger.info(f'📨 Шаг 2 (raw): HTTP {ur.status_code}')
+                logger.info(f'📨 Шаг 2 (multipart): HTTP {ur.status_code}')
                 if ur.status_code not in (200, 201, 204):
-                    logger.error(f'❌ Шаг 2 (raw): {ur.status_code} - {ur.text[:300]}')
+                    logger.error(f'❌ Шаг 2 (multipart): {ur.status_code} - {ur.text[:300]}')
 
                 # Возвращаем токен из Шага 1
                 if token_from_step1:
@@ -242,7 +242,7 @@ class APIClient:
                   retry_not_ready=True, max_retries=12):
         """
         Отправка поста.
-        Для видео — увеличенные паузы (экспоненциально).
+        Для видео — увеличенные паузы (экспоненциальные).
         """
         if not self.token:
             return False, None
@@ -264,7 +264,6 @@ class APIClient:
             chat_id_str = str(chat_id)
             chat_id_for_api = chat_id_str if chat_id_str.startswith('-') else f"-{chat_id_str}"
 
-            # Есть ли среди медиа видео? Если да — паузы будут длиннее
             has_video = 'video' in media_types
 
             for attempt in range(1, max_retries + 1):
@@ -300,15 +299,12 @@ class APIClient:
                         logger.warning(f'⚠️ Ссылка: {e}')
                     return True, post_link
 
-                # Проверка на attachment.not.ready
                 error_text = r.text.lower()
                 if 'attachment.not.ready' in error_text or 'not.processed' in error_text:
                     if retry_not_ready and attempt < max_retries:
                         if has_video:
-                            # Для видео — экспоненциальная пауза (5, 10, 20, 40, 80...)
                             wait = min(5 * (2 ** (attempt - 1)), 180)
                         else:
-                            # Для фото — умеренная пауза (3 * attempt)
                             wait = min(3 * attempt, 30)
                         logger.warning(f'⚠️ Медиа ещё не обработано, ждём {wait} сек...')
                         time.sleep(wait)
@@ -372,7 +368,6 @@ def publish_one_ad(ad: dict) -> tuple:
     if not text:
         return False, 'Пустой текст поста', None
 
-    # Определяем медиа
     all_files = sorted(os.listdir(media_path))
     photos, videos = [], []
     for f in all_files:
@@ -414,10 +409,10 @@ def publish_one_ad(ad: dict) -> tuple:
                 upload_errors.append(fname)
                 logger.error(f'❌ {fname} — токен не получен')
 
-            # Пауза после загрузки — для видео больше
+            # Пауза после загрузки — для видео 60 сек
             if ftype == 'video':
-                logger.info('⏳ Ждём 15 сек для обработки видео на сервере MAX...')
-                time.sleep(15)
+                logger.info('⏳ Ждём 60 сек для обработки видео на сервере MAX...')
+                time.sleep(60)
             else:
                 time.sleep(0.5)
 
@@ -428,7 +423,6 @@ def publish_one_ad(ad: dict) -> tuple:
     if not media_tokens:
         return False, f'Не удалось загрузить медиа (ошибок: {len(upload_errors)})', None
 
-    # Отправляем с retry
     success, post_link = api.send_post(chat_id, text, media_tokens, media_types,
                                         retry_not_ready=True, max_retries=12)
     if not success:
