@@ -128,7 +128,8 @@ class APIClient:
                 f"{self.base_url}/uploads",
                 headers={"Authorization": self.token},
                 params={"type": file_type},
-                timeout=30, verify=False)
+                timeout=30, verify=False,
+            )
             logger.info(f'📨 Шаг 1: HTTP {r.status_code}')
             if r.status_code != 200:
                 logger.error(f'❌ Шаг 1: {r.status_code} - {r.text[:300]}')
@@ -137,9 +138,59 @@ class APIClient:
             data = r.json()
             upload_url = data.get('url')
             if not upload_url:
-                logger.error(f'❌ Шаг 1: нет url: {data}')
+                logger.error(f'❌ Шаг 1: нет url в ответе: {data}')
                 return None
 
+            # === ВИДЕО: токен обычно приходит на ШАГЕ 1 ===
+            if file_type == 'video':
+                token_from_step1 = data.get('token')
+                logger.info(f'🎬 Видео: токен из Шага 1: '
+                            f'{str(token_from_step1)[:30] + "..." if token_from_step1 else "НЕТ"}')
+
+                # Всё равно загружаем файл по полученному url
+                logger.info(f'📤 Шаг 2: загрузка видео на {upload_url[:100]}')
+                ur = requests.post(upload_url,
+                                   files={'data': (filename, file_bytes)},
+                                   timeout=300, verify=False)
+                logger.info(f'📨 Шаг 2: HTTP {ur.status_code}')
+
+                # Если токен был в Шаге 1 — возвращаем его
+                if token_from_step1:
+                    logger.info(f'✅ Токен видео (из Шага 1): {str(token_from_step1)[:30]}...')
+                    return token_from_step1
+
+                # Иначе пробуем вытащить из ответа Шага 2
+                try:
+                    result = ur.json()
+                    logger.info(f'📨 Ответ загрузки видео: '
+                                f'{json.dumps(result, ensure_ascii=False)[:500]}')
+
+                    token = result.get('token')
+                    if not token and isinstance(result, dict):
+                        for key in ('videos', 'video', 'data', 'payload'):
+                            if token:
+                                break
+                            val = result.get(key)
+                            if isinstance(val, dict):
+                                if 'token' in val:
+                                    token = val['token']
+                                else:
+                                    for v in val.values():
+                                        if isinstance(v, dict) and 'token' in v:
+                                            token = v['token']
+                                            break
+
+                    if token:
+                        logger.info(f'✅ Токен видео (из Шага 2): {str(token)[:30]}...')
+                    else:
+                        logger.error(f'❌ Токен видео не найден в ответе Шага 2')
+                    return token
+                except Exception as je:
+                    logger.error(f'❌ Ошибка парсинга ответа видео: {je}')
+                    logger.error(f'   Тело: {ur.text[:500]}')
+                    return None
+
+            # === IMAGE: как было ===
             logger.info(f'📤 Шаг 2: загрузка на {upload_url[:100]}')
             ur = requests.post(upload_url,
                                files={'data': (filename, file_bytes)},
@@ -155,21 +206,19 @@ class APIClient:
 
             # Ищем токен в разных местах
             token = result.get('token')
-            if not token:
-                # Может быть в payload
-                payload = result.get('payload')
-                if isinstance(payload, dict):
-                    token = payload.get('token')
-                # Может быть в photos/videos
-                for key in ('photos', 'videos', 'files'):
-                    if not token and key in result and isinstance(result[key], dict):
-                        for v in result[key].values():
-                            if isinstance(v, dict) and 'token' in v:
-                                token = v['token']
-                                break
-                # Может быть в data
-                if not token and 'data' in result and isinstance(result['data'], dict):
-                    token = result['data'].get('token')
+            if not token and isinstance(result, dict):
+                for key in ('photos', 'videos', 'data', 'payload'):
+                    if token:
+                        break
+                    val = result.get(key)
+                    if isinstance(val, dict):
+                        if 'token' in val:
+                            token = val['token']
+                        else:
+                            for v in val.values():
+                                if isinstance(v, dict) and 'token' in v:
+                                    token = v['token']
+                                    break
 
             if token:
                 logger.info(f'✅ Токен: {str(token)[:30]}...')
@@ -350,8 +399,8 @@ def publish_one_ad(ad: dict) -> tuple:
 
             # Пауза ПОСЛЕ загрузки видео — ждём обработки
             if ftype == 'video':
-                logger.info('⏳ Ждём 5 сек для обработки видео на сервере MAX...')
-                time.sleep(5)
+                logger.info('⏳ Ждём 8 сек для обработки видео на сервере MAX...')
+                time.sleep(8)
             else:
                 time.sleep(0.5)
 
@@ -364,7 +413,7 @@ def publish_one_ad(ad: dict) -> tuple:
 
     # Отправляем с retry
     success, post_link = api.send_post(chat_id, text, media_tokens, media_types,
-                                        retry_not_ready=True, max_retries=5)
+                                        retry_not_ready=True, max_retries=8)
     if not success:
         return False, 'Ошибка отправки поста в MAX', None
 
@@ -569,8 +618,10 @@ def get_autopublish_status():
             'today_count': today_count, 'daily_limit': limit,
             'status_message': msg, 'next_in_seconds': next_in,
             'window': f'{sh:02d}:{sm:02d} – {eh:02d}:{em:02d} МСК'}
-    # ============================================================
-# Стили и HTML
+
+
+# ============================================================
+# Стили
 # ============================================================
 
 BASE_STYLE = """
@@ -684,7 +735,8 @@ def setup_webhook():
         logger.warning(f'⚠️ {e}')
     try:
         r = requests.post(f"{BASE_URL}/subscriptions", headers=headers,
-                          json={"url": webhook_url, "update_types": ["message_created", "bot_started", "bot_stopped"]},
+                          json={"url": webhook_url,
+                                "update_types": ["message_created", "bot_started", "bot_stopped"]},
                           timeout=30, verify=False)
         if r.status_code == 200:
             return f"✅ Вебхук зарегистрирован: {webhook_url}"
@@ -694,7 +746,7 @@ def setup_webhook():
 
 
 # ============================================================
-# АДМИНКА
+# АДМИНКА — главная
 # ============================================================
 
 @app.route('/admin')
@@ -709,11 +761,14 @@ def admin_page():
         f"<td>{s.get('key_in_title') or '—'}</td><td>{s['chat_id']}</td>"
         f"<td>{'✅' if s.get('enabled', True) else '❌'}</td></tr>"
         for s in sections)
-    stats_rows = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in stats.items()) or "<tr><td colspan='2'>Пусто</td></tr>"
+    stats_rows = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in stats.items()) or \
+        "<tr><td colspan='2'>Пусто</td></tr>"
     pending = stats.get('pending', 0)
     ap_class = 'status-on' if ap_status['enabled'] else 'status-off'
-    ap_next = f" (следующий пост через ~{ap_status['next_in_seconds']//60} мин)" if ap_status.get('next_in_seconds') else ''
-    import_warn = '' if IMPORT_FOLDER_AVAILABLE else '<div class="warn">⚠️ Файл <code>import_folder.py</code> не найден.</div>'
+    ap_next = f" (следующий пост через ~{ap_status['next_in_seconds']//60} мин)" \
+              if ap_status.get('next_in_seconds') else ''
+    import_warn = '' if IMPORT_FOLDER_AVAILABLE else \
+        '<div class="warn">⚠️ Файл <code>import_folder.py</code> не найден.</div>'
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🛠 Админка</h1>
@@ -750,7 +805,7 @@ def admin_page():
     <div class="card">
         <h2>📤 Ручная публикация</h2>
         <p>В очереди: <b>{pending}</b></p>
-        <a href="/admin/publish_one" class="btn btn-orange" onclick="return confirm('Опубликовать 1 (первое по очереди)?')">📤 Опубликовать 1</a>
+        <a href="/admin/publish_one" class="btn btn-orange" onclick="return confirm('Опубликовать 1?')">📤 Опубликовать 1</a>
         <a href="/admin/queue" class="btn">📋 Открыть очередь</a>
     </div>
     <div class="card">
@@ -782,6 +837,10 @@ def admin_toggle_autopublish():
         start_auto_publish()
     return redirect('/admin')
 
+
+# ============================================================
+# АДМИНКА — Импорт папок
+# ============================================================
 
 @app.route('/admin/import_folder', methods=['GET', 'POST'])
 @require_admin
@@ -826,7 +885,9 @@ def admin_import_folder():
             status = d.get('status', '')
             icon, color = ('✅', '#28a745') if status == 'ok' else \
                           ('⏭️', '#fd7e14') if status == 'skip' else ('❌', '#dc3545')
-            details_html += f"<tr><td style='color:{color};font-weight:bold'>{icon}</td><td><code>{d.get('folder','')}</code></td><td style='font-size:12px'>{d.get('reason','')}</td></tr>"
+            details_html += (f"<tr><td style='color:{color};font-weight:bold'>{icon}</td>"
+                             f"<td><code>{d.get('folder','')}</code></td>"
+                             f"<td style='font-size:12px'>{d.get('reason','')}</td></tr>")
         if not details_html:
             details_html = "<tr><td colspan='3' style='text-align:center;color:#999'>Нет данных</td></tr>"
         return BASE_STYLE + f"""
@@ -957,7 +1018,8 @@ def admin_settings():
     saved = False
     if request.method == 'POST':
         for s in SECTIONS:
-            bot_db.set_setting(f"chat_id_{s['name']}", (request.form.get(f"chat_id_{s['name']}") or '').strip())
+            bot_db.set_setting(f"chat_id_{s['name']}",
+                               (request.form.get(f"chat_id_{s['name']}") or '').strip())
         bot_db.set_setting('schedule_start', (request.form.get('schedule_start') or '06:00').strip())
         bot_db.set_setting('schedule_end', (request.form.get('schedule_end') or '20:00').strip())
         dl = (request.form.get('daily_limit') or '150').strip()
@@ -986,7 +1048,10 @@ def admin_settings():
             <div class="form-row"><label>Лимит/день:</label><input type="text" name="daily_limit" value="{schedule['daily_limit']}"></div>
         </div>
         {saved_msg}
-        <div class="card"><button type="submit" class="btn btn-green">💾 Сохранить</button><a href="/admin" class="btn btn-gray">Отмена</a></div>
+        <div class="card">
+            <button type="submit" class="btn btn-green">💾 Сохранить</button>
+            <a href="/admin" class="btn btn-gray">Отмена</a>
+        </div>
     </form>
     """
 
@@ -997,9 +1062,14 @@ def admin_today():
     pubs = bot_db.get_publications_today_full()
     rows_html = ""
     for i, p in enumerate(pubs, 1):
-        max_cell = f'<a href="{p["max_post_url"]}" target="_blank">🔗 MAX</a>' if p.get('max_post_url') else '—'
-        src_cell = f'<a href="{p["source_url"]}" target="_blank">🔗 Источник</a>' if p.get('source_url') and str(p['source_url']).startswith('http') else '—'
-        rows_html += f"<tr><td>{i}</td><td>{p.get('date','')}</td><td>{p.get('time','')}</td><td>{max_cell}</td><td>{src_cell}</td><td>{p.get('title','')}</td><td>{p.get('code','')}</td><td>{p.get('price','') or ''}</td></tr>"
+        max_cell = f'<a href="{p["max_post_url"]}" target="_blank">🔗 MAX</a>' \
+                   if p.get('max_post_url') else '—'
+        src_cell = f'<a href="{p["source_url"]}" target="_blank">🔗 Источник</a>' \
+                   if p.get('source_url') and str(p['source_url']).startswith('http') else '—'
+        rows_html += (f"<tr><td>{i}</td><td>{p.get('date','')}</td>"
+                      f"<td>{p.get('time','')}</td><td>{max_cell}</td>"
+                      f"<td>{src_cell}</td><td>{p.get('title','')}</td>"
+                      f"<td>{p.get('code','')}</td><td>{p.get('price','') or ''}</td></tr>")
     if not rows_html:
         rows_html = "<tr><td colspan='8' style='text-align:center;color:#999'>Пока ничего не опубликовано</td></tr>"
     return BASE_STYLE + f"""
@@ -1015,7 +1085,9 @@ def admin_today():
         <p class="hint" id="lastUpdate">Автообновление каждые 15 сек</p>
     </div>
     <div class="card"><div style="max-height:600px;overflow-y:auto">
-        <table><thead><tr><th>№</th><th>Дата</th><th>Время (МСК)</th><th>Ссылка на пост</th><th>Ссылка-источник</th><th>Название</th><th>Код</th><th>Цена</th></tr></thead>
+        <table><thead><tr><th>№</th><th>Дата</th><th>Время (МСК)</th>
+        <th>Ссылка на пост</th><th>Ссылка-источник</th>
+        <th>Название</th><th>Код</th><th>Цена</th></tr></thead>
         <tbody id="todayTable">{rows_html}</tbody></table>
     </div></div>
     <script>
@@ -1071,7 +1143,8 @@ def api_today_export():
     wb = Workbook()
     ws = wb.active
     ws.title = "Отчет"
-    headers = ['№', 'Дата', 'Время (МСК)', 'Ссылка на пост', 'Ссылка (источник)', 'Название', 'Код предложения', 'Цена в лизинге']
+    headers = ['№', 'Дата', 'Время (МСК)', 'Ссылка на пост',
+               'Ссылка (источник)', 'Название', 'Код предложения', 'Цена в лизинге']
     header_font = Font(bold=True, size=11, color="FFFFFF")
     header_fill = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -1114,9 +1187,7 @@ def api_today_export():
     buf.seek(0)
     return send_file(buf, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                      as_attachment=True, download_name=f"Отчет_{today}.xlsx")
-
-
-# ============================================================
+                     # ============================================================
 # ОЧЕРЕДЬ
 # ============================================================
 
@@ -1212,7 +1283,11 @@ def admin_queue():
             </div>
         </div>'''
     if not cards_html:
-        cards_html = '<div class="card"><p style="text-align:center;color:#999;font-size:16px">Очередь пуста. Запустите парсер или импортируйте папки.</p><div style="text-align:center;margin-top:15px"><a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Парсер (5)</a><a href="/admin/import_folder" class="btn btn-green">📥 Импорт папок</a></div></div>'
+        cards_html = ('<div class="card"><p style="text-align:center;color:#999;font-size:16px">Очередь пуста. Запустите парсер или импортируйте папки.</p>'
+                      '<div style="text-align:center;margin-top:15px">'
+                      '<a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Парсер (5)</a>'
+                      '<a href="/admin/import_folder" class="btn btn-green">📥 Импорт папок</a>'
+                      '</div></div>')
     summary = bot_db.get_queue_category_summary()
     summary_html = f'<p class="hint">📊 По категориям: {" · ".join(f"<b>{cat}</b>: {cnt}" for cat, cnt in summary.items())}</p>' if summary else ''
     return BASE_STYLE + f"""
@@ -1441,7 +1516,8 @@ def admin_publish_ad(ad_id):
 @app.route('/admin/clear_all')
 @require_admin
 def admin_clear_all():
-    result = {'parsed_ads_deleted': 0, 'publications_deleted': 0, 'settings_deleted': 0, 'folders_deleted': 0, 'folder_errors': 0}
+    result = {'parsed_ads_deleted': 0, 'publications_deleted': 0,
+              'settings_deleted': 0, 'folders_deleted': 0, 'folder_errors': 0}
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
