@@ -119,6 +119,12 @@ class APIClient:
             return False
 
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
+        """
+        Загрузка файла в MAX.
+        - Для фото: multipart/form-data
+        - Для видео: raw body с Content-Type: application/octet-stream
+          (multipart для видео даёт HTTP 400 от MAX API)
+        """
         if not self.token:
             logger.error('❌ upload_file: нет токена')
             return None
@@ -141,30 +147,34 @@ class APIClient:
                 logger.error(f'❌ Шаг 1: нет url в ответе: {data}')
                 return None
 
-            # === ВИДЕО: токен обычно приходит на ШАГЕ 1 ===
+            # ========== ВИДЕО ==========
             if file_type == 'video':
                 token_from_step1 = data.get('token')
                 logger.info(f'🎬 Видео: токен из Шага 1: '
                             f'{str(token_from_step1)[:30] + "..." if token_from_step1 else "НЕТ"}')
 
-                # Всё равно загружаем файл по полученному url
-                logger.info(f'📤 Шаг 2: загрузка видео на {upload_url[:100]}')
-                ur = requests.post(upload_url,
-                                   files={'data': (filename, file_bytes)},
-                                   timeout=300, verify=False)
-                logger.info(f'📨 Шаг 2: HTTP {ur.status_code}')
+                # Загружаем RAW body (НЕ multipart)
+                logger.info(f'📤 Шаг 2: загрузка видео (raw) на {upload_url[:100]}')
+                ur = requests.post(
+                    upload_url,
+                    data=file_bytes,
+                    headers={'Content-Type': 'application/octet-stream'},
+                    timeout=600, verify=False,
+                )
+                logger.info(f'📨 Шаг 2 (raw): HTTP {ur.status_code}')
+                if ur.status_code not in (200, 201, 204):
+                    logger.error(f'❌ Шаг 2 (raw): {ur.status_code} - {ur.text[:300]}')
 
-                # Если токен был в Шаге 1 — возвращаем его
+                # Возвращаем токен из Шага 1
                 if token_from_step1:
                     logger.info(f'✅ Токен видео (из Шага 1): {str(token_from_step1)[:30]}...')
                     return token_from_step1
 
-                # Иначе пробуем вытащить из ответа Шага 2
+                # Резерв — ищем токен в ответе Шага 2
                 try:
                     result = ur.json()
                     logger.info(f'📨 Ответ загрузки видео: '
                                 f'{json.dumps(result, ensure_ascii=False)[:500]}')
-
                     token = result.get('token')
                     if not token and isinstance(result, dict):
                         for key in ('videos', 'video', 'data', 'payload'):
@@ -179,7 +189,6 @@ class APIClient:
                                         if isinstance(v, dict) and 'token' in v:
                                             token = v['token']
                                             break
-
                     if token:
                         logger.info(f'✅ Токен видео (из Шага 2): {str(token)[:30]}...')
                     else:
@@ -190,7 +199,7 @@ class APIClient:
                     logger.error(f'   Тело: {ur.text[:500]}')
                     return None
 
-            # === IMAGE: как было ===
+            # ========== IMAGE ==========
             logger.info(f'📤 Шаг 2: загрузка на {upload_url[:100]}')
             ur = requests.post(upload_url,
                                files={'data': (filename, file_bytes)},
@@ -204,7 +213,6 @@ class APIClient:
             result = ur.json()
             logger.info(f'📨 Ответ загрузки: {json.dumps(result, ensure_ascii=False)[:500]}')
 
-            # Ищем токен в разных местах
             token = result.get('token')
             if not token and isinstance(result, dict):
                 for key in ('photos', 'videos', 'data', 'payload'):
@@ -224,7 +232,6 @@ class APIClient:
                 logger.info(f'✅ Токен: {str(token)[:30]}...')
             else:
                 logger.error(f'❌ Токен не найден в ответе')
-
             return token
 
         except Exception as e:
@@ -232,7 +239,11 @@ class APIClient:
             return None
 
     def send_post(self, chat_id, text, media_tokens, media_types=None,
-                  retry_not_ready=True, max_retries=5):
+                  retry_not_ready=True, max_retries=12):
+        """
+        Отправка поста.
+        Для видео — увеличенные паузы (экспоненциально).
+        """
         if not self.token:
             return False, None
         try:
@@ -252,6 +263,9 @@ class APIClient:
 
             chat_id_str = str(chat_id)
             chat_id_for_api = chat_id_str if chat_id_str.startswith('-') else f"-{chat_id_str}"
+
+            # Есть ли среди медиа видео? Если да — паузы будут длиннее
+            has_video = 'video' in media_types
 
             for attempt in range(1, max_retries + 1):
                 logger.info(f'📤 Отправка в {chat_id_for_api} (попытка {attempt}/{max_retries}), '
@@ -290,7 +304,12 @@ class APIClient:
                 error_text = r.text.lower()
                 if 'attachment.not.ready' in error_text or 'not.processed' in error_text:
                     if retry_not_ready and attempt < max_retries:
-                        wait = 3 * attempt
+                        if has_video:
+                            # Для видео — экспоненциальная пауза (5, 10, 20, 40, 80...)
+                            wait = min(5 * (2 ** (attempt - 1)), 180)
+                        else:
+                            # Для фото — умеренная пауза (3 * attempt)
+                            wait = min(3 * attempt, 30)
                         logger.warning(f'⚠️ Медиа ещё не обработано, ждём {wait} сек...')
                         time.sleep(wait)
                         continue
@@ -325,7 +344,6 @@ def clean_post_text(raw_text: str) -> str:
     if idx == -1:
         return raw_text.rstrip()
     post = raw_text[:idx].rstrip()
-    # Убираем возможные служебные строки
     lines = []
     for line in post.splitlines():
         s = line.strip()
@@ -375,7 +393,6 @@ def publish_one_ad(ad: dict) -> tuple:
 
     logger.info(f'📷 Медиа: {len(media_files)} ({[t for _, t in media_files]})')
 
-    # Загружаем медиа
     media_tokens = []
     media_types = []
     upload_errors = []
@@ -397,10 +414,10 @@ def publish_one_ad(ad: dict) -> tuple:
                 upload_errors.append(fname)
                 logger.error(f'❌ {fname} — токен не получен')
 
-            # Пауза ПОСЛЕ загрузки видео — ждём обработки
+            # Пауза после загрузки — для видео больше
             if ftype == 'video':
-                logger.info('⏳ Ждём 8 сек для обработки видео на сервере MAX...')
-                time.sleep(8)
+                logger.info('⏳ Ждём 15 сек для обработки видео на сервере MAX...')
+                time.sleep(15)
             else:
                 time.sleep(0.5)
 
@@ -413,7 +430,7 @@ def publish_one_ad(ad: dict) -> tuple:
 
     # Отправляем с retry
     success, post_link = api.send_post(chat_id, text, media_tokens, media_types,
-                                        retry_not_ready=True, max_retries=8)
+                                        retry_not_ready=True, max_retries=12)
     if not success:
         return False, 'Ошибка отправки поста в MAX', None
 
