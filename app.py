@@ -1,12 +1,6 @@
 # app.py
 # ============================================================
 # vtb-bot — Flask-сервер
-# + автопубликация по расписанию
-# + парсер в отдельном процессе
-# + очередь с предпросмотром, сортировкой, удалением
-# + перемежение категорий
-# + удаление отдельного фото
-# + импорт папок из ZIP
 # ============================================================
 
 import os
@@ -49,8 +43,6 @@ from db import BotDB
 from sheets_client import SheetsClient
 from parser_runner import run_parser
 
-# Импорт модуля импорта папок — обёрнут в try/except,
-# чтобы отсутствие файла НЕ ломало весь Flask
 try:
     from import_folder import import_zip, IMPORT_DIR
     IMPORT_FOLDER_AVAILABLE = True
@@ -64,7 +56,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024   # 500 MB (для zip)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -792,7 +784,6 @@ def admin_page():
         mins = ap_status['next_in_seconds'] // 60
         ap_next = f' (следующий пост через ~{mins} мин)'
 
-    # Предупреждение, если import_folder.py нет
     import_warn = ''
     if not IMPORT_FOLDER_AVAILABLE:
         import_warn = '<div class="warn">⚠️ Файл <code>import_folder.py</code> не найден. Импорт папок не работает.</div>'
@@ -993,7 +984,6 @@ def admin_import_folder():
         </div>
         """
 
-    # === GET ===
     error = request.args.get('error', '')
     error_html = ''
     if error == 'no_file':
@@ -1041,7 +1031,7 @@ def admin_import_folder():
 
     <div class="card">
         <h2>📤 Загрузка</h2>
-        <form method="POST" enctype="multipart/form-data" id="uploadForm">
+        <form method="POST" enctype="multipart/form-data">
             <div class="file-drop" onclick="document.getElementById('zipInput').click()">
                 <div style="font-size:48px">📦</div>
                 <div style="margin-top:10px;font-size:16px" id="fileName">
@@ -1052,8 +1042,7 @@ def admin_import_folder():
             <input type="file" name="zip_file" id="zipInput" accept=".zip" style="display:none"
                    onchange="document.getElementById('fileName').textContent = this.files[0] ? this.files[0].name : 'Нажмите, чтобы выбрать ZIP-архив'">
 
-            <button type="submit" class="btn btn-green" style="font-size:16px;padding:12px 30px"
-                    id="submitBtn" onclick="return confirmUpload()">
+            <button type="submit" class="btn btn-green" style="font-size:16px;padding:12px 30px">
                 🚀 Загрузить и распределить
             </button>
             <p class="hint">Импорт может занять время (копирование файлов). Не закрывайте страницу.</p>
@@ -1089,17 +1078,6 @@ def admin_import_folder():
                 document.getElementById('fileName').textContent = files[0].name;
             }}
         }});
-
-        function confirmUpload() {{
-            if (!input.files || input.files.length === 0) {{
-                alert('Выберите ZIP-файл!');
-                return false;
-            }}
-            const btn = document.getElementById('submitBtn');
-            btn.disabled = true;
-            btn.textContent = '⏳ Обработка... (не закрывайте страницу)';
-            return true;
-        }}
     </script>
     """
     # ============================================================
