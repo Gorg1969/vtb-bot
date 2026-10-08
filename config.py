@@ -88,7 +88,7 @@ MAX_PAGES = 200
 MAX_CARDS_PER_SECTION = 300    # максимум карточек с одного раздела
 
 # === Фильтр по цене ===
-MIN_PRICE = 2_200_000
+MIN_PRICE = 5_200_000
 MAX_PRICE = 0
 
 # === Флаги ===
