@@ -2,7 +2,7 @@
 # ============================================================
 # Парсер VTB-лизинга
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
-#   * Правило Т1: URL в таблице и дата СВЕЖЕЕ DEDUP_MAX_AGE_DAYS
+#   * Правило Т1: название в таблице и дата СВЕЖЕЕ DEDUP_MAX_AGE_DAYS
 #     → дубль; СТАРШЕ → перепубликация
 # - Фильтр по пробегу/моточасам:
 #   * MAX_MILEAGE (км) и MAX_MOTOHOURS из config
@@ -255,32 +255,38 @@ class VTBParser:
         return urls
 
     # --------------------------------------------------------
-    # ДЕДУП
+    # ДЕДУП ПО НАЗВАНИЮ (Т1)
     # --------------------------------------------------------
 
-    def is_duplicate(self, url: str) -> bool:
-        # 1) Google Sheets (правило Т1 с датами)
-        if self.sheets.is_duplicate(url):
+    def is_duplicate(self, title: str) -> bool:
+        """
+        Дедуп по НАЗВАНИЮ (правило Т1):
+          1) Google Sheets: если название есть и хоть одна запись
+             свежее DEDUP_MAX_AGE_DAYS — дубль.
+          2) Локальная БД: если объявление с таким же названием
+             уже стоит в очереди со статусом pending — дубль.
+        """
+        # 1) Google Sheets
+        if self.sheets.is_duplicate(title):
             return True
-        # 2) Локальная БД (любое присутствие = дубль, кроме published/failed
-        #    — их add_parsed_ad сам обработает как перепубликацию)
-        if self.db.is_parsed(url):
-            # НО: если запись есть и она published/failed — не блокируем,
-            # пусть add_parsed_ad обновит. Пропускаем только pending.
+
+        # 2) Локальная БД: pending по названию
+        if title:
             try:
                 conn = self.db._connect()
                 c = conn.cursor()
                 c.execute(
-                    "SELECT status FROM parsed_ads WHERE source_url = ? LIMIT 1",
-                    (url,)
+                    "SELECT 1 FROM parsed_ads "
+                    "WHERE title = ? AND status = 'pending' LIMIT 1",
+                    (title,)
                 )
                 row = c.fetchone()
                 conn.close()
-                if row and row['status'] == 'pending':
+                if row:
                     return True
             except Exception as e:
                 logger.warning(f'⚠️ is_duplicate DB check: {e}')
-                return True
+
         return False
 
     # --------------------------------------------------------
@@ -511,7 +517,8 @@ class VTBParser:
 
         logger.info(f'  💾 {folder_name} ({downloaded} фото)')
         return folder_path
-            def _download_file(self, url: str, filepath: str, min_size: int = 0) -> bool:
+
+    def _download_file(self, url: str, filepath: str, min_size: int = 0) -> bool:
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -599,39 +606,31 @@ class VTBParser:
           - Логика "И": если есть оба поля — оба должны быть < лимитов.
           - Если есть только пробег — проверяем только пробег.
           - Если есть только моточасы — проверяем только моточасы.
-          - Нераспарсенное значение (< поле есть, но число не извлеклось>)
-            → отклоняем.
-
-        Возвращает (ok, reason).
+          - Нераспарсенное значение → отклоняем.
         """
-        # Прицепы — без проверки
         if cat_name in CATEGORIES_WITHOUT_MILEAGE:
             return True, 'категория без проверки'
 
         mileage_raw = (ad.get('mileage') or '').strip()
         motohours_raw = (ad.get('motohours') or '').strip()
 
-        # Нет ни пробега, ни моточасов → отклоняем
         if not mileage_raw and not motohours_raw:
             return False, 'нет ни пробега, ни моточасов'
 
         mileage_val = mileage_to_int(mileage_raw) if mileage_raw else None
         motohours_val = mileage_to_int(motohours_raw) if motohours_raw else None
 
-        # Если поле присутствует, но не распарсилось → отклоняем
         if mileage_raw and mileage_val is None:
             return False, f'пробег не распарсен: "{mileage_raw}"'
         if motohours_raw and motohours_val is None:
             return False, f'моточасы не распарсены: "{motohours_raw}"'
 
-        # Проверяем лимиты (логика "И" — оба поля, если есть)
         if mileage_val is not None and mileage_val >= MAX_MILEAGE:
             return False, f'пробег {mileage_val:,} ≥ {MAX_MILEAGE:,}'.replace(',', ' ')
 
         if motohours_val is not None and motohours_val >= MAX_MOTOHOURS:
             return False, f'моточасы {motohours_val:,} ≥ {MAX_MOTOHOURS:,}'.replace(',', ' ')
 
-        # Формируем человекочитаемое пояснение
         parts = []
         if mileage_val is not None:
             parts.append(f'пробег {mileage_val:,} км'.replace(',', ' '))
@@ -647,15 +646,16 @@ class VTBParser:
                           saved_count: int, limit: int) -> Tuple[bool, int]:
         logger.info(f'\n[{saved_count + 1}/{limit}] {url}')
 
-        # === ДЕДУП (Sheets + БД) ===
-        if self.is_duplicate(url):
-            logger.info('  ⏭️ Дубль')
-            self.skipped_dup += 1
-            return False, saved_count
-
+        # === ПАРСИМ КАРТОЧКУ (нужно название для дедупа) ===
         ad = self.parse_card(page, url)
         if not ad:
             self.errors += 1
+            return False, saved_count
+
+        # === ДЕДУП ПО НАЗВАНИЮ (Sheets + БД) ===
+        if self.is_duplicate(ad.get('title') or ''):
+            logger.info(f'  ⏭️ Дубль по названию: "{ad.get("title")}"')
+            self.skipped_dup += 1
             return False, saved_count
 
         cat_name = section.get('name', '')
@@ -711,7 +711,6 @@ class VTBParser:
             return True, saved_count
         else:
             logger.info(f'  ⚠️ Уже был в БД (pending) — пропуск')
-            # Чистим только что скачанную папку, раз запись не нужна
             try:
                 shutil.rmtree(folder, ignore_errors=True)
                 logger.info(f'  🗑️ Папка {folder} удалена (дубль pending)')
@@ -770,7 +769,7 @@ class VTBParser:
         logger.info(f'   Стоп: когда ВСЕ категории вернули пустую страницу')
         logger.info('=' * 60)
 
-        self.sheets.get_all_urls()
+        self.sheets.get_all_records()
         sections = [s for s in get_sections_from_db(self.db)
                     if s.get('enabled', True)]
 
