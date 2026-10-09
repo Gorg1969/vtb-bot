@@ -95,23 +95,97 @@ class BotDB:
     def add_parsed_ad(self, ad: Dict) -> bool:
         """
         Добавляет объявление в очередь.
-        sort_order выставляется в конец очереди (max + 1).
+
+        Правило Т1 (перепубликация):
+          - Если source_url НЕ в БД          → INSERT (status='pending').
+          - Если source_url в БД, status='pending' → игнор (уже в очереди).
+          - Если source_url в БД, status='published' или 'failed'
+            → UPDATE: сбрасываем в 'pending', sort_order в конец,
+              обновляем метаданные, media_path, folder_name.
+              Старая папка (если есть и отличается) НЕ удаляется здесь —
+              вызывающий код (парсер) сам решает.
+
+        Возвращает True, если запись добавлена ИЛИ обновлена.
         """
         try:
             conn = self._connect()
             c = conn.cursor()
 
-            c.execute("SELECT COALESCE(MAX(sort_order), 0) FROM parsed_ads")
-            max_order = c.fetchone()[0]
-            new_order = max_order + 1
+            source_url = ad.get('source_url')
+            if not source_url:
+                conn.close()
+                return False
 
+            # Проверяем, есть ли запись
+            c.execute(
+                "SELECT id, status, media_path FROM parsed_ads WHERE source_url = ?",
+                (source_url,)
+            )
+            existing = c.fetchone()
+
+            # === Случай 1: запись уже есть в очереди — игнор ===
+            if existing and existing['status'] == 'pending':
+                conn.close()
+                return False
+
+            # === Вычисляем sort_order для новой/обновлённой записи ===
+            c.execute("SELECT COALESCE(MAX(sort_order), 0) FROM parsed_ads")
+            new_order = c.fetchone()[0] + 1
+
+            if existing:
+                # === Случай 2: перепубликация — UPDATE ===
+                old_media_path = existing['media_path']
+                c.execute('''
+                    UPDATE parsed_ads SET
+                        title = ?,
+                        code = ?,
+                        price = ?,
+                        city = ?,
+                        year = ?,
+                        mileage = ?,
+                        category = ?,
+                        chat_id = ?,
+                        folder_name = ?,
+                        media_path = ?,
+                        status = 'pending',
+                        error = NULL,
+                        sort_order = ?,
+                        created_at = CURRENT_TIMESTAMP,
+                        published_at = NULL
+                    WHERE id = ?
+                ''', (
+                    ad.get('title'),
+                    ad.get('code'),
+                    ad.get('price'),
+                    ad.get('city'),
+                    ad.get('year'),
+                    ad.get('mileage'),
+                    ad.get('category'),
+                    ad.get('chat_id'),
+                    ad.get('folder_name'),
+                    ad.get('media_path'),
+                    new_order,
+                    existing['id'],
+                ))
+                logger.info(
+                    f'♻️ Перепубликация #{existing["id"]}: '
+                    f'{ad.get("folder_name")} (sort_order={new_order})'
+                )
+                # Сообщаем вызывающему коду, что старое медиа надо подчистить
+                if old_media_path and old_media_path != ad.get('media_path'):
+                    logger.info(f'   Старая папка: {old_media_path}')
+                conn.commit()
+                conn.close()
+                return True
+
+            # === Случай 3: новое объявление — INSERT ===
             c.execute('''
                 INSERT OR IGNORE INTO parsed_ads
                 (source_url, title, code, price, city, year, mileage,
                  category, chat_id, folder_name, media_path, status, sort_order)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             ''', (
-                ad.get('source_url'),
+                source_url,
                 ad.get('title'),
                 ad.get('code'),
                 ad.get('price'),
@@ -128,6 +202,7 @@ class BotDB:
             inserted = c.rowcount > 0
             conn.close()
             return inserted
+
         except Exception as e:
             logger.error(f'❌ add_parsed_ad: {e}')
             return False
@@ -245,11 +320,7 @@ class BotDB:
     def delete_ad_photo(self, ad_id: int, filename: str, keep_min: int = 1) -> tuple:
         """
         Удаляет ОДНО фото из папки объявления.
-
         keep_min — минимальное количество фото, которое должно остаться.
-                   По умолчанию 1: если после удаления не останется ни одного
-                   фото, удаление НЕ выполняется.
-
         Возвращает (success: bool, message: str, remaining: int).
         """
         import os
@@ -262,14 +333,12 @@ class BotDB:
         if not media_path or not os.path.exists(media_path):
             return False, 'Папка с медиа не найдена', 0
 
-        # Защита от path traversal
         safe_name = os.path.basename(filename)
         file_path = os.path.join(media_path, safe_name)
 
         if not os.path.exists(file_path):
             return False, f'Файл не найден: {safe_name}', 0
 
-        # Считаем, сколько фото сейчас
         try:
             photos = [
                 f for f in os.listdir(media_path)
@@ -285,7 +354,6 @@ class BotDB:
                 len(photos),
             )
 
-        # Удаляем
         try:
             os.remove(file_path)
             logger.info(f'🗑️ Удалено фото: {file_path}')
@@ -296,9 +364,7 @@ class BotDB:
         return True, f'Удалено: {safe_name}', remaining
 
     def get_ad_photos(self, ad_id: int) -> list:
-        """
-        Возвращает список имён фото в папке объявления (отсортированный).
-        """
+        """Возвращает список имён фото в папке объявления (отсортированный)."""
         import os
 
         ad = self.get_ad_by_id(ad_id)
@@ -323,11 +389,7 @@ class BotDB:
     # --------------------------------------------------------
 
     def move_ad(self, ad_id: int, direction: str) -> bool:
-        """
-        Меняет порядок публикации.
-        direction='up'   — поменять sort_order с предыдущим pending
-        direction='down' — поменять sort_order со следующим pending
-        """
+        """Меняет порядок публикации (up/down) среди pending."""
         if direction not in ('up', 'down'):
             return False
 
@@ -442,9 +504,7 @@ class BotDB:
         return len(ordered_ids)
 
     def get_queue_category_summary(self) -> Dict:
-        """
-        Возвращает сводку: сколько pending-объявлений в каждой категории.
-        """
+        """Сводка: сколько pending-объявлений в каждой категории."""
         conn = self._connect()
         c = conn.cursor()
         c.execute('''
