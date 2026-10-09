@@ -2,6 +2,13 @@
 # ============================================================
 # Парсер VTB-лизинга
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
+#   * Правило Т1: URL в таблице и дата СВЕЖЕЕ DEDUP_MAX_AGE_DAYS
+#     → дубль; СТАРШЕ → перепубликация
+# - Фильтр по пробегу/моточасам:
+#   * MAX_MILEAGE (км) и MAX_MOTOHOURS из config
+#   * Логика "И": если есть оба поля — оба должны быть < лимита
+#   * Категория trailer — без проверки
+#   * Нераспарсенные значения → отклоняем
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
 # - Категория по URL раздела
@@ -10,11 +17,8 @@
 # - info.txt = для публикации, report.txt = для отчёта
 # - ПОСТРАНИЧНЫЙ ОБХОД: стр.1 всех категорий → стр.2 всех → ...
 # - Стоп: когда ВСЕ категории вернули пустую страницу
-# - ПЕРЕЗАПУСК БРАУЗЕРА каждые 20 карточек (борьба с OOM)
+# - ПЕРЕЗАПУСК БРАУЗЕРА каждые 20 карточек
 # - gc.collect() после каждой карточки
-# - ОТКЛОНЯЕМ объявления БЕЗ пробега И БЕЗ моточасов
-#   (ИСКЛЮЧЕНИЕ: trailer — у прицепов этих полей нет по определению)
-# - Парсим моточасы (для спецтехники)
 # - info.txt: строка "Марка, модель:  **{title}**"
 # - АВТОМАТИЧЕСКОЕ ПЕРЕМЕЖЕНИЕ категорий в очереди в конце run()
 # ============================================================
@@ -41,6 +45,7 @@ from config import (
     get_sections_from_db,
     MIN_PRICE, MAX_PRICE,
     MASK_PLATES, PLATE_MODEL_PATH, PLATE_CONFIDENCE, PLATE_PADDING,
+    DEDUP_MAX_AGE_DAYS, MAX_MILEAGE, MAX_MOTOHOURS,
 )
 from sheets_client import SheetsClient
 from db import BotDB
@@ -112,6 +117,28 @@ def price_to_int(price_str: str) -> int:
         return 0
 
 
+def mileage_to_int(value: str) -> Optional[int]:
+    """
+    Извлекает число из строки пробега/моточасов.
+    Возвращает int или None, если распарсить не удалось.
+    Примеры: "12 345 км" → 12345, "12,345" → 12345, "—" → None.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s in ('—', '-', '–', 'не указан', 'не указано', 'нет данных'):
+        return None
+    digits = re.sub(r'[^\d]', '', s)
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
 def compress_image(input_path: str,
                     max_size: int = MAX_IMAGE_SIZE,
                     quality: int = JPEG_QUALITY) -> Optional[str]:
@@ -180,12 +207,16 @@ class VTBParser:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
+        # Пробрасываем порог дат в клиент Sheets
+        self.sheets.set_max_age_days(DEDUP_MAX_AGE_DAYS)
+
         self.processed = 0
         self.skipped_dup = 0
         self.skipped_flags = 0
         self.skipped_category = 0
         self.skipped_price = 0
         self.skipped_no_mileage = 0
+        self.skipped_limits = 0
         self.errors = 0
 
     # --------------------------------------------------------
@@ -228,10 +259,28 @@ class VTBParser:
     # --------------------------------------------------------
 
     def is_duplicate(self, url: str) -> bool:
+        # 1) Google Sheets (правило Т1 с датами)
         if self.sheets.is_duplicate(url):
             return True
+        # 2) Локальная БД (любое присутствие = дубль, кроме published/failed
+        #    — их add_parsed_ad сам обработает как перепубликацию)
         if self.db.is_parsed(url):
-            return True
+            # НО: если запись есть и она published/failed — не блокируем,
+            # пусть add_parsed_ad обновит. Пропускаем только pending.
+            try:
+                conn = self.db._connect()
+                c = conn.cursor()
+                c.execute(
+                    "SELECT status FROM parsed_ads WHERE source_url = ? LIMIT 1",
+                    (url,)
+                )
+                row = c.fetchone()
+                conn.close()
+                if row and row['status'] == 'pending':
+                    return True
+            except Exception as e:
+                logger.warning(f'⚠️ is_duplicate DB check: {e}')
+                return True
         return False
 
     # --------------------------------------------------------
@@ -297,7 +346,7 @@ class VTBParser:
             if not price:
                 logger.warning('  ⚠️ Цена не найдена')
 
-            # === ПАРСИМ ГОРОД, ГОД, ПРОБЕГ, МОТОЧАСЫ ===
+            # === ГОРОД, ГОД, ПРОБЕГ, МОТОЧАСЫ ===
             city = year = mileage = motohours = ''
             items = page.query_selector_all(
                 'div.t-tab-content.active div.t-tab-content-column-item'
@@ -462,8 +511,7 @@ class VTBParser:
 
         logger.info(f'  💾 {folder_name} ({downloaded} фото)')
         return folder_path
-
-    def _download_file(self, url: str, filepath: str, min_size: int = 0) -> bool:
+            def _download_file(self, url: str, filepath: str, min_size: int = 0) -> bool:
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -539,6 +587,59 @@ class VTBParser:
 Цена: {ad['price']} руб"""
 
     # --------------------------------------------------------
+    # ПРОВЕРКА ПРОБЕГА / МОТОЧАСОВ
+    # --------------------------------------------------------
+
+    @staticmethod
+    def check_mileage_limits(ad: Dict, cat_name: str) -> Tuple[bool, str]:
+        """
+        Проверка пробега/моточасов по правилам:
+          - Категория из CATEGORIES_WITHOUT_MILEAGE → проверка не применяется.
+          - Если нет ни пробега, ни моточасов → отклоняем.
+          - Логика "И": если есть оба поля — оба должны быть < лимитов.
+          - Если есть только пробег — проверяем только пробег.
+          - Если есть только моточасы — проверяем только моточасы.
+          - Нераспарсенное значение (< поле есть, но число не извлеклось>)
+            → отклоняем.
+
+        Возвращает (ok, reason).
+        """
+        # Прицепы — без проверки
+        if cat_name in CATEGORIES_WITHOUT_MILEAGE:
+            return True, 'категория без проверки'
+
+        mileage_raw = (ad.get('mileage') or '').strip()
+        motohours_raw = (ad.get('motohours') or '').strip()
+
+        # Нет ни пробега, ни моточасов → отклоняем
+        if not mileage_raw and not motohours_raw:
+            return False, 'нет ни пробега, ни моточасов'
+
+        mileage_val = mileage_to_int(mileage_raw) if mileage_raw else None
+        motohours_val = mileage_to_int(motohours_raw) if motohours_raw else None
+
+        # Если поле присутствует, но не распарсилось → отклоняем
+        if mileage_raw and mileage_val is None:
+            return False, f'пробег не распарсен: "{mileage_raw}"'
+        if motohours_raw and motohours_val is None:
+            return False, f'моточасы не распарсены: "{motohours_raw}"'
+
+        # Проверяем лимиты (логика "И" — оба поля, если есть)
+        if mileage_val is not None and mileage_val >= MAX_MILEAGE:
+            return False, f'пробег {mileage_val:,} ≥ {MAX_MILEAGE:,}'.replace(',', ' ')
+
+        if motohours_val is not None and motohours_val >= MAX_MOTOHOURS:
+            return False, f'моточасы {motohours_val:,} ≥ {MAX_MOTOHOURS:,}'.replace(',', ' ')
+
+        # Формируем человекочитаемое пояснение
+        parts = []
+        if mileage_val is not None:
+            parts.append(f'пробег {mileage_val:,} км'.replace(',', ' '))
+        if motohours_val is not None:
+            parts.append(f'моточасы {motohours_val:,}'.replace(',', ' '))
+        return True, ', '.join(parts) if parts else 'OK'
+
+    # --------------------------------------------------------
     # ОБРАБОТКА ОДНОЙ КАРТОЧКИ
     # --------------------------------------------------------
 
@@ -546,6 +647,7 @@ class VTBParser:
                           saved_count: int, limit: int) -> Tuple[bool, int]:
         logger.info(f'\n[{saved_count + 1}/{limit}] {url}')
 
+        # === ДЕДУП (Sheets + БД) ===
         if self.is_duplicate(url):
             logger.info('  ⏭️ Дубль')
             self.skipped_dup += 1
@@ -556,24 +658,17 @@ class VTBParser:
             self.errors += 1
             return False, saved_count
 
-        # === Проверка наличия пробега ИЛИ моточасов ===
-        mileage = (ad.get('mileage') or '').strip()
-        motohours = (ad.get('motohours') or '').strip()
         cat_name = section.get('name', '')
 
-        if cat_name not in CATEGORIES_WITHOUT_MILEAGE:
-            if not mileage and not motohours:
-                logger.info('  ⏭️ Нет ни пробега, ни моточасов — пропуск')
-                self.skipped_no_mileage += 1
-                return False, saved_count
-            if mileage:
-                logger.info(f'  🛣️ Пробег: {mileage} км')
-            if motohours:
-                logger.info(f'  ⏱️ Моточасы: {motohours}')
-        else:
-            logger.info(f'  ℹ️ Категория "{cat_name}": проверка пробега/моточасов пропущена')
+        # === ПРОВЕРКА ПРОБЕГА / МОТОЧАСОВ ===
+        ok, reason = self.check_mileage_limits(ad, cat_name)
+        if not ok:
+            logger.info(f'  ⏭️ Пробег/моточасы: {reason}')
+            self.skipped_no_mileage += 1
+            return False, saved_count
+        logger.info(f'  🛣️ {reason}')
 
-        # === Флаги ===
+        # === ФЛАГИ ===
         ok, reason = self.check_flags(ad['flags'])
         if not ok:
             logger.info(f'  ⏭️ Флаги: {reason} ({ad["flags"]})')
@@ -581,7 +676,7 @@ class VTBParser:
             return False, saved_count
         logger.info(f'  ✅ Флаги ОК: {ad["flags"]}')
 
-        # === Цена ===
+        # === ЦЕНА ===
         price_num = price_to_int(ad['price'])
         if MIN_PRICE > 0 and price_num < MIN_PRICE:
             logger.info(f'  ⏭️ Цена {price_num:,} < {MIN_PRICE:,} — пропуск'.replace(',', ' '))
@@ -615,7 +710,13 @@ class VTBParser:
             logger.info(f'  ✅ В очередь ({saved_count}/{limit})')
             return True, saved_count
         else:
-            logger.info(f'  ⚠️ Уже был в БД')
+            logger.info(f'  ⚠️ Уже был в БД (pending) — пропуск')
+            # Чистим только что скачанную папку, раз запись не нужна
+            try:
+                shutil.rmtree(folder, ignore_errors=True)
+                logger.info(f'  🗑️ Папка {folder} удалена (дубль pending)')
+            except Exception:
+                pass
             return False, saved_count
 
     # --------------------------------------------------------
@@ -658,12 +759,14 @@ class VTBParser:
         logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
         logger.info(f'   Сжатие: max {MAX_IMAGE_SIZE}px, JPEG q={JPEG_QUALITY}')
         logger.info(f'   Фильтр цены: MIN={MIN_PRICE:,} MAX={MAX_PRICE or "∞"}'.replace(',', ' '))
+        logger.info(f'   Фильтр пробега: < {MAX_MILEAGE:,} км'.replace(',', ' '))
+        logger.info(f'   Фильтр моточасов: < {MAX_MOTOHOURS:,}'.replace(',', ' '))
         logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES and MASK_AVAILABLE else "ВЫКЛ"}')
+        logger.info(f'   Дедуп: Sheets (порог {DEDUP_MAX_AGE_DAYS} дн.) + БД')
         logger.info(f'   Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2')
         logger.info(f'   Режим: ПОСТРАНИЧНЫЙ (стр.1 всех категорий → стр.2 всех → ...)')
         logger.info(f'   Перезапуск браузера: каждые {CARDS_BEFORE_RESTART} карточек')
-        logger.info(f'   Отклоняем: без пробега И без моточасов')
-        logger.info(f'   Исключения: {sorted(CATEGORIES_WITHOUT_MILEAGE)}')
+        logger.info(f'   Исключения по пробегу: {sorted(CATEGORIES_WITHOUT_MILEAGE)}')
         logger.info(f'   Стоп: когда ВСЕ категории вернули пустую страницу')
         logger.info('=' * 60)
 
@@ -732,10 +835,9 @@ class VTBParser:
                             if cards_since_restart >= CARDS_BEFORE_RESTART:
                                 logger.info(
                                     f'\n♻️ Перезапуск браузера '
-                                    f'(обработано {cards_since_restart} карточек с прошлого раза)'
+                                    f'(обработано {cards_since_restart} карточек)'
                                 )
                                 self._close_browser(browser, context, page)
-
                                 browser, context, page = self._create_browser(p)
                                 cards_since_restart = 0
                                 logger.info('✅ Браузер перезапущен, память освобождена')
@@ -766,7 +868,7 @@ class VTBParser:
         logger.info(f'  ⏭️ Дублей: {self.skipped_dup}')
         logger.info(f'  🚫 Флаги: {self.skipped_flags}')
         logger.info(f'  💰 Цена не подошла: {self.skipped_price}')
-        logger.info(f'  🛣️ Без пробега/моточасов: {self.skipped_no_mileage}')
+        logger.info(f'  🛣️ Пробег/моточасы не подошли: {self.skipped_no_mileage}')
         logger.info(f'  📂 Категория не определена: {self.skipped_category}')
         logger.info(f'  ❌ Ошибок: {self.errors}')
         logger.info(f'  💾 В очередь: {saved_count}')
