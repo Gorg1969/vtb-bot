@@ -85,6 +85,13 @@ def is_allowed_user(user_id):
     return int(user_id) in ALLOWED_ADMIN_IDS
 
 
+def log_threads(tag=''):
+    try:
+        logger.info(f'🧵 Потоков [{tag}]: {threading.active_count()}')
+    except Exception:
+        pass
+
+
 db = Database()
 db.fix_publication_times()
 fm = FileManager(DATA_DIR)
@@ -122,8 +129,9 @@ class APIClient:
         """
         Загрузка файла в MAX.
         Для фото и для видео используется multipart/form-data,
-        но для видео дополнительно передаём Content-Length (иначе сервер отдаёт 412).
+        но для видео дополнительно передаём Content-Length.
         Токен для видео берётся из ответа Шага 1 (POST /uploads).
+        Таймауты уменьшены, чтобы не держать потоки.
         """
         if not self.token:
             logger.error('❌ upload_file: нет токена')
@@ -153,24 +161,21 @@ class APIClient:
                 logger.info(f'🎬 Видео: токен из Шага 1: '
                             f'{str(token_from_step1)[:30] + "..." if token_from_step1 else "НЕТ"}')
 
-                # Загружаем через multipart, но с явным Content-Length
                 logger.info(f'📤 Шаг 2: загрузка видео (multipart) на {upload_url[:100]}')
                 ur = requests.post(
                     upload_url,
                     files={'data': (filename, file_bytes, 'application/octet-stream')},
                     headers={'Content-Length': str(len(file_bytes))},
-                    timeout=600, verify=False,
+                    timeout=180, verify=False,
                 )
                 logger.info(f'📨 Шаг 2 (multipart): HTTP {ur.status_code}')
                 if ur.status_code not in (200, 201, 204):
                     logger.error(f'❌ Шаг 2 (multipart): {ur.status_code} - {ur.text[:300]}')
 
-                # Возвращаем токен из Шага 1
                 if token_from_step1:
                     logger.info(f'✅ Токен видео (из Шага 1): {str(token_from_step1)[:30]}...')
                     return token_from_step1
 
-                # Резерв — ищем токен в ответе Шага 2
                 try:
                     result = ur.json()
                     logger.info(f'📨 Ответ загрузки видео: '
@@ -203,7 +208,7 @@ class APIClient:
             logger.info(f'📤 Шаг 2: загрузка на {upload_url[:100]}')
             ur = requests.post(upload_url,
                                files={'data': (filename, file_bytes)},
-                               timeout=300, verify=False)
+                               timeout=120, verify=False)
             logger.info(f'📨 Шаг 2: HTTP {ur.status_code}')
 
             if ur.status_code != 200:
@@ -241,8 +246,7 @@ class APIClient:
     def send_post(self, chat_id, text, media_tokens, media_types=None,
                   retry_not_ready=True, max_retries=12):
         """
-        Отправка поста.
-        Для видео — увеличенные паузы (экспоненциальные).
+        Отправка поста. Таймаут уменьшен, чтобы не держать потоки.
         """
         if not self.token:
             return False, None
@@ -274,7 +278,7 @@ class APIClient:
                     f"{self.base_url}/messages",
                     headers={"Authorization": self.token, "Content-Type": "application/json"},
                     params={"chat_id": chat_id_for_api},
-                    json=payload, timeout=120, verify=False)
+                    json=payload, timeout=60, verify=False)
 
                 logger.info(f'📨 Ответ: {r.status_code}')
 
@@ -409,7 +413,6 @@ def publish_one_ad(ad: dict) -> tuple:
                 upload_errors.append(fname)
                 logger.error(f'❌ {fname} — токен не получен')
 
-            # Пауза после загрузки — для видео 60 сек
             if ftype == 'video':
                 logger.info('⏳ Ждём 60 сек для обработки видео на сервере MAX...')
                 time.sleep(60)
@@ -542,6 +545,8 @@ def auto_publish_loop():
     logger.info('🚀 Автопубликация: поток запущен')
     while AUTOPUBLISH_ENABLED[0]:
         try:
+            log_threads('auto_publish_loop')
+
             if not is_in_schedule_window():
                 wait_sec = min(seconds_until_window_start(), 3600)
                 if wait_sec <= 0:
@@ -719,12 +724,14 @@ def index():
 
 @app.route('/health')
 def health():
-    return {"status": "ok", "token_set": bool(TOKEN)}
+    return {"status": "ok", "token_set": bool(TOKEN),
+            "threads": threading.active_count()}
 
 
 @app.route('/status')
 def status():
-    return {"status": "running", "queue": bot_db.count_by_status()}
+    return {"status": "running", "queue": bot_db.count_by_status(),
+            "threads": threading.active_count()}
 
 
 @app.route('/setup_webhook')
@@ -1005,11 +1012,13 @@ def admin_parser_status():
         log_tail = '(лог пуст)'
     status_class = 'status-on' if running else 'status-off'
     status_text = '🟢 РАБОТАЕТ' if running else '🔴 ОСТАНОВЛЕН'
+    threads_count = threading.active_count()
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🚀 Статус парсера</h1>
         <p>Состояние: <span class="{status_class}">{status_text}</span></p>
         <p>Лог: <code>{log_path}</code> ({log_size} байт)</p>
+        <p>🧵 Активных потоков: <b>{threads_count}</b></p>
         <a href="/admin" class="btn btn-gray">← В админку</a>
         <a href="/admin/parser_status" class="btn">🔄 Обновить</a>
         <a href="/admin/run_parser?limit=300" class="btn btn-green" onclick="return confirm('Запустить парсер (300)?')">🚀 Запустить</a>
@@ -1019,8 +1028,11 @@ def admin_parser_status():
         <h2>📜 Последние 200 строк лога</h2>
         <pre class="log">{log_tail}</pre>
     </div>
-    <script>const running = {str(running).lower()}; if (running) {{ setTimeout(() => location.reload(), 10000); }}</script>
     """
+    # ВНИМАНИЕ: автообновление страницы УДАЛЕНО.
+    # Оно создавало новый HTTP-запрос (и поток) каждые 10 секунд
+    # и приводило к ошибке "can't start new thread".
+    # Обновляйте страницу вручную кнопкой "🔄 Обновить".
 
 
 @app.route('/admin/settings', methods=['GET', 'POST'])
@@ -1089,11 +1101,11 @@ def admin_today():
         <p>Всего: <span class="counter-big" id="totalCount">{len(pubs)}</span></p>
         <div style="margin-top:15px">
             <a href="/admin" class="btn btn-gray">← Назад</a>
-            <button class="btn" onclick="refreshTable()">🔄 Обновить</button>
+            <a href="/admin/today" class="btn">🔄 Обновить</a>
             <a href="/api/today/export" class="btn btn-green">📥 Скачать Excel</a>
             <button class="btn btn-orange" onclick="copyMaxLinks()">📋 Копировать ссылки MAX</button>
         </div>
-        <p class="hint" id="lastUpdate">Автообновление каждые 15 сек</p>
+        <p class="hint">Обновляйте вручную кнопкой «🔄 Обновить»</p>
     </div>
     <div class="card"><div style="max-height:600px;overflow-y:auto">
         <table><thead><tr><th>№</th><th>Дата</th><th>Время (МСК)</th>
@@ -1102,35 +1114,15 @@ def admin_today():
         <tbody id="todayTable">{rows_html}</tbody></table>
     </div></div>
     <script>
-        let lastMaxLinks = [];
-        function escapeHtml(s) {{ if (!s) return ''; return String(s).replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[c]); }}
-        async function refreshTable() {{
-            try {{
-                const resp = await fetch('/api/today?_=' + Date.now());
-                const data = await resp.json();
-                if (!data.success) return;
-                const tbody = document.getElementById('todayTable');
-                const pubs = data.publications || [];
-                lastMaxLinks = pubs.map(p => p.max_post_url).filter(Boolean);
-                if (pubs.length === 0) {{ tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#999">Пока ничего не опубликовано</td></tr>'; }}
-                else {{
-                    tbody.innerHTML = pubs.map((p, i) => {{
-                        const maxCell = p.max_post_url ? `<a href="${{escapeHtml(p.max_post_url)}}" target="_blank">🔗 MAX</a>` : '—';
-                        const srcCell = (p.source_url && p.source_url.startsWith('http')) ? `<a href="${{escapeHtml(p.source_url)}}" target="_blank">🔗 Источник</a>` : '—';
-                        return `<tr><td>${{i+1}}</td><td>${{escapeHtml(p.date)}}</td><td>${{escapeHtml(p.time)}}</td><td>${{maxCell}}</td><td>${{srcCell}}</td><td>${{escapeHtml(p.title)}}</td><td>${{escapeHtml(p.code)}}</td><td>${{escapeHtml(p.price)}}</td></tr>`;
-                    }}).join('');
-                }}
-                document.getElementById('totalCount').textContent = pubs.length;
-                document.getElementById('lastUpdate').textContent = 'Обновлено: ' + new Date().toLocaleTimeString('ru-RU') + ' (автообновление каждые 15 сек)';
-            }} catch (e) {{ console.error(e); }}
-        }}
+        const allMaxLinks = [
+            {",".join(f'"{p["max_post_url"]}"' for p in pubs if p.get('max_post_url'))}
+        ];
         function copyMaxLinks() {{
-            if (lastMaxLinks.length === 0) {{ alert('Нет ссылок для копирования'); return; }}
-            navigator.clipboard.writeText(lastMaxLinks.join('\\n')).then(
-                () => alert('✅ Скопировано ' + lastMaxLinks.length + ' ссылок'),
+            if (allMaxLinks.length === 0) {{ alert('Нет ссылок для копирования'); return; }}
+            navigator.clipboard.writeText(allMaxLinks.join('\\n')).then(
+                () => alert('✅ Скопировано ' + allMaxLinks.length + ' ссылок'),
                 () => alert('❌ Не удалось скопировать'));
         }}
-        setInterval(refreshTable, 15000);
     </script>
     """
 
@@ -1198,7 +1190,9 @@ def api_today_export():
     buf.seek(0)
     return send_file(buf, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                      as_attachment=True, download_name=f"Отчет_{today}.xlsx")
-                     # ============================================================
+
+
+# ============================================================
 # ОЧЕРЕДЬ
 # ============================================================
 
