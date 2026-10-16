@@ -4,6 +4,12 @@
 # - Дедуп ВСЕГДА включён (Google Sheets + БД)
 # - Сжатие фото: max 1080px, JPEG quality=85
 # - Фильтр по цене: MIN_PRICE <= цена
+# - Фильтр по пробегу/моточасам (числовой):
+#     * есть пробег → < MAX_MILEAGE
+#     * есть моточасы → < MAX_MOTOHOURS
+#     * есть и то, и другое → оба должны быть < лимитов
+#     * нет ни того, ни другого → пропускаем (ALLOW_NO_MILEAGE_AND_MOTOHOURS=True)
+#   Это нужно, чтобы спецтехника без указанных хар-к тоже публиковалась.
 # - Категория по URL раздела
 # - Название обрезается перед годом
 # - Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2
@@ -12,9 +18,6 @@
 # - Стоп: когда ВСЕ категории вернули пустую страницу
 # - ПЕРЕЗАПУСК БРАУЗЕРА каждые 20 карточек (борьба с OOM)
 # - gc.collect() после каждой карточки
-# - ОТКЛОНЯЕМ объявления БЕЗ пробега И БЕЗ моточасов
-#   (ИСКЛЮЧЕНИЕ: trailer — у прицепов этих полей нет по определению)
-# - Парсим моточасы (для спецтехники)
 # - info.txt: строка "Марка, модель:  **{title}**"
 # - АВТОМАТИЧЕСКОЕ ПЕРЕМЕЖЕНИЕ категорий в очереди в конце run()
 # ============================================================
@@ -40,6 +43,9 @@ from config import (
     FLAG_BUY_AVAILABLE, PAGE_TIMEOUT, CARD_DELAY, SHEETS_URL,
     get_sections_from_db,
     MIN_PRICE, MAX_PRICE,
+    MAX_MILEAGE, MAX_MOTOHOURS,
+    ALLOW_NO_MILEAGE_AND_MOTOHOURS,
+    is_mileage_ok,
     MASK_PLATES, PLATE_MODEL_PATH, PLATE_CONFIDENCE, PLATE_PADDING,
 )
 from sheets_client import SheetsClient
@@ -67,9 +73,6 @@ JPEG_QUALITY = 85
 
 # === Перезапуск браузера ===
 CARDS_BEFORE_RESTART = 20
-
-# === Категории, где пробег/моточасы НЕ обязательны ===
-CATEGORIES_WITHOUT_MILEAGE = {'trailer'}
 
 
 # ============================================================
@@ -110,6 +113,33 @@ def price_to_int(price_str: str) -> int:
         return int(digits)
     except ValueError:
         return 0
+
+
+def parse_number(value: str) -> Optional[int]:
+    """
+    Извлекает первое целое число из строки.
+    Возвращает int или None, если числа нет.
+
+    Примеры:
+        "123 456 км"  → 123456
+        "1 234 м/ч"   → 1234
+        "12,345"      → 12345
+        "н/д"         → None
+        ""            → None
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # убираем всё, кроме цифр
+    digits = re.sub(r'[^\d]', '', s)
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
 
 
 def compress_image(input_path: str,
@@ -186,6 +216,7 @@ class VTBParser:
         self.skipped_category = 0
         self.skipped_price = 0
         self.skipped_no_mileage = 0
+        self.skipped_mileage_limit = 0
         self.errors = 0
 
     # --------------------------------------------------------
@@ -490,7 +521,7 @@ class VTBParser:
         Собирает текст поста для публикации.
         Пробег — если есть.
         Моточасы — если есть.
-        Если ничего нет (например, прицеп) — блок пропускается.
+        Если ничего нет — блок пропускается.
         """
         mileage = ad.get('mileage') or ''
         motohours = ad.get('motohours') or ''
@@ -556,22 +587,35 @@ class VTBParser:
             self.errors += 1
             return False, saved_count
 
-        # === Проверка наличия пробега ИЛИ моточасов ===
-        mileage = (ad.get('mileage') or '').strip()
-        motohours = (ad.get('motohours') or '').strip()
-        cat_name = section.get('name', '')
+        # === ЧИСЛОВОЙ ФИЛЬТР ПО ПРОБЕГУ / МОТОЧАСАМ ===
+        mileage_raw = (ad.get('mileage') or '').strip()
+        motohours_raw = (ad.get('motohours') or '').strip()
 
-        if cat_name not in CATEGORIES_WITHOUT_MILEAGE:
-            if not mileage and not motohours:
-                logger.info('  ⏭️ Нет ни пробега, ни моточасов — пропуск')
+        mileage_num = parse_number(mileage_raw)
+        motohours_num = parse_number(motohours_raw)
+
+        if mileage_num is not None:
+            logger.info(f'  🛣️ Пробег: {mileage_num:,} км'.replace(',', ' '))
+        if motohours_num is not None:
+            logger.info(f'  ⏱️ Моточасы: {motohours_num:,}'.replace(',', ' '))
+        if mileage_num is None and motohours_num is None:
+            if ALLOW_NO_MILEAGE_AND_MOTOHOURS:
+                logger.info('  ℹ️ Ни пробега, ни моточасов — публикуем без этих полей')
+            else:
+                logger.info('  ⏭️ Ни пробега, ни моточасов — пропуск (ALLOW=False)')
                 self.skipped_no_mileage += 1
                 return False, saved_count
-            if mileage:
-                logger.info(f'  🛣️ Пробег: {mileage} км')
-            if motohours:
-                logger.info(f'  ⏱️ Моточасы: {motohours}')
-        else:
-            logger.info(f'  ℹ️ Категория "{cat_name}": проверка пробега/моточасов пропущена')
+
+        if not is_mileage_ok(mileage_num, motohours_num):
+            reasons = []
+            if mileage_num is not None and mileage_num >= MAX_MILEAGE:
+                reasons.append(f'пробег {mileage_num:,} ≥ {MAX_MILEAGE:,}'.replace(',', ' '))
+            if motohours_num is not None and motohours_num >= MAX_MOTOHOURS:
+                reasons.append(f'моточасы {motohours_num:,} ≥ {MAX_MOTOHOURS:,}'.replace(',', ' '))
+            reason_str = '; '.join(reasons) or 'не прошёл фильтр'
+            logger.info(f'  ⏭️ Пробег/моточасы: {reason_str}')
+            self.skipped_mileage_limit += 1
+            return False, saved_count
 
         # === Флаги ===
         ok, reason = self.check_flags(ad['flags'])
@@ -658,16 +702,18 @@ class VTBParser:
         logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
         logger.info(f'   Сжатие: max {MAX_IMAGE_SIZE}px, JPEG q={JPEG_QUALITY}')
         logger.info(f'   Фильтр цены: MIN={MIN_PRICE:,} MAX={MAX_PRICE or "∞"}'.replace(',', ' '))
+        logger.info(f'   Фильтр пробега: < {MAX_MILEAGE:,} км'.replace(',', ' '))
+        logger.info(f'   Фильтр моточасов: < {MAX_MOTOHOURS:,}'.replace(',', ' '))
+        logger.info(f'   Без пробега и моточасов: '
+                    f'{"ПУСКАЕМ" if ALLOW_NO_MILEAGE_AND_MOTOHOURS else "ОТКЛОНЯЕМ"}')
         logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES and MASK_AVAILABLE else "ВЫКЛ"}')
         logger.info(f'   Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2')
         logger.info(f'   Режим: ПОСТРАНИЧНЫЙ (стр.1 всех категорий → стр.2 всех → ...)')
         logger.info(f'   Перезапуск браузера: каждые {CARDS_BEFORE_RESTART} карточек')
-        logger.info(f'   Отклоняем: без пробега И без моточасов')
-        logger.info(f'   Исключения: {sorted(CATEGORIES_WITHOUT_MILEAGE)}')
         logger.info(f'   Стоп: когда ВСЕ категории вернули пустую страницу')
         logger.info('=' * 60)
 
-        # === ИСПРАВЛЕНО: get_all_urls() вместо get_all_records() ===
+        # === Дедуп из Google Sheets ===
         self.sheets.get_all_urls()
 
         sections = [s for s in get_sections_from_db(self.db)
@@ -768,7 +814,8 @@ class VTBParser:
         logger.info(f'  ⏭️ Дублей: {self.skipped_dup}')
         logger.info(f'  🚫 Флаги: {self.skipped_flags}')
         logger.info(f'  💰 Цена не подошла: {self.skipped_price}')
-        logger.info(f'  🛣️ Без пробега/моточасов: {self.skipped_no_mileage}')
+        logger.info(f'  🛣️ Пробег/моточасы сверх лимита: {self.skipped_mileage_limit}')
+        logger.info(f'  🛣️ Без пробега/моточасов (ALLOW=False): {self.skipped_no_mileage}')
         logger.info(f'  📂 Категория не определена: {self.skipped_category}')
         logger.info(f'  ❌ Ошибок: {self.errors}')
         logger.info(f'  💾 В очередь: {saved_count}')
