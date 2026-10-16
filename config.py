@@ -130,12 +130,29 @@ DEDUP_MAX_AGE_DAYS = 30
 
 # Максимально допустимый пробег (км).
 # Объявления с пробегом >= этого значения отклоняются.
-# Логика "И": если есть И пробег, И моточасы — оба должны быть < лимита.
 MAX_MILEAGE = 150_000
 
 # Максимально допустимые моточасы.
 # Объявления с моточасами >= этого значения отклоняются.
 MAX_MOTOHOURS = 150_000
+
+# Разрешать объявления, в которых НЕ указаны НИ пробег, НИ моточасы.
+#
+# Логика фильтрации:
+#   1) Есть И пробег, И моточасы:
+#         объявление проходит, только если ОБА значения < своих лимитов.
+#   2) Есть только пробег:
+#         объявление проходит, если пробег < MAX_MILEAGE.
+#   3) Есть только моточасы:
+#         объявление проходит, если моточасы < MAX_MOTOHOURS.
+#   4) Нет ни пробега, ни моточасов:
+#         - при ALLOW_NO_MILEAGE_AND_MOTOHOURS = True  → объявление проходит;
+#         - при ALLOW_NO_MILEAGE_AND_MOTOHOURS = False → объявление отклоняется.
+#
+# ВАЖНО: спецтехника (бульдозеры, экскаваторы, грейдеры и т.п.)
+# часто идёт БЕЗ пробега/моточасов. Чтобы такие объявления публиковались,
+# оставляем True.
+ALLOW_NO_MILEAGE_AND_MOTOHOURS = True
 
 # ============================================================
 # СПРАВОЧНЫЕ ФУНКЦИИ
@@ -175,3 +192,29 @@ def get_schedule_from_db(db=None):
         except ValueError:
             pass
     return result
+
+
+def is_mileage_ok(mileage, motohours):
+    """
+    Универсальная проверка объявления по пробегу и моточасам.
+
+    Принимает ЧИСЛА (int/float) либо None.
+    Возвращает True, если объявление проходит фильтр, иначе False.
+
+    Правила:
+      - Есть И пробег, И моточасы → оба должны быть < лимитов.
+      - Есть только пробег        → пробег < MAX_MILEAGE.
+      - Есть только моточасы      → моточасы < MAX_MOTOHOURS.
+      - Нет ни того, ни другого   → зависит от ALLOW_NO_MILEAGE_AND_MOTOHOURS.
+    """
+    has_mileage = mileage is not None
+    has_motohours = motohours is not None
+
+    if has_mileage and has_motohours:
+        return mileage < MAX_MILEAGE and motohours < MAX_MOTOHOURS
+    if has_mileage:
+        return mileage < MAX_MILEAGE
+    if has_motohours:
+        return motohours < MAX_MOTOHOURS
+    # Ни пробега, ни моточасов
+    return ALLOW_NO_MILEAGE_AND_MOTOHOURS
