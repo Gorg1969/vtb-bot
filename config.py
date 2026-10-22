@@ -82,13 +82,13 @@ SECTIONS = [
 ]
 
 # === Лимиты ===
-INITIAL_LIMIT = 500
+INITIAL_LIMIT = 300
 MAX_PHOTOS_PER_AD = 5
-MAX_PAGES = 500
-MAX_CARDS_PER_SECTION = 500    # максимум карточек с одного раздела
+MAX_PAGES = 300
+MAX_CARDS_PER_SECTION = 300    # максимум карточек с одного раздела
 
 # === Фильтр по цене ===
-MIN_PRICE = 4_500_000
+MIN_PRICE = 4_000_000
 MAX_PRICE = 0
 
 # === Флаги ===
