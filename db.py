@@ -171,7 +171,6 @@ class BotDB:
                     f'♻️ Перепубликация #{existing["id"]}: '
                     f'{ad.get("folder_name")} (sort_order={new_order})'
                 )
-                # Сообщаем вызывающему коду, что старое медиа надо подчистить
                 if old_media_path and old_media_path != ad.get('media_path'):
                     logger.info(f'   Старая папка: {old_media_path}')
                 conn.commit()
@@ -224,10 +223,6 @@ class BotDB:
         return found
 
     def get_pending_ads(self, limit: int = 10) -> List[Dict]:
-        """
-        Возвращает pending-объявления в порядке sort_order ASC, created_at ASC.
-        Именно в этом порядке автопубликация берёт объявления.
-        """
         conn = self._connect()
         c = conn.cursor()
         c.execute('''
@@ -241,7 +236,6 @@ class BotDB:
         return rows
 
     def get_all_pending_ads(self) -> List[Dict]:
-        """Все pending-объявления в порядке очереди."""
         conn = self._connect()
         c = conn.cursor()
         c.execute('''
@@ -284,10 +278,6 @@ class BotDB:
         conn.close()
 
     def delete_ad(self, ad_id: int, delete_files: bool = True) -> bool:
-        """
-        Удаляет объявление из БД. Если delete_files=True — удаляет папку с медиа.
-        Возвращает True, если запись найдена и удалена.
-        """
         import shutil
         import os
 
@@ -318,11 +308,6 @@ class BotDB:
     # --------------------------------------------------------
 
     def delete_ad_photo(self, ad_id: int, filename: str, keep_min: int = 1) -> tuple:
-        """
-        Удаляет ОДНО фото из папки объявления.
-        keep_min — минимальное количество фото, которое должно остаться.
-        Возвращает (success: bool, message: str, remaining: int).
-        """
         import os
 
         ad = self.get_ad_by_id(ad_id)
@@ -364,7 +349,6 @@ class BotDB:
         return True, f'Удалено: {safe_name}', remaining
 
     def get_ad_photos(self, ad_id: int) -> list:
-        """Возвращает список имён фото в папке объявления (отсортированный)."""
         import os
 
         ad = self.get_ad_by_id(ad_id)
@@ -389,7 +373,6 @@ class BotDB:
     # --------------------------------------------------------
 
     def move_ad(self, ad_id: int, direction: str) -> bool:
-        """Меняет порядок публикации (up/down) среди pending."""
         if direction not in ('up', 'down'):
             return False
 
@@ -438,18 +421,14 @@ class BotDB:
     # --------------------------------------------------------
 
     CATEGORY_GROUPS = [
-        ['truck_samosval'],                                  # 1. Самосвалы
-        ['truck_sedelny'],                                   # 2. Седельные тягачи
-        ['buldozer', 'excavator', 'grader'],                 # 3. Дорожная техника
-        ['trailer'],                                         # 4. Прицепы
-        ['car'],                                             # 5. Легковые
+        ['truck_samosval'],
+        ['truck_sedelny'],
+        ['buldozer', 'excavator', 'grader'],
+        ['trailer'],
+        ['car'],
     ]
 
     def resort_queue_by_categories(self) -> int:
-        """
-        Пересчитывает sort_order у всех pending-объявлений так,
-        чтобы категории шли ПО ОЧЕРЕДИ (перемежались).
-        """
         conn = self._connect()
         c = conn.cursor()
 
@@ -504,7 +483,6 @@ class BotDB:
         return len(ordered_ids)
 
     def get_queue_category_summary(self) -> Dict:
-        """Сводка: сколько pending-объявлений в каждой категории."""
         conn = self._connect()
         c = conn.cursor()
         c.execute('''
@@ -567,19 +545,61 @@ class BotDB:
         conn.close()
         return rows
 
-    def get_publications_today_full(self) -> List[Dict]:
+    # === ИЗМЕНЕНО: единый метод с фильтром по датам ===
+    def get_publications_full(self, date_from: str = None, date_to: str = None,
+                              limit: int = 5000,
+                              status: str = 'success') -> List[Dict]:
+        """
+        Возвращает публикации для отчёта.
+
+        date_from / date_to — строки 'YYYY-MM-DD' (включительно).
+            - оба переданы  → BETWEEN
+            - только from   → >= from
+            - только to     → <= to
+            - ни один       → СЕГОДНЯ (DATE('now','localtime'))
+
+        status — фильтр по статусу; по умолчанию 'success'.
+                 Передайте None, чтобы не фильтровать.
+
+        limit — ограничение количества строк (для HTML-таблицы).
+                Для Excel-экспорта используйте limit=100000.
+        """
         import pytz
         moscow_tz = pytz.timezone('Europe/Moscow')
 
         conn = self._connect()
         c = conn.cursor()
-        c.execute('''
+
+        where = []
+        params = []
+
+        if status:
+            where.append("status = ?")
+            params.append(status)
+
+        if date_from and date_to:
+            where.append("DATE(published_at) BETWEEN ? AND ?")
+            params += [date_from, date_to]
+        elif date_from:
+            where.append("DATE(published_at) >= ?")
+            params.append(date_from)
+        elif date_to:
+            where.append("DATE(published_at) <= ?")
+            params.append(date_to)
+        else:
+            where.append("DATE(published_at) = DATE('now', 'localtime')")
+
+        sql = f'''
             SELECT id, published_at, max_post_url, folder_name,
                    title, code, price, category, group_id
             FROM publications
-            WHERE DATE(published_at) = DATE('now', 'localtime')
+            WHERE {' AND '.join(where)}
             ORDER BY published_at ASC
-        ''')
+            LIMIT ?
+        '''
+        params.append(int(limit))
+
+        c.execute(sql, params)
         rows = c.fetchall()
         conn.close()
 
@@ -609,6 +629,53 @@ class BotDB:
                 'group_id': row[8] or '',
             })
         return result
+
+    # === ИЗМЕНЕНО: обёртка для обратной совместимости ===
+    def get_publications_today_full(self) -> List[Dict]:
+        return self.get_publications_full()
+
+    # === НОВОЕ: список дат, за которые есть публикации ===
+    def get_available_dates(self) -> List[str]:
+        """Даты 'YYYY-MM-DD' с успешными публикациями, по убыванию."""
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute('''
+            SELECT DISTINCT DATE(published_at) AS d
+            FROM publications
+            WHERE status = 'success' AND published_at IS NOT NULL
+            ORDER BY d DESC
+        ''')
+        dates = [r[0] for r in c.fetchall() if r[0]]
+        conn.close()
+        return dates
+
+    # === НОВОЕ: количество строк за период (для предупреждения о лимите) ===
+    def count_publications(self, date_from: str = None,
+                           date_to: str = None,
+                           status: str = 'success') -> int:
+        conn = self._connect()
+        c = conn.cursor()
+        where = []
+        params = []
+        if status:
+            where.append("status = ?")
+            params.append(status)
+        if date_from and date_to:
+            where.append("DATE(published_at) BETWEEN ? AND ?")
+            params += [date_from, date_to]
+        elif date_from:
+            where.append("DATE(published_at) >= ?")
+            params.append(date_from)
+        elif date_to:
+            where.append("DATE(published_at) <= ?")
+            params.append(date_to)
+        else:
+            where.append("DATE(published_at) = DATE('now', 'localtime')")
+        sql = f"SELECT COUNT(*) FROM publications WHERE {' AND '.join(where)}"
+        c.execute(sql, params)
+        n = c.fetchone()[0]
+        conn.close()
+        return int(n or 0)
 
     def get_publications(self, limit: int = 100) -> List[Dict]:
         conn = self._connect()
