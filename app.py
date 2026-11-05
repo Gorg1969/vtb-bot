@@ -126,13 +126,6 @@ class APIClient:
             return False
 
     def upload_file(self, file_bytes, filename='file.bin', file_type='image'):
-        """
-        Загрузка файла в MAX.
-        Для фото и для видео используется multipart/form-data,
-        но для видео дополнительно передаём Content-Length.
-        Токен для видео берётся из ответа Шага 1 (POST /uploads).
-        Таймауты уменьшены, чтобы не держать потоки.
-        """
         if not self.token:
             logger.error('❌ upload_file: нет токена')
             return None
@@ -155,7 +148,6 @@ class APIClient:
                 logger.error(f'❌ Шаг 1: нет url в ответе: {data}')
                 return None
 
-            # ========== ВИДЕО ==========
             if file_type == 'video':
                 token_from_step1 = data.get('token')
                 logger.info(f'🎬 Видео: токен из Шага 1: '
@@ -204,7 +196,6 @@ class APIClient:
                     logger.error(f'   Тело: {ur.text[:500]}')
                     return None
 
-            # ========== IMAGE ==========
             logger.info(f'📤 Шаг 2: загрузка на {upload_url[:100]}')
             ur = requests.post(upload_url,
                                files={'data': (filename, file_bytes)},
@@ -245,9 +236,6 @@ class APIClient:
 
     def send_post(self, chat_id, text, media_tokens, media_types=None,
                   retry_not_ready=True, max_retries=12):
-        """
-        Отправка поста. Таймаут уменьшен, чтобы не держать потоки.
-        """
         if not self.token:
             return False, None
         try:
@@ -336,7 +324,6 @@ VIDEO_EXTS = {'.mp4', '.mov', '.webm'}
 
 
 def clean_post_text(raw_text: str) -> str:
-    """Берём только часть до '#изъятая'."""
     if not raw_text:
         return ''
     marker = '#изъятая'
@@ -658,7 +645,8 @@ BASE_STYLE = """
     table { width: 100%; border-collapse: collapse; margin-top: 10px; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #eee; text-align: left; font-size: 13px; }
     th { background: #f8f9fa; }
-    input[type="text"] { padding: 8px 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; width: 100%; max-width: 320px; }
+    input[type="text"], input[type="date"] { padding: 8px 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; }
+    input[type="text"] { width: 100%; max-width: 320px; }
     .form-row { margin-bottom: 15px; }
     .form-row label { display: block; margin-bottom: 5px; font-weight: bold; color: #333; font-size: 14px; }
     .success-msg { background: #d4edda; color: #155724; padding: 12px; border-radius: 5px; margin-bottom: 15px; }
@@ -684,6 +672,11 @@ BASE_STYLE = """
     .file-drop { border: 2px dashed #007bff; border-radius: 8px; padding: 30px;
                  text-align: center; background: #f8f9fa; margin: 15px 0; cursor: pointer; }
     .file-drop:hover { background: #e9ecef; }
+    .period-form { display: flex; gap: 15px; align-items: flex-end; flex-wrap: wrap; margin: 15px 0; }
+    .period-form > div { display: flex; flex-direction: column; }
+    .period-form label { font-size: 12px; color: #666; margin-bottom: 4px; }
+    .quick-links { margin: 10px 0; }
+    .quick-links .btn { font-size: 13px; padding: 7px 12px; }
 </style>
 """
 
@@ -787,6 +780,13 @@ def admin_page():
               if ap_status.get('next_in_seconds') else ''
     import_warn = '' if IMPORT_FOLDER_AVAILABLE else \
         '<div class="warn">⚠️ Файл <code>import_folder.py</code> не найден.</div>'
+
+    # === ИЗМЕНЕНО: быстрые ссылки на отчёты по периодам ===
+    now_msk = datetime.now(MOSCOW_TZ)
+    yesterday = (now_msk - timedelta(days=1)).strftime('%Y-%m-%d')
+    week_ago = (now_msk - timedelta(days=7)).strftime('%Y-%m-%d')
+    month_ago = (now_msk - timedelta(days=30)).strftime('%Y-%m-%d')
+
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🛠 Админка</h1>
@@ -799,6 +799,17 @@ def admin_page():
         <a href="/setup_webhook" class="btn btn-gray">🔄 Вебхук</a>
     </div>
     {import_warn}
+    <div class="card">
+        <h2>📊 Отчёты по публикациям</h2>
+        <div class="quick-links">
+            <a href="/admin/today" class="btn">📅 Сегодня</a>
+            <a href="/admin/today?from={yesterday}&to={yesterday}" class="btn">📅 Вчера</a>
+            <a href="/admin/today?from={week_ago}" class="btn">📅 За 7 дней</a>
+            <a href="/admin/today?from={month_ago}" class="btn">📅 За 30 дней</a>
+            <a href="/admin/today?all=1" class="btn btn-orange">📚 Всё время</a>
+        </div>
+        <p class="hint">Можно выбрать произвольный период на странице отчёта.</p>
+    </div>
     <div class="card">
         <h2>🕒 Автопубликация</h2>
         <p>Статус: <span class="{ap_class}">{ap_status['status_message']}</span>{ap_next}</p>
@@ -1029,10 +1040,6 @@ def admin_parser_status():
         <pre class="log">{log_tail}</pre>
     </div>
     """
-    # ВНИМАНИЕ: автообновление страницы УДАЛЕНО.
-    # Оно создавало новый HTTP-запрос (и поток) каждые 10 секунд
-    # и приводило к ошибке "can't start new thread".
-    # Обновляйте страницу вручную кнопкой "🔄 Обновить".
 
 
 @app.route('/admin/settings', methods=['GET', 'POST'])
@@ -1079,10 +1086,70 @@ def admin_settings():
     """
 
 
+# ============================================================
+# АДМИНКА — Отчёты по публикациям (ИЗМЕНЕНО)
+# ============================================================
+
+HTML_TABLE_LIMIT = 500          # сколько строк максимум в HTML
+EXCEL_EXPORT_LIMIT = 100000     # сколько строк максимум в Excel
+
+
+def _parse_period_from_request():
+    """
+    Возвращает (date_from, date_to, is_all_time, period_label).
+    Приоритет:
+      1) all=1 → всё время (date_from=None, date_to=None, is_all_time=True)
+      2) from/to из query-строки
+      3) по умолчанию — сегодня
+    Валидируем формат YYYY-MM-DD.
+    """
+    def _valid_date(s):
+        if not s:
+            return None
+        try:
+            datetime.strptime(s, '%Y-%m-%d')
+            return s
+        except Exception:
+            return None
+
+    if request.args.get('all') == '1':
+        return None, None, True, 'Все публикации'
+
+    date_from = _valid_date(request.args.get('from', ''))
+    date_to = _valid_date(request.args.get('to', ''))
+
+    if date_from or date_to:
+        if date_from and date_to and date_from == date_to:
+            label = f'за {date_from}'
+        elif date_from and date_to:
+            label = f'с {date_from} по {date_to}'
+        elif date_from:
+            label = f'с {date_from}'
+        else:
+            label = f'по {date_to}'
+        return date_from, date_to, False, label
+
+    today = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d')
+    return today, today, False, f'за {today} (сегодня)'
+
+
 @app.route('/admin/today')
 @require_admin
 def admin_today():
-    pubs = bot_db.get_publications_today_full()
+    date_from, date_to, is_all_time, period_label = _parse_period_from_request()
+
+    if is_all_time:
+        # Для "всё время" отдаём ограниченное число строк в HTML,
+        # но показываем реальное общее количество.
+        total_count = bot_db.count_publications()
+        pubs = bot_db.get_publications_full(limit=HTML_TABLE_LIMIT)
+    else:
+        total_count = bot_db.count_publications(date_from, date_to)
+        pubs = bot_db.get_publications_full(date_from, date_to,
+                                            limit=HTML_TABLE_LIMIT)
+
+    available_dates = bot_db.get_available_dates()
+
     rows_html = ""
     for i, p in enumerate(pubs, 1):
         max_cell = f'<a href="{p["max_post_url"]}" target="_blank">🔗 MAX</a>' \
@@ -1094,18 +1161,90 @@ def admin_today():
                       f"<td>{src_cell}</td><td>{p.get('title','')}</td>"
                       f"<td>{p.get('code','')}</td><td>{p.get('price','') or ''}</td></tr>")
     if not rows_html:
-        rows_html = "<tr><td colspan='8' style='text-align:center;color:#999'>Пока ничего не опубликовано</td></tr>"
+        rows_html = "<tr><td colspan='8' style='text-align:center;color:#999'>За выбранный период ничего не опубликовано</td></tr>"
+
+    # === Формируем параметры для экспорта ===
+    if is_all_time:
+        export_qs = 'all=1'
+    else:
+        qs_parts = []
+        if date_from:
+            qs_parts.append(f'from={date_from}')
+        if date_to:
+            qs_parts.append(f'to={date_to}')
+        export_qs = '&'.join(qs_parts)
+
+    # === Быстрые ссылки ===
+    now_msk = datetime.now(MOSCOW_TZ)
+    today_str = now_msk.strftime('%Y-%m-%d')
+    yesterday = (now_msk - timedelta(days=1)).strftime('%Y-%m-%d')
+    week_ago = (now_msk - timedelta(days=7)).strftime('%Y-%m-%d')
+    month_ago = (now_msk - timedelta(days=30)).strftime('%Y-%m-%d')
+
+    # === Предупреждение о лимите HTML ===
+    limit_warn = ''
+    if total_count > len(pubs):
+        limit_warn = (
+            f'<div class="warn">⚠️ Показаны последние {len(pubs)} '
+            f'из {total_count} строк. Полный список — в Excel-экспорте.</div>'
+        )
+
+    # === Набор дат для datalist ===
+    datalist_options = "".join(
+        f'<option value="{d}">' for d in available_dates[:90]
+    )
+
+    # === JS: копирование всех ссылок MAX (только для текущей выборки) ===
+    max_links_js = ",".join(
+        f'"{p["max_post_url"]}"' for p in pubs if p.get('max_post_url')
+    )
+
     return BASE_STYLE + f"""
     <div class="card">
-        <h1>📅 Опубликовано сегодня</h1>
-        <p>Всего: <span class="counter-big" id="totalCount">{len(pubs)}</span></p>
+        <h1>📅 Опубликовано: {period_label}</h1>
+        <p>Найдено: <span class="counter-big">{total_count}</span>
+           {f' · показано: {len(pubs)}' if total_count > len(pubs) else ''}</p>
+
+        <form method="GET" action="/admin/today" class="period-form">
+            <div>
+                <label>С даты (МСК)</label>
+                <input type="date" name="from"
+                       value="{date_from or ''}" list="dates-list">
+            </div>
+            <div>
+                <label>По дату (МСК)</label>
+                <input type="date" name="to"
+                       value="{date_to or ''}" list="dates-list">
+            </div>
+            <div>
+                <button type="submit" class="btn">🔎 Показать</button>
+            </div>
+            <div>
+                <a href="/admin/today" class="btn btn-gray">Сегодня</a>
+            </div>
+        </form>
+        <datalist id="dates-list">{datalist_options}</datalist>
+
+        <div class="quick-links">
+            <a href="/admin/today" class="btn">📅 Сегодня</a>
+            <a href="/admin/today?from={yesterday}&to={yesterday}" class="btn">📅 Вчера</a>
+            <a href="/admin/today?from={week_ago}&to={today_str}" class="btn">📅 7 дней</a>
+            <a href="/admin/today?from={month_ago}&to={today_str}" class="btn">📅 30 дней</a>
+            <a href="/admin/today?all=1" class="btn btn-orange">📚 Всё время</a>
+        </div>
+
+        {limit_warn}
+
         <div style="margin-top:15px">
             <a href="/admin" class="btn btn-gray">← Назад</a>
-            <a href="/admin/today" class="btn">🔄 Обновить</a>
-            <a href="/api/today/export" class="btn btn-green">📥 Скачать Excel</a>
+            <a href="/admin/today?{export_qs.replace('&', '&amp;')}" class="btn">🔄 Обновить</a>
+            <a href="/api/today/export?{export_qs.replace('&', '&amp;')}" class="btn btn-green">📥 Скачать Excel</a>
             <button class="btn btn-orange" onclick="copyMaxLinks()">📋 Копировать ссылки MAX</button>
         </div>
-        <p class="hint">Обновляйте вручную кнопкой «🔄 Обновить»</p>
+        <p class="hint">
+            Даты берутся по московскому времени. Excel-экспорт отдаёт полный список
+            за выбранный период (до {EXCEL_EXPORT_LIMIT} строк).
+        </p>
     </div>
     <div class="card"><div style="max-height:600px;overflow-y:auto">
         <table><thead><tr><th>№</th><th>Дата</th><th>Время (МСК)</th>
@@ -1114,9 +1253,7 @@ def admin_today():
         <tbody id="todayTable">{rows_html}</tbody></table>
     </div></div>
     <script>
-        const allMaxLinks = [
-            {",".join(f'"{p["max_post_url"]}"' for p in pubs if p.get('max_post_url'))}
-        ];
+        const allMaxLinks = [{max_links_js}];
         function copyMaxLinks() {{
             if (allMaxLinks.length === 0) {{ alert('Нет ссылок для копирования'); return; }}
             navigator.clipboard.writeText(allMaxLinks.join('\\n')).then(
@@ -1130,8 +1267,14 @@ def admin_today():
 @app.route('/api/today')
 @require_admin
 def api_today():
-    pubs = bot_db.get_publications_today_full()
-    resp = jsonify({'success': True, 'publications': pubs, 'count': len(pubs)})
+    date_from, date_to, is_all_time, period_label = _parse_period_from_request()
+    if is_all_time:
+        pubs = bot_db.get_publications_full(limit=EXCEL_EXPORT_LIMIT)
+    else:
+        pubs = bot_db.get_publications_full(date_from, date_to,
+                                            limit=EXCEL_EXPORT_LIMIT)
+    resp = jsonify({'success': True, 'period': period_label,
+                    'publications': pubs, 'count': len(pubs)})
     resp.headers['Content-Type'] = 'application/json; charset=utf-8'
     return resp
 
@@ -1141,8 +1284,29 @@ def api_today():
 def api_today_export():
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-    pubs = bot_db.get_publications_today_full()
+
+    date_from, date_to, is_all_time, period_label = _parse_period_from_request()
+
+    if is_all_time:
+        pubs = bot_db.get_publications_full(limit=EXCEL_EXPORT_LIMIT)
+    else:
+        pubs = bot_db.get_publications_full(date_from, date_to,
+                                            limit=EXCEL_EXPORT_LIMIT)
+
     today = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    # имя файла отражает период
+    if is_all_time:
+        fname_part = 'all_time'
+    elif date_from and date_to and date_from == date_to:
+        fname_part = date_from
+    elif date_from and date_to:
+        fname_part = f'{date_from}_{date_to}'
+    elif date_from:
+        fname_part = f'from_{date_from}'
+    else:
+        fname_part = date_from or 'today'
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Отчет"
@@ -1153,7 +1317,8 @@ def api_today_export():
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     thin = Border(left=Side(style="thin", color="D0D0D0"), right=Side(style="thin", color="D0D0D0"),
                   top=Side(style="thin", color="D0D0D0"), bottom=Side(style="thin", color="D0D0D0"))
-    title = ws.cell(row=1, column=1, value="Отчет по публикациям")
+    title = ws.cell(row=1, column=1,
+                    value=f"Отчет по публикациям — {period_label}")
     title.font = Font(bold=True, size=14)
     title.alignment = Alignment(horizontal="center", vertical="center")
     ws.merge_cells('A1:H1')
@@ -1189,7 +1354,8 @@ def api_today_export():
     wb.save(buf)
     buf.seek(0)
     return send_file(buf, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                     as_attachment=True, download_name=f"Отчет_{today}.xlsx")
+                     as_attachment=True,
+                     download_name=f"Отчет_{fname_part}_{today}.xlsx")
 
 
 # ============================================================
