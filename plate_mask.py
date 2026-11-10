@@ -1,8 +1,9 @@
-# plate_mask.py 3
+# plate_mask.py 4
 # ============================================================
 # Закраска номерных знаков через OpenCV DNN (YOLOv8 ONNX)
 # - НЕ требует onnxruntime (он падает на Bothost из-за execstack)
 # - Использует cv2.dnn.readNetFromONNX()
+# - Номера НЕ закрашиваются чёрным, а РАЗМЫВАЮТСЯ (GaussianBlur)
 # ============================================================
 
 import os
@@ -82,11 +83,56 @@ def letterbox(img: np.ndarray, new_shape: Tuple[int, int] = (640, 640),
     return img, r, (dw, dh)
 
 
+def _apply_blur(img: np.ndarray, x1: int, y1: int, x2: int, y2: int,
+                strength: int = 31) -> None:
+    """
+    Размывает прямоугольную область (x1, y1, x2, y2) прямо в img.
+    strength — размер ядра GaussianBlur (нечётное число, >= 3).
+    Применяется 3 прохода подряд, чтобы символы гарантированно
+    стали нечитаемыми.
+    """
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    # Гарантируем нечётное ядро >= 3
+    k = max(3, int(strength))
+    if k % 2 == 0:
+        k += 1
+
+    region_h = y2 - y1
+    region_w = x2 - x1
+
+    # Слишком маленькая область — заливаем средним цветом ROI,
+    # иначе GaussianBlur даст артефакты на крошечном кропе.
+    if min(region_h, region_w) < 3:
+        roi = img[y1:y2, x1:x2]
+        if roi.size:
+            mean_color = roi.reshape(-1, roi.shape[-1]).mean(axis=0).astype(np.uint8)
+            img[y1:y2, x1:x2] = mean_color
+        return
+
+    # Ограничиваем ядро размерами области
+    max_k = min(region_h, region_w)
+    if k > max_k:
+        k = max_k if max_k % 2 == 1 else max_k - 1
+    if k < 3:
+        k = 3
+
+    roi = img[y1:y2, x1:x2]
+    blurred = roi
+    # Несколько проходов для надёжности
+    for _ in range(3):
+        blurred = cv2.GaussianBlur(blurred, (k, k), 0)
+
+    img[y1:y2, x1:x2] = blurred
+
+
 def mask_plate(image_bytes: bytes,
                model_path: str = '/app/yolov8_plate_fp16.onnx',
                confidence: float = 0.4,
-               padding: int = 3,
-               imgsz: int = 640) -> bytes:
+               padding: int = 5,
+               imgsz: int = 640,
+               blur_strength: int = 31) -> bytes:
     net = get_session(model_path)
     if net is None:
         logger.warning('⚠️ OpenCV DNN модель недоступна, возвращаю оригинал')
@@ -106,10 +152,8 @@ def mask_plate(image_bytes: bytes,
 
         # BGR → RGB, нормализация, HWC → CHW
         img_rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB)
-        img_norm = img_rgb.astype(np.float32) / 255.0
 
         # Создаём blob для OpenCV DNN
-        # blobFromImage принимает HWC, возвращает NCHW
         blob = cv2.dnn.blobFromImage(
             img_rgb, scalefactor=1/255.0, size=(imgsz, imgsz),
             mean=(0, 0, 0), swapRB=False, crop=False
@@ -146,18 +190,19 @@ def mask_plate(image_bytes: bytes,
             x2 = min(orig_w, x2 + padding)
             y2 = min(orig_h, y2 + padding)
 
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 0), -1)
+            # === РАЗМЫТИЕ вместо чёрного прямоугольника ===
+            _apply_blur(img, x1, y1, x2, y2, strength=blur_strength)
             masked_count += 1
 
         if masked_count == 0:
             logger.info('  ⏭️ Номера не найдены — фото без изменений')
             return image_bytes
 
-        logger.info(f'  🎭 Закрашено номеров: {masked_count}')
+        logger.info(f'  🎭 Размыто номеров: {masked_count}')
 
         _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return buf.tobytes()
 
     except Exception as e:
-        logger.exception(f'❌ Ошибка закраски: {e}')
+        logger.exception(f'❌ Ошибка размытия номеров: {e}')
         return image_bytes
