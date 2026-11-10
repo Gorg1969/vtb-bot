@@ -643,4 +643,4 @@ class VTBParser:
 
         ad['category'] = section['name']
         ad['chat_id'] = section['chat_id']
-        logger.info(f'  📂 {section["name"]} → {section["chat_id"]}
+        logger.info(f'  📂 {section["name"]} → {section["chat_id"]}')   
