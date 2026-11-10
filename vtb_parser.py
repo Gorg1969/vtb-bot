@@ -9,7 +9,6 @@
 #     * есть моточасы → < MAX_MOTOHOURS
 #     * есть и то, и другое → оба должны быть < лимитов
 #     * нет ни того, ни другого → пропускаем (ALLOW_NO_MILEAGE_AND_MOTOHOURS=True)
-#   Это нужно, чтобы спецтехника без указанных хар-к тоже публиковалась.
 # - Категория по URL раздела
 # - Название обрезается перед годом
 # - Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2
@@ -133,7 +132,6 @@ def parse_number(value: str) -> Optional[int]:
     s = str(value).strip()
     if not s:
         return None
-    # убираем всё, кроме цифр
     digits = re.sub(r'[^\d]', '', s)
     if not digits:
         return None
@@ -535,21 +533,20 @@ class VTBParser:
 
         spec_block = '\n'.join(spec_lines)
 
-        return f"""**{ad['title']}**
-
-**Цена в лизинге: {ad['price']} руб с НДС**
-
-*возможна скидка после осмотра*
-Изъятая техника ЛК -  ✅
-
-{spec_block}
-Год: {ad['year']}
-Место нахождения: {ad['city']}
-
-**За покупкой и согласованием скидки обращайтесь в личные сообщения ⏩️ [Евгений](https://max.ru/u/f9LHodD0cOL4IXTfONTL9Ju-y7ShR5IHNPGNZ1MFYHPHImA10EgOQcxQWto)
-Если не отвечаю в течение 30 мин, обратитесь к [Надежда](https://max.ru/u/f9LHodD0cOIcl8J8friWk-iFWzi9jy7lJql-IMInGvvX_hM8s1w4klx-F0k)**
-
-#изятка #лизинг #бу"""
+        return (
+            f"**{ad['title']}**\n\n"
+            f"**Цена в лизинге: {ad['price']} руб с НДС**\n\n"
+            f"*возможна скидка после осмотра*\n"
+            f"Изъятая техника ЛК -  ✅\n\n"
+            f"{spec_block}\n"
+            f"Год: {ad['year']}\n"
+            f"Место нахождения: {ad['city']}\n\n"
+            f"**За покупкой и согласованием скидки обращайтесь в личные сообщения ⏩️ "
+            f"[Евгений](https://max.ru/u/f9LHodD0cOL4IXTfONTL9Ju-y7ShR5IHNPGNZ1MFYHPHImA10EgOQcxQWto)\n"
+            f"Если не отвечаю в течение 30 мин, обратитесь к "
+            f"[Надежда](https://max.ru/u/f9LHodD0cOIcl8J8friWk-iFWzi9jy7lJql-IMInGvvX_hM8s1w4klx-F0k)**\n\n"
+            f"#изятка #лизинг #бу"
+        )
 
     def _build_report_text(self, ad: Dict) -> str:
         mileage = ad.get('mileage') or ''
@@ -562,13 +559,15 @@ class VTBParser:
             spec_lines.append(f"Моточасы: {motohours}")
         spec_block = '\n'.join(spec_lines)
 
-        return f"""Название: {ad['title']}
-Ссылка: {ad['source_url']}
-Код предложения: {ad['code']}
-Город: {ad['city']}
-Год: {ad['year']}
-{spec_block}
-Цена: {ad['price']} руб"""
+        return (
+            f"Название: {ad['title']}\n"
+            f"Ссылка: {ad['source_url']}\n"
+            f"Код предложения: {ad['code']}\n"
+            f"Город: {ad['city']}\n"
+            f"Год: {ad['year']}\n"
+            f"{spec_block}\n"
+            f"Цена: {ad['price']} руб"
+        )
 
     # --------------------------------------------------------
     # ОБРАБОТКА ОДНОЙ КАРТОЧКИ
@@ -643,4 +642,220 @@ class VTBParser:
 
         ad['category'] = section['name']
         ad['chat_id'] = section['chat_id']
-        logger.info(f'  📂 {section["name"]} → {section["chat_id"]}')   
+        logger.info("  📂 %s → %s" % (section['name'], section['chat_id']))
+
+        self.processed += 1
+        folder = self.save_ad_media(ad, self.processed, section)
+        if not folder:
+            self.errors += 1
+            return False, saved_count
+
+        ad['folder_name'] = os.path.basename(folder)
+        ad['media_path'] = folder
+        inserted = self.db.add_parsed_ad(ad)
+
+        if inserted:
+            saved_count += 1
+            logger.info(f'  ✅ В очередь ({saved_count}/{limit})')
+            return True, saved_count
+        else:
+            logger.info(f'  ⚠️ Уже был в БД')
+            return False, saved_count
+
+    # --------------------------------------------------------
+    # БРАУЗЕР
+    # --------------------------------------------------------
+
+    def _create_browser(self, p):
+        browser = p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox',
+                  '--disable-dev-shm-usage']
+        )
+        context = browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        )
+        page = context.new_page()
+        return browser, context, page
+
+    def _close_browser(self, browser, context, page):
+        try:
+            if page:
+                page.close()
+        except Exception:
+            pass
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        gc.collect()
+
+    # --------------------------------------------------------
+    # ГЛАВНЫЙ МЕТОД: ПОСТРАНИЧНЫЙ ОБХОД + ПЕРЕЗАПУСК БРАУЗЕРА
+    # --------------------------------------------------------
+
+    def run(self, limit: int = INITIAL_LIMIT):
+        logger.info('=' * 60)
+        logger.info(f'🚀 СТАРТ ПАРСИНГА (лимит: {limit})')
+        logger.info(f'   Сжатие: max {MAX_IMAGE_SIZE}px, JPEG q={JPEG_QUALITY}')
+        logger.info(f'   Фильтр цены: MIN={MIN_PRICE:,} MAX={MAX_PRICE or "∞"}'.replace(',', ' '))
+        logger.info(f'   Фильтр пробега: < {MAX_MILEAGE:,} км'.replace(',', ' '))
+        logger.info(f'   Фильтр моточасов: < {MAX_MOTOHOURS:,}'.replace(',', ' '))
+        logger.info(f'   Без пробега и моточасов: '
+                    f'{"ПУСКАЕМ" if ALLOW_NO_MILEAGE_AND_MOTOHOURS else "ОТКЛОНЯЕМ"}')
+        logger.info(f'   Закраска номеров: {"ВКЛ" if MASK_PLATES and MASK_AVAILABLE else "ВЫКЛ"}')
+        logger.info(f'   Пагинация: <base>/ для стр.1, <base>/?PAGEN_1=N для N>=2')
+        logger.info(f'   Режим: ПОСТРАНИЧНЫЙ (стр.1 всех категорий → стр.2 всех → ...)')
+        logger.info(f'   Перезапуск браузера: каждые {CARDS_BEFORE_RESTART} карточек')
+        logger.info(f'   Стоп: когда ВСЕ категории вернули пустую страницу')
+        logger.info('=' * 60)
+
+        # === Дедуп из Google Sheets ===
+        self.sheets.get_all_urls()
+
+        sections = [s for s in get_sections_from_db(self.db)
+                    if s.get('enabled', True)]
+
+        if not sections:
+            logger.warning('⚠️ Нет активных разделов')
+            return 0
+
+        logger.info(f'📊 Категорий: {len(sections)}')
+
+        saved_count = 0
+
+        with sync_playwright() as p:
+            browser, context, page = self._create_browser(p)
+            logger.info('✅ Браузер запущен')
+
+            cards_since_restart = 0
+
+            try:
+                pagen = 1
+
+                while saved_count < limit and pagen <= MAX_PAGES:
+                    logger.info(f'\n{"=" * 60}')
+                    logger.info(f'📄 СТРАНИЦА {pagen} ПО ВСЕМ КАТЕГОРИЯМ')
+                    logger.info(f'{"=" * 60}')
+
+                    any_cards_on_page = False
+
+                    for section in sections:
+                        if saved_count >= limit:
+                            break
+
+                        name = section['name']
+                        title = section.get('title', name)
+                        base_url = section['url']
+                        if not base_url.endswith('/'):
+                            base_url += '/'
+
+                        if pagen == 1:
+                            page_url = base_url
+                        else:
+                            page_url = f"{base_url}?PAGEN_1={pagen}"
+
+                        logger.info(f'\n📂 {name} ({title}): {page_url}')
+
+                        urls_on_page = self.collect_urls_from_one_page(
+                            page, section, page_url
+                        )
+
+                        if not urls_on_page:
+                            logger.info(f'  ⏹️ {name}: страница пуста — конец категории')
+                            continue
+
+                        any_cards_on_page = True
+
+                        logger.info(f'  📋 {len(urls_on_page)} карточек')
+
+                        for url in urls_on_page:
+                            if saved_count >= limit:
+                                break
+
+                            # === ПЕРЕЗАПУСК БРАУЗЕРА ===
+                            if cards_since_restart >= CARDS_BEFORE_RESTART:
+                                logger.info(
+                                    f'\n♻️ Перезапуск браузера '
+                                    f'(обработано {cards_since_restart} карточек с прошлого раза)'
+                                )
+                                self._close_browser(browser, context, page)
+
+                                browser, context, page = self._create_browser(p)
+                                cards_since_restart = 0
+                                logger.info('✅ Браузер перезапущен, память освобождена')
+
+                            success, saved_count = self._process_one_url(
+                                page, url, section, saved_count, limit
+                            )
+                            cards_since_restart += 1
+
+                            gc.collect()
+
+                    if not any_cards_on_page:
+                        logger.info('\n⏹️ Все категории вернули пустую страницу — стоп')
+                        break
+
+                    logger.info(
+                        f'\n📊 Итог стр. {pagen}: в очередь {saved_count}/{limit}'
+                    )
+                    pagen += 1
+
+            finally:
+                self._close_browser(browser, context, page)
+                logger.info('🛑 Браузер закрыт')
+
+        logger.info('\n' + '=' * 60)
+        logger.info('📊 ИТОГИ ПАРСИНГА:')
+        logger.info(f'  ✅ Обработано: {self.processed}')
+        logger.info(f'  ⏭️ Дублей: {self.skipped_dup}')
+        logger.info(f'  🚫 Флаги: {self.skipped_flags}')
+        logger.info(f'  💰 Цена не подошла: {self.skipped_price}')
+        logger.info(f'  🛣️ Пробег/моточасы сверх лимита: {self.skipped_mileage_limit}')
+        logger.info(f'  🛣️ Без пробега/моточасов (ALLOW=False): {self.skipped_no_mileage}')
+        logger.info(f'  📂 Категория не определена: {self.skipped_category}')
+        logger.info(f'  ❌ Ошибок: {self.errors}')
+        logger.info(f'  💾 В очередь: {saved_count}')
+        logger.info('=' * 60)
+
+        # === АВТОМАТИЧЕСКОЕ ПЕРЕМЕЖЕНИЕ КАТЕГОРИЙ В ОЧЕРЕДИ ===
+        if saved_count > 0:
+            try:
+                logger.info('🔀 Перемежаем категории в очереди...')
+                reordered = self.db.resort_queue_by_categories()
+                logger.info(f'✅ Очередь перемежена по категориям: {reordered} записей')
+            except Exception as e:
+                logger.warning(f'⚠️ Не удалось перемешать очередь: {e}')
+
+        stats = self.db.count_by_status()
+        logger.info(f'📊 Очередь: {stats}')
+        return saved_count
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def main():
+    ap = argparse.ArgumentParser(description='VTB Parser')
+    ap.add_argument('--limit', type=int, default=INITIAL_LIMIT)
+    args = ap.parse_args()
+
+    sheets = SheetsClient(url=SHEETS_URL)
+    from config import DB_PATH
+    db = BotDB(DB_PATH)
+
+    parser = VTBParser(sheets, db, OUTPUT_DIR)
+    saved = parser.run(limit=args.limit)
+    logger.info(f'🎯 Готово. Новых: {saved}')
+
+
+if __name__ == '__main__':
+    main()
