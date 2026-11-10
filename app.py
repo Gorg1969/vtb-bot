@@ -767,6 +767,7 @@ def admin_page():
     stats = bot_db.count_by_status()
     schedule = get_schedule_from_db(bot_db)
     ap_status = get_autopublish_status()
+    parser_running = parser_is_running()  # === ДОБАВЛЕНО: СТОП ПАРСЕРА ===
     rows = "".join(
         f"<tr><td>{s.get('title', s['name'])}</td><td>{s['url']}</td>"
         f"<td>{s.get('key_in_title') or '—'}</td><td>{s['chat_id']}</td>"
@@ -787,6 +788,21 @@ def admin_page():
     week_ago = (now_msk - timedelta(days=7)).strftime('%Y-%m-%d')
     month_ago = (now_msk - timedelta(days=30)).strftime('%Y-%m-%d')
 
+    # === ДОБАВЛЕНО: СТОП ПАРСЕРА — кнопка в шапке ===
+    parser_status_html = (
+        '<span class="status-on">🟢 РАБОТАЕТ</span>'
+        if parser_running else
+        '<span class="status-off">🔴 ОСТАНОВЛЕН</span>'
+    )
+    parser_stop_btn = (
+        '<a href="/admin/stop_parser" class="btn btn-red" '
+        'onclick="return confirm(\'Остановить парсер? Текущая карточка будет обработана, '
+        'но новые загружаться не будут.\')">⏹ СТОП парсера</a>'
+        if parser_running else
+        '<a href="/admin/run_parser?limit=300" class="btn btn-green" '
+        'onclick="return confirm(\'Запустить парсер (300)?\')">🚀 Запустить парсер</a>'
+    )
+
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🛠 Админка</h1>
@@ -797,6 +813,7 @@ def admin_page():
         <a href="/admin/import_folder" class="btn">📥 Импорт папок (zip)</a>
         <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
         <a href="/setup_webhook" class="btn btn-gray">🔄 Вебхук</a>
+        {parser_stop_btn}
     </div>
     {import_warn}
     <div class="card">
@@ -821,9 +838,11 @@ def admin_page():
     </div>
     <div class="card">
         <h2>🚀 Парсинг (дедуп ВКЛ)</h2>
+        <p>Статус: {parser_status_html}</p>
         <a href="/admin/run_parser?limit=5" class="btn btn-green">Тест (5)</a>
         <a href="/admin/run_parser?limit=50" class="btn btn-green">50</a>
         <a href="/admin/run_parser?limit=300" class="btn btn-green">300</a>
+        {parser_stop_btn}
         <p class="hint">Парсер запускается в отдельном процессе.</p>
     </div>
     <div class="card">
@@ -1024,6 +1043,17 @@ def admin_parser_status():
     status_class = 'status-on' if running else 'status-off'
     status_text = '🟢 РАБОТАЕТ' if running else '🔴 ОСТАНОВЛЕН'
     threads_count = threading.active_count()
+
+    # === ДОБАВЛЕНО: СТОП ПАРСЕРА — кнопка на странице статуса ===
+    parser_stop_btn = (
+        '<a href="/admin/stop_parser" class="btn btn-red" '
+        'onclick="return confirm(\'Остановить парсер? Текущая карточка будет обработана.\')">'
+        '⏹ СТОП парсера</a>'
+        if running else
+        '<a href="/admin/run_parser?limit=300" class="btn btn-green" '
+        'onclick="return confirm(\'Запустить парсер (300)?\')">🚀 Запустить парсер</a>'
+    )
+
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🚀 Статус парсера</h1>
@@ -1032,7 +1062,7 @@ def admin_parser_status():
         <p>🧵 Активных потоков: <b>{threads_count}</b></p>
         <a href="/admin" class="btn btn-gray">← В админку</a>
         <a href="/admin/parser_status" class="btn">🔄 Обновить</a>
-        <a href="/admin/run_parser?limit=300" class="btn btn-green" onclick="return confirm('Запустить парсер (300)?')">🚀 Запустить</a>
+        {parser_stop_btn}
         <a href="/admin/queue" class="btn">📋 Очередь</a>
     </div>
     <div class="card">
@@ -1087,7 +1117,7 @@ def admin_settings():
 
 
 # ============================================================
-# АДМИНКА — Отчёты по публикациям (ИЗМЕНЕНО)
+# АДМИНКА — Отчёты по публикациям
 # ============================================================
 
 HTML_TABLE_LIMIT = 500          # сколько строк максимум в HTML
@@ -1139,8 +1169,6 @@ def admin_today():
     date_from, date_to, is_all_time, period_label = _parse_period_from_request()
 
     if is_all_time:
-        # Для "всё время" отдаём ограниченное число строк в HTML,
-        # но показываем реальное общее количество.
         total_count = bot_db.count_publications()
         pubs = bot_db.get_publications_full(limit=HTML_TABLE_LIMIT)
     else:
@@ -1163,7 +1191,6 @@ def admin_today():
     if not rows_html:
         rows_html = "<tr><td colspan='8' style='text-align:center;color:#999'>За выбранный период ничего не опубликовано</td></tr>"
 
-    # === Формируем параметры для экспорта ===
     if is_all_time:
         export_qs = 'all=1'
     else:
@@ -1174,14 +1201,12 @@ def admin_today():
             qs_parts.append(f'to={date_to}')
         export_qs = '&'.join(qs_parts)
 
-    # === Быстрые ссылки ===
     now_msk = datetime.now(MOSCOW_TZ)
     today_str = now_msk.strftime('%Y-%m-%d')
     yesterday = (now_msk - timedelta(days=1)).strftime('%Y-%m-%d')
     week_ago = (now_msk - timedelta(days=7)).strftime('%Y-%m-%d')
     month_ago = (now_msk - timedelta(days=30)).strftime('%Y-%m-%d')
 
-    # === Предупреждение о лимите HTML ===
     limit_warn = ''
     if total_count > len(pubs):
         limit_warn = (
@@ -1189,12 +1214,10 @@ def admin_today():
             f'из {total_count} строк. Полный список — в Excel-экспорте.</div>'
         )
 
-    # === Набор дат для datalist ===
     datalist_options = "".join(
         f'<option value="{d}">' for d in available_dates[:90]
     )
 
-    # === JS: копирование всех ссылок MAX (только для текущей выборки) ===
     max_links_js = ",".join(
         f'"{p["max_post_url"]}"' for p in pubs if p.get('max_post_url')
     )
@@ -1295,7 +1318,6 @@ def api_today_export():
 
     today = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    # имя файла отражает период
     if is_all_time:
         fname_part = 'all_time'
     elif date_from and date_to and date_from == date_to:
@@ -1799,12 +1821,78 @@ def parser_is_running() -> bool:
     return True
 
 
+# === ДОБАВЛЕНО: СТОП ПАРСЕРА — функция остановки процесса ===
+def stop_parser() -> tuple:
+    """
+    Останавливает парсер, если он запущен.
+
+    Возвращает (ok: bool, message: str).
+
+    Логика:
+      1) Если процесс не запущен — возвращаем False с сообщением.
+      2) Пытаемся terminate() (SIGTERM) — Playwright корректно закроется.
+      3) Ждём до 10 секунд.
+      4) Если процесс всё ещё жив — kill() (SIGKILL).
+      5) Сбрасываем _PARSER_PROC[0] = None.
+    """
+    proc = _PARSER_PROC[0]
+    if proc is None or proc.poll() is not None:
+        _PARSER_PROC[0] = None
+        return False, 'Парсер не запущен'
+
+    pid = proc.pid
+    logger.info(f'⏹ Попытка остановки парсера PID={pid}')
+
+    try:
+        proc.terminate()
+    except Exception as e:
+        logger.warning(f'⚠️ terminate() не сработал: {e}')
+
+    # Ждём завершения до 10 секунд
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        logger.warning(f'⚠️ PID={pid} не завершился за 10 сек, применяем kill()')
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception as e:
+            logger.error(f'❌ kill() не сработал: {e}')
+            return False, f'Не удалось остановить процесс: {e}'
+    except Exception as e:
+        logger.warning(f'⚠️ Ошибка wait(): {e}')
+
+    _PARSER_PROC[0] = None
+    logger.info(f'✅ Парсер PID={pid} остановлен')
+    return True, f'Парсер PID={pid} остановлен'
+
+
+@app.route('/admin/stop_parser')
+@require_admin
+def admin_stop_parser():
+    """=== ДОБАВЛЕНО: СТОП ПАРСЕРА — роут остановки === """
+    ok, message = stop_parser()
+    color = '#28a745' if ok else '#6c757d'
+    icon = '⏹' if ok else 'ℹ️'
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>{icon} {'Парсер остановлен' if ok else 'Парсер не запущен'}</h1>
+        <p style="color:{color};font-weight:bold">{message}</p>
+        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+        <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
+        <a href="/admin/run_parser?limit=300" class="btn btn-green"
+           onclick="return confirm('Запустить парсер (300)?')">🚀 Запустить заново</a>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>"""
+
+
 @app.route('/admin/run_parser')
 @require_admin
 def admin_run_parser():
     limit = int(request.args.get('limit', 50))
     if parser_is_running():
-        return BASE_STYLE + '<div class="card"><h1>⚠️ Парсер уже запущен</h1><p>Дождитесь завершения.</p><a href="/admin" class="btn btn-gray">← В админку</a><a href="/admin/parser_status" class="btn">🚀 Статус парсера</a></div>'
+        return BASE_STYLE + '<div class="card"><h1>⚠️ Парсер уже запущен</h1><p>Дождитесь завершения или нажмите «СТОП парсера».</p><a href="/admin" class="btn btn-gray">← В админку</a><a href="/admin/parser_status" class="btn">🚀 Статус парсера</a><a href="/admin/stop_parser" class="btn btn-red">⏹ СТОП парсера</a></div>'
     log_path = '/tmp/parser_subprocess.log'
     try:
         log_file = open(log_path, 'a', encoding='utf-8')
@@ -1827,6 +1915,8 @@ def admin_run_parser():
             <p>Лимит: <b>{limit}</b></p>
             <p>Лог: <code>{log_path}</code></p>
             <a href="/admin/parser_status" class="btn">🚀 Смотреть прогресс</a>
+            <a href="/admin/stop_parser" class="btn btn-red"
+               onclick="return confirm('Остановить парсер?')">⏹ СТОП парсера</a>
             <a href="/admin/queue" class="btn">📋 Очередь</a>
             <a href="/admin" class="btn btn-gray">← В админку</a>
         </div>"""
@@ -1911,13 +2001,15 @@ def webhook():
             if user_id and text == '/status':
                 stats = bot_db.count_by_status()
                 ap_status = get_autopublish_status()
+                parser_running = parser_is_running()  # === ДОБАВЛЕНО: СТОП ПАРСЕРА ===
                 api.send_message(user_id,
                     f"📊 **Статус:**\n"
                     f"⏳ В очереди: {stats.get('pending', 0)}\n"
                     f"✅ Опубликовано: {stats.get('published', 0)}\n"
                     f"❌ Ошибок: {stats.get('failed', 0)}\n\n"
                     f"🕒 Автопубликация: {ap_status['status_message']}\n"
-                    f"📅 Сегодня: {ap_status['today_count']}/{ap_status['daily_limit']}")
+                    f"📅 Сегодня: {ap_status['today_count']}/{ap_status['daily_limit']}\n"
+                    f"🚀 Парсер: {'🟢 РАБОТАЕТ' if parser_running else '🔴 ОСТАНОВЛЕН'}")
                 return jsonify({"ok": True}), 200
             if user_id and text == '/myid':
                 api.send_message(user_id, f"Твой user_id: `{user_id}`")
@@ -1929,6 +2021,11 @@ def webhook():
             if user_id and text == '/autopublish_off':
                 stop_auto_publish()
                 api.send_message(user_id, "🛑 Автопубликация выключена")
+                return jsonify({"ok": True}), 200
+            # === ДОБАВЛЕНО: СТОП ПАРСЕРА — команда в MAX ===
+            if user_id and text == '/stop_parser':
+                ok, message = stop_parser()
+                api.send_message(user_id, f"{'⏹' if ok else 'ℹ️'} {message}")
                 return jsonify({"ok": True}), 200
         return jsonify({"ok": True}), 200
     except Exception as e:
