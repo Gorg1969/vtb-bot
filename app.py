@@ -28,6 +28,8 @@ from functools import wraps
 from datetime import datetime, timedelta
 import pytz
 
+from PIL import Image  # === ДОБАВЛЕНО: ПОВОРОТ ФОТО ===
+
 from flask import (Flask, request, jsonify, send_file, redirect)
 
 from modules import Database, FileManager, Publisher, ReportGenerator
@@ -362,6 +364,8 @@ def publish_one_ad(ad: dict) -> tuple:
     all_files = sorted(os.listdir(media_path))
     photos, videos = [], []
     for f in all_files:
+        if '.orig.' in f:  # === ДОБАВЛЕНО: не отправляем оригиналы ===
+            continue
         ext = os.path.splitext(f)[1].lower()
         if ext in IMAGE_EXTS:
             photos.append(f)
@@ -669,6 +673,19 @@ BASE_STYLE = """
                         background: rgba(108,117,125,0.7); color: white;
                         padding: 4px 8px; border-radius: 4px; font-size: 12px;
                         font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
+    /* === ДОБАВЛЕНО: ПОВОРОТ ФОТО === */
+    .photo-rotate { position: absolute; top: 8px; right: 44px;
+                    background: rgba(0,123,255,0.9); color: white;
+                    padding: 4px 8px; border-radius: 4px; font-size: 12px;
+                    text-decoration: none; cursor: pointer; font-weight: bold;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
+    .photo-rotate:hover { background: #007bff; color: white; }
+    .photo-reset { position: absolute; top: 8px; right: 80px;
+                   background: rgba(108,117,125,0.9); color: white;
+                   padding: 4px 8px; border-radius: 4px; font-size: 12px;
+                   text-decoration: none; cursor: pointer; font-weight: bold;
+                   box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
+    .photo-reset:hover { background: #6c757d; color: white; }
     .file-drop { border: 2px dashed #007bff; border-radius: 8px; padding: 30px;
                  text-align: center; background: #f8f9fa; margin: 15px 0; cursor: pointer; }
     .file-drop:hover { background: #e9ecef; }
@@ -767,7 +784,7 @@ def admin_page():
     stats = bot_db.count_by_status()
     schedule = get_schedule_from_db(bot_db)
     ap_status = get_autopublish_status()
-    parser_running = parser_is_running()  # === ДОБАВЛЕНО: СТОП ПАРСЕРА ===
+    parser_running = parser_is_running()
     rows = "".join(
         f"<tr><td>{s.get('title', s['name'])}</td><td>{s['url']}</td>"
         f"<td>{s.get('key_in_title') or '—'}</td><td>{s['chat_id']}</td>"
@@ -782,13 +799,11 @@ def admin_page():
     import_warn = '' if IMPORT_FOLDER_AVAILABLE else \
         '<div class="warn">⚠️ Файл <code>import_folder.py</code> не найден.</div>'
 
-    # === ИЗМЕНЕНО: быстрые ссылки на отчёты по периодам ===
     now_msk = datetime.now(MOSCOW_TZ)
     yesterday = (now_msk - timedelta(days=1)).strftime('%Y-%m-%d')
     week_ago = (now_msk - timedelta(days=7)).strftime('%Y-%m-%d')
     month_ago = (now_msk - timedelta(days=30)).strftime('%Y-%m-%d')
 
-    # === ДОБАВЛЕНО: СТОП ПАРСЕРА — кнопка в шапке ===
     parser_status_html = (
         '<span class="status-on">🟢 РАБОТАЕТ</span>'
         if parser_running else
@@ -1044,7 +1059,6 @@ def admin_parser_status():
     status_text = '🟢 РАБОТАЕТ' if running else '🔴 ОСТАНОВЛЕН'
     threads_count = threading.active_count()
 
-    # === ДОБАВЛЕНО: СТОП ПАРСЕРА — кнопка на странице статуса ===
     parser_stop_btn = (
         '<a href="/admin/stop_parser" class="btn btn-red" '
         'onclick="return confirm(\'Остановить парсер? Текущая карточка будет обработана.\')">'
@@ -1408,6 +1422,8 @@ def admin_queue():
                 files = sorted(os.listdir(media_path))
                 photos, videos = [], []
                 for f in files:
+                    if '.orig.' in f:  # === ДОБАВЛЕНО: не показываем оригиналы ===
+                        continue
                     ext = os.path.splitext(f)[1].lower()
                     if ext in IMAGE_EXTS:
                         photos.append(f)
@@ -1425,6 +1441,7 @@ def admin_queue():
                         photos_html += f'''
                         <div style="position:relative;display:inline-block;margin:2px">
                             <img src="/admin/queue_photo/{ad_id}/{pf}" style="width:120px;height:90px;object-fit:cover;border-radius:4px;cursor:pointer;display:block" onclick="window.open(this.src, '_blank')">
+                            <a href="/admin/queue_photo_rotate/{ad_id}/{pf}" style="position:absolute;top:2px;right:28px;background:rgba(0,123,255,0.9);color:white;padding:2px 6px;border-radius:3px;font-size:11px;text-decoration:none;cursor:pointer;font-weight:bold;line-height:1" onclick="event.stopPropagation();return confirm('Повернуть фото на 45°?');" title="Повернуть 45°">🔄</a>
                             <a href="/admin/queue_photo_delete/{ad_id}/{pf}" style="position:absolute;top:2px;right:2px;background:rgba(220,53,69,0.9);color:white;padding:2px 6px;border-radius:3px;font-size:11px;text-decoration:none;cursor:pointer;font-weight:bold;line-height:1" onclick="event.stopPropagation();return confirm('Удалить это фото?');" title="Удалить">✕</a>
                         </div>'''
             except Exception as e:
@@ -1524,6 +1541,18 @@ def admin_queue_photo_delete(ad_id, filename):
     ok, message, remaining = bot_db.delete_ad_photo(ad_id, filename, keep_min=1)
     if ok:
         logger.info(f'🗑️ Файл удалён: {filename} (осталось {remaining})')
+        # === ДОБАВЛЕНО: удаляем и .orig-файл, если он есть ===
+        try:
+            ad = bot_db.get_ad_by_id(ad_id)
+            if ad and ad.get('media_path'):
+                mp = ad['media_path']
+                base, ext = os.path.splitext(os.path.join(mp, os.path.basename(filename)))
+                orig = base + '.orig' + ext
+                if os.path.exists(orig):
+                    os.remove(orig)
+                    logger.info(f'🗑️ Удалён оригинал: {orig}')
+        except Exception as e:
+            logger.warning(f'⚠️ Не удалить .orig: {e}')
     else:
         logger.warning(f'⚠️ Не удалось удалить {filename}: {message}')
     ref = request.referrer or ''
@@ -1613,6 +1642,8 @@ def admin_ad_detail(ad_id):
             files = sorted(os.listdir(media_path))
             photos, videos = [], []
             for f in files:
+                if '.orig.' in f:  # === ДОБАВЛЕНО: не показываем оригиналы ===
+                    continue
                 ext = os.path.splitext(f)[1].lower()
                 if ext in IMAGE_EXTS:
                     photos.append(f)
@@ -1626,8 +1657,35 @@ def admin_ad_detail(ad_id):
                 badge = f'<a href="/admin/queue_photo_delete/{ad_id}/{vf}" class="photo-del" onclick="return confirm(\'Удалить это видео?\')" title="Удалить видео">🗑️</a>' if can_delete else '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
                 photos_html += f'<div class="photo-wrap"><video src="/admin/queue_photo/{ad_id}/{vf}" controls style="width:400px;height:auto;border-radius:6px;display:block"></video>{badge}</div>'
             for pf in photos:
-                badge = f'<a href="/admin/queue_photo_delete/{ad_id}/{pf}" class="photo-del" onclick="return confirm(\'Удалить это фото?\')" title="Удалить это фото">🗑️</a>' if can_delete else '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
-                photos_html += f'<div class="photo-wrap"><img src="/admin/queue_photo/{ad_id}/{pf}" style="width:300px;height:auto;border-radius:6px;cursor:pointer;display:block" onclick="window.open(this.src, \'_blank\')">{badge}</div>'
+                # === ДОБАВЛЕНО: кнопки поворота и сброса ===
+                rotate_btn = (
+                    f'<a href="/admin/queue_photo_rotate/{ad_id}/{pf}" '
+                    f'class="photo-rotate" '
+                    f'onclick="return confirm(\'Повернуть фото на 45°?\')" '
+                    f'title="Повернуть на 45°">🔄</a>'
+                )
+                reset_btn = (
+                    f'<a href="/admin/queue_photo_reset/{ad_id}/{pf}" '
+                    f'class="photo-reset" '
+                    f'onclick="return confirm(\'Вернуть фото к исходному виду?\')" '
+                    f'title="Сбросить поворот">↩️</a>'
+                )
+                delete_btn = (
+                    f'<a href="/admin/queue_photo_delete/{ad_id}/{pf}" '
+                    f'class="photo-del" '
+                    f'onclick="return confirm(\'Удалить это фото?\')" '
+                    f'title="Удалить это фото">🗑️</a>'
+                    if can_delete else
+                    '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
+                )
+                photos_html += (
+                    f'<div class="photo-wrap">'
+                    f'<img src="/admin/queue_photo/{ad_id}/{pf}" '
+                    f'style="width:300px;height:auto;border-radius:6px;cursor:pointer;display:block" '
+                    f'onclick="window.open(this.src, \'_blank\')">'
+                    f'{rotate_btn}{reset_btn}{delete_btn}'
+                    f'</div>'
+                )
         except Exception as e:
             photos_html = f'<p style="color:red">Ошибка: {e}</p>'
     return BASE_STYLE + f"""
@@ -1639,7 +1697,7 @@ def admin_ad_detail(ad_id):
     </div>
     <div class="card">
         <h2>🎬 Медиа (фото: {photos_count}, видео: {videos_count})</h2>
-        <p class="hint">Клик по 🗑️ — удалить это медиа. {'Последнее удалить нельзя.' if not can_delete else ''}</p>
+        <p class="hint">🔄 — повернуть на 45° · ↩️ — сбросить поворот · 🗑️ — удалить. {'Последнее удалить нельзя.' if not can_delete else ''}</p>
         <div>{photos_html or '<p style="color:#999">Нет медиа</p>'}</div>
     </div>
     <div class="card">
@@ -1664,6 +1722,117 @@ def admin_ad_detail(ad_id):
             <tr><td>sort_order</td><td>{ad.get('sort_order', '')}</td></tr>
         </table>
     </div>"""
+
+
+# ============================================================
+# ПОВОРОТ ФОТО (роуты + утилита)
+# ============================================================
+
+def _rotate_image_file(file_path: str, angle: float = 45.0) -> bool:
+    """
+    Поворачивает изображение на angle градусов по часовой стрелке,
+    расширяя холст, чтобы углы не обрезались. Фон — белый (для JPEG).
+    Исходник при первом повороте сохраняется в <name>.orig<ext>,
+    чтобы можно было откатиться.
+    Возвращает True при успехе.
+    """
+    try:
+        base, ext = os.path.splitext(file_path)
+        orig_path = base + '.orig' + ext
+
+        if not os.path.exists(orig_path):
+            shutil.copy2(file_path, orig_path)
+            logger.info(f'💾 Сохранён оригинал: {orig_path}')
+
+        img = Image.open(file_path)
+
+        if img.mode in ('RGBA', 'LA', 'P'):
+            bg = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            if img.mode == 'RGBA':
+                bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # PIL rotate — против часовой; для «по часовой» берём -angle.
+        rotated = img.rotate(-angle, expand=True, resample=Image.BICUBIC,
+                             fillcolor=(255, 255, 255))
+        rotated.save(file_path, 'JPEG', quality=90, optimize=True)
+        img.close()
+        rotated.close()
+
+        logger.info(f'🔄 Повёрнуто на {angle}°: {file_path}')
+        return True
+    except Exception as e:
+        logger.exception(f'❌ Ошибка поворота {file_path}: {e}')
+        return False
+
+
+@app.route('/admin/queue_photo_rotate/<int:ad_id>/<path:filename>')
+@require_admin
+def admin_queue_photo_rotate(ad_id, filename):
+    """Поворачивает фото на 45° по часовой стрелке."""
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return 'Not found', 404
+    media_path = ad.get('media_path')
+    if not media_path or not os.path.exists(media_path):
+        return 'Not found', 404
+
+    safe_name = os.path.basename(filename)
+    file_path = os.path.join(media_path, safe_name)
+    if not os.path.exists(file_path):
+        return 'Not found', 404
+
+    if '.orig.' in safe_name:
+        return 'Cannot rotate original', 400
+
+    ok = _rotate_image_file(file_path, 45.0)
+    logger.info(f'🔄 rotate {safe_name}: {"OK" if ok else "FAIL"}')
+
+    ref = request.referrer or ''
+    if f'/admin/ad_detail/{ad_id}' in ref:
+        return redirect(f'/admin/ad_detail/{ad_id}')
+    return redirect('/admin/queue')
+
+
+@app.route('/admin/queue_photo_reset/<int:ad_id>/<path:filename>')
+@require_admin
+def admin_queue_photo_reset(ad_id, filename):
+    """Возвращает фото к исходному состоянию (если был поворот)."""
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return 'Not found', 404
+    media_path = ad.get('media_path')
+    if not media_path or not os.path.exists(media_path):
+        return 'Not found', 404
+
+    safe_name = os.path.basename(filename)
+    file_path = os.path.join(media_path, safe_name)
+    if not os.path.exists(file_path):
+        return 'Not found', 404
+
+    base, ext = os.path.splitext(file_path)
+    orig_path = base + '.orig' + ext
+    if not os.path.exists(orig_path):
+        logger.info(f'ℹ️ Нет оригинала для {safe_name} — сброс не нужен')
+        ref = request.referrer or ''
+        if f'/admin/ad_detail/{ad_id}' in ref:
+            return redirect(f'/admin/ad_detail/{ad_id}')
+        return redirect('/admin/queue')
+
+    try:
+        shutil.move(orig_path, file_path)
+        logger.info(f'↩️ Сброшен поворот: {safe_name}')
+    except Exception as e:
+        logger.error(f'❌ Ошибка сброса {safe_name}: {e}')
+
+    ref = request.referrer or ''
+    if f'/admin/ad_detail/{ad_id}' in ref:
+        return redirect(f'/admin/ad_detail/{ad_id}')
+    return redirect('/admin/queue')
 
 
 @app.route('/admin/publish_ad/<int:ad_id>')
@@ -1821,19 +1990,10 @@ def parser_is_running() -> bool:
     return True
 
 
-# === ДОБАВЛЕНО: СТОП ПАРСЕРА — функция остановки процесса ===
 def stop_parser() -> tuple:
     """
     Останавливает парсер, если он запущен.
-
     Возвращает (ok: bool, message: str).
-
-    Логика:
-      1) Если процесс не запущен — возвращаем False с сообщением.
-      2) Пытаемся terminate() (SIGTERM) — Playwright корректно закроется.
-      3) Ждём до 10 секунд.
-      4) Если процесс всё ещё жив — kill() (SIGKILL).
-      5) Сбрасываем _PARSER_PROC[0] = None.
     """
     proc = _PARSER_PROC[0]
     if proc is None or proc.poll() is not None:
@@ -1848,7 +2008,6 @@ def stop_parser() -> tuple:
     except Exception as e:
         logger.warning(f'⚠️ terminate() не сработал: {e}')
 
-    # Ждём завершения до 10 секунд
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
@@ -1870,7 +2029,6 @@ def stop_parser() -> tuple:
 @app.route('/admin/stop_parser')
 @require_admin
 def admin_stop_parser():
-    """=== ДОБАВЛЕНО: СТОП ПАРСЕРА — роут остановки === """
     ok, message = stop_parser()
     color = '#28a745' if ok else '#6c757d'
     icon = '⏹' if ok else 'ℹ️'
@@ -2001,7 +2159,7 @@ def webhook():
             if user_id and text == '/status':
                 stats = bot_db.count_by_status()
                 ap_status = get_autopublish_status()
-                parser_running = parser_is_running()  # === ДОБАВЛЕНО: СТОП ПАРСЕРА ===
+                parser_running = parser_is_running()
                 api.send_message(user_id,
                     f"📊 **Статус:**\n"
                     f"⏳ В очереди: {stats.get('pending', 0)}\n"
@@ -2022,7 +2180,6 @@ def webhook():
                 stop_auto_publish()
                 api.send_message(user_id, "🛑 Автопубликация выключена")
                 return jsonify({"ok": True}), 200
-            # === ДОБАВЛЕНО: СТОП ПАРСЕРА — команда в MAX ===
             if user_id and text == '/stop_parser':
                 ok, message = stop_parser()
                 api.send_message(user_id, f"{'⏹' if ok else 'ℹ️'} {message}")
