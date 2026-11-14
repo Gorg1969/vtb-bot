@@ -60,4 +60,4 @@ RUN mkdir -p /app/data /app/data/VTB_Объявления /app/logs
 
 EXPOSE 3000
 
-CMD ["python", "app.py"]
+CMD pip install --no-cache-dir moviepy==1.0.3 imageio==2.31.6 && python app.py
