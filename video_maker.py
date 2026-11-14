@@ -3,7 +3,8 @@
 # Серверная сборка видео из фото папки (адаптация reels_maker.py).
 #
 # - Работает без GUI.
-# - Использует moviepy (как reels_maker.py).
+# - Использует moviepy + СИСТЕМНЫЙ ffmpeg (FFMPEG_BINARY=/usr/bin/ffmpeg).
+# - imageio-ffmpeg НЕ используется (на Bothost падает с execstack).
 # - Zoom-эффект + размытие фона + опционально логотип/музыка/сжатие.
 # - После успешной сборки УДАЛЯЕТ исходные фото из папки.
 # - Возвращает отчёт для админки.
@@ -20,8 +21,14 @@ logger = logging.getLogger(__name__)
 
 # === Ленивый импорт moviepy (чтобы app.py не падал, если пакета нет) ===
 MOVIEPY_AVAILABLE = False
-MOVIEPY_IMPORT_ERROR = None   # причина, почему не загрузился
-MOVIEPY_VERSION = None        # какая версия стоит
+MOVIEPY_IMPORT_ERROR = None
+MOVIEPY_VERSION = None
+
+# === Принудительно используем системный ffmpeg ===
+# imageio-ffmpeg (который тянет свой бинарник) на Bothost падает с execstack.
+# Через переменную окружения FFMPEG_BINARY moviepy будет искать системный ffmpeg.
+os.environ.setdefault('FFMPEG_BINARY', '/usr/bin/ffmpeg')
+os.environ.setdefault('IMAGEIO_FFMPEG_EXE', '/usr/bin/ffmpeg')
 
 try:
     from moviepy.editor import (
@@ -45,15 +52,15 @@ from PIL import Image
 
 
 # ============================================================
-# Настройки по умолчанию (можно переопределить в app.py)
+# Настройки по умолчанию
 # ============================================================
 
-DEFAULT_DURATION = 3.0          # длительность каждого фото
-DEFAULT_TRANSITION = 0.5        # длительность перехода
+DEFAULT_DURATION = 3.0
+DEFAULT_TRANSITION = 0.5
 DEFAULT_FPS = 30
-DEFAULT_MAX_SIZE_MB = 2.5       # лимит размера итогового видео (для MAX)
-DEFAULT_MAX_DIMENSION = 1280    # макс. сторона фото после сжатия
-DEFAULT_TARGET_SIZE = (1080, 1920)  # вертикальное видео (как в MAX-рилсах)
+DEFAULT_MAX_SIZE_MB = 2.5
+DEFAULT_MAX_DIMENSION = 1280
+DEFAULT_TARGET_SIZE = (1080, 1920)
 DEFAULT_BLUR_RADIUS = 30
 DEFAULT_OUTPUT_NAME = 'video_ad.mp4'
 QUALITY_PRESET = 'Сбалансированное'
@@ -66,7 +73,6 @@ IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
 # ============================================================
 
 def _list_photos(folder: str) -> List[str]:
-    """Возвращает отсортированный список фото в папке (без .orig)."""
     photos = []
     try:
         for f in sorted(os.listdir(folder)):
@@ -82,7 +88,6 @@ def _list_photos(folder: str) -> List[str]:
 def _compress_image(image_path: str,
                     max_dimension: int = DEFAULT_MAX_DIMENSION,
                     quality: int = 75) -> str:
-    """Сжимает фото до max_dimension и сохраняет во временный JPEG."""
     try:
         with Image.open(image_path) as img:
             if img.mode in ('RGBA', 'LA', 'P'):
@@ -115,7 +120,6 @@ def _compress_image(image_path: str,
 
 def _get_video_size(folder: str, images: List[str],
                     target_size: Optional[Tuple[int, int]] = None) -> Tuple[int, int]:
-    """Определяет размер видео: либо фиксированный (target_size), либо по медиане фото."""
     if target_size:
         return target_size
     try:
@@ -147,7 +151,6 @@ def _get_video_size(folder: str, images: List[str],
 
 
 def _apply_blur(clip, radius: int = DEFAULT_BLUR_RADIUS):
-    """Пытается применить gaussian_blur, иначе — простое уменьшение/увеличение."""
     try:
         return clip.fx(gaussian_blur, radius)
     except Exception:
@@ -160,7 +163,6 @@ def _apply_blur(clip, radius: int = DEFAULT_BLUR_RADIUS):
 
 def _resize_with_blur(clip, target_size: Tuple[int, int],
                       blur_radius: int = DEFAULT_BLUR_RADIUS):
-    """Масштабирует с сохранением пропорций + размытый фон под ним."""
     try:
         cw, ch = clip.size
         tw, th = target_size
@@ -181,7 +183,6 @@ def _resize_with_blur(clip, target_size: Tuple[int, int],
 
 
 def _apply_zoom(clip, duration: float, zoom_factor: float = 1.15):
-    """Плавный zoom-in."""
     def zoom_func(t):
         progress = min(1.0, t / duration) if duration > 0 else 1.0
         return 1.0 + (zoom_factor - 1.0) * progress
@@ -193,7 +194,6 @@ def _apply_zoom(clip, duration: float, zoom_factor: float = 1.15):
 
 def _add_logo(clip, logo_path: str, target_size: Tuple[int, int],
               opacity: float = 0.6, scale: float = 0.15):
-    """Добавляет логотип в правый нижний угол."""
     if not logo_path or not os.path.exists(logo_path):
         return clip
     try:
@@ -212,7 +212,6 @@ def _add_logo(clip, logo_path: str, target_size: Tuple[int, int],
 
 def _compress_video(input_path: str, output_path: str,
                     target_size_mb: float = DEFAULT_MAX_SIZE_MB) -> bool:
-    """Сжимает видео до target_size_mb через пересохранение."""
     try:
         video = VideoFileClip(input_path)
         current_size = os.path.getsize(input_path) / (1024 * 1024)
@@ -270,13 +269,6 @@ def process_one_folder(
     output_name: str = DEFAULT_OUTPUT_NAME,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, str]:
-    """
-    Собирает видео из фото папки.
-
-    Возвращает (ok, message).
-    При успехе — сохраняет видео в folder_path/output_name,
-    удаляет исходные фото (если delete_photos_after=True).
-    """
     if not MOVIEPY_AVAILABLE:
         return False, f'moviepy не установлен: {MOVIEPY_IMPORT_ERROR or "unknown"}'
 
@@ -291,7 +283,6 @@ def process_one_folder(
 
     progress_cb(f'  📸 Фото: {len(photos)}')
 
-    # === Сжатие фото (для скорости и размера) ===
     temp_photos: List[str] = []
     use_photos = []
     for p in photos:
@@ -302,7 +293,6 @@ def process_one_folder(
     size = _get_video_size(folder_path, use_photos, target_size)
     progress_cb(f'  📐 Размер видео: {size[0]}x{size[1]}')
 
-    # === Аудио ===
     audio_clip = None
     music_duration = None
     if music_file and os.path.exists(music_file):
@@ -314,7 +304,6 @@ def process_one_folder(
             progress_cb(f'  ⚠️ Ошибка загрузки музыки: {e}')
             audio_clip = None
 
-    # === Сколько фото нужно ===
     total_photos_needed = len(use_photos)
     if music_duration and music_duration > 0:
         effective = duration + transition * 0.5
@@ -327,7 +316,6 @@ def process_one_folder(
         sequence.append(use_photos[idx % len(use_photos)])
         idx += 1
 
-    # === Собираем клипы ===
     clips = []
     for i, path in enumerate(sequence):
         try:
@@ -348,7 +336,6 @@ def process_one_folder(
                 pass
         return False, 'Не удалось обработать ни одного фото'
 
-    # === Переходы ===
     if transition > 0 and len(clips) > 1:
         faded = []
         for i, c in enumerate(clips):
@@ -362,11 +349,9 @@ def process_one_folder(
     else:
         final_video = concatenate_videoclips(clips, method="compose")
 
-    # === Логотип ===
     if logo_path:
         final_video = _add_logo(final_video, logo_path, size, logo_opacity, logo_scale)
 
-    # === Музыка: обрезка/цикл ===
     if audio_clip:
         try:
             if final_video.duration < audio_clip.duration:
@@ -381,7 +366,6 @@ def process_one_folder(
         except Exception as e:
             progress_cb(f'  ⚠️ Музыка: {e}')
 
-    # === Куда сохранять ===
     if not output_name.lower().endswith('.mp4'):
         output_name += '.mp4'
     output_path = os.path.join(folder_path, output_name)
@@ -391,7 +375,6 @@ def process_one_folder(
         output_path = os.path.join(folder_path, f'{base}_{counter}{ext}')
         counter += 1
 
-    # === Рендер ===
     tmp_video = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     tmp_video_path = tmp_video.name
     tmp_video.close()
@@ -420,7 +403,6 @@ def process_one_folder(
         final_size = os.path.getsize(output_path) / (1024 * 1024)
         progress_cb(f'  ✅ Готово: {os.path.basename(output_path)} ({final_size:.1f} МБ)')
 
-        # === Удаление исходных фото ===
         if delete_photos_after:
             deleted = 0
             for p in photos:
@@ -485,15 +467,6 @@ def process_queue_videos(
     progress_cb: Optional[Callable[[Dict], None]] = None,
     **kwargs,
 ) -> Dict:
-    """
-    Проходит по pending-объявлениям и собирает видео для каждого.
-
-    only_ids — если задан, обрабатывает только эти ID (кнопка в карточке).
-    stop_flag — функция без аргументов; если вернёт True — прерываемся.
-    progress_cb — получает dict {'total','done','ok','failed','current','log'}.
-
-    Возвращает итоговый отчёт.
-    """
     report = {'total': 0, 'ok': 0, 'failed': 0, 'skipped': 0, 'details': []}
 
     if not MOVIEPY_AVAILABLE:
