@@ -43,12 +43,16 @@ from parser_runner import run_parser
 # === Создание видео из фото (moviepy) ===
 try:
     from video_maker import (process_queue_videos, process_one_folder,
-                             MOVIEPY_AVAILABLE)
+                             MOVIEPY_AVAILABLE,
+                             MOVIEPY_IMPORT_ERROR,
+                             MOVIEPY_VERSION)
     VIDEO_MAKER_AVAILABLE = MOVIEPY_AVAILABLE
-except ImportError as e:
+except Exception as e:
     VIDEO_MAKER_AVAILABLE = False
+    MOVIEPY_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    MOVIEPY_VERSION = None
     _import_logger = logging.getLogger(__name__)
-    _import_logger.warning(f'⚠️ video_maker недоступен: {e}')
+    _import_logger.warning(f'⚠️ video_maker недоступен: {MOVIEPY_IMPORT_ERROR}')
     def process_queue_videos(*a, **k):
         return {'total': 0, 'ok': 0, 'failed': 1, 'skipped': 0,
                 'details': [{'id': None, 'folder': '(все)',
@@ -936,15 +940,22 @@ def admin_page():
         if video_running else
         '<span class="status-off">🔴 НЕ ЗАПУЩЕНО</span>'
     )
-    video_btn = (
-        '<a href="/admin/make_videos_status" class="btn btn-purple">🎬 К прогрессу</a>'
-        if video_running else
-        '<a href="/admin/make_videos" class="btn btn-purple" '
-        'onclick="return confirm(\'Собрать видео из фото для ВСЕЙ очереди? Исходные фото будут удалены.\')">🎬 Создать видео</a>'
-    )
     if not VIDEO_MAKER_AVAILABLE:
-        video_btn = ('<a href="/admin/make_videos" class="btn btn-gray" '
-                     'title="moviepy не установлен">🎬 Создать видео (moviepy не установлен)</a>')
+        reason_short = (MOVIEPY_IMPORT_ERROR or 'moviepy не установлен')
+        if len(reason_short) > 60:
+            reason_short = reason_short[:60] + '…'
+        video_btn = (
+            f'<a href="/admin/make_videos_status" class="btn btn-gray" '
+            f'title="{MOVIEPY_IMPORT_ERROR or "moviepy не установлен"}">'
+            f'🎬 Видео недоступно: {reason_short}</a>'
+        )
+    elif video_running:
+        video_btn = '<a href="/admin/make_videos_status" class="btn btn-purple">🎬 К прогрессу</a>'
+    else:
+        video_btn = (
+            '<a href="/admin/make_videos" class="btn btn-purple" '
+            'onclick="return confirm(\'Собрать видео из фото для ВСЕЙ очереди? Исходные фото будут удалены.\')">🎬 Создать видео</a>'
+        )
 
     return BASE_STYLE + f"""
     <div class="card">
@@ -1259,9 +1270,7 @@ def admin_settings():
         </div>
     </form>
     """
-
-
-# ============================================================
+    # ============================================================
 # АДМИНКА — Отчёты по публикациям
 # ============================================================
 
@@ -1525,6 +1534,30 @@ def admin_queue():
     ads = bot_db.get_all_pending_ads()
     video_running = video_maker_is_running()
 
+    # === Визуализация прогресса видео (если идёт сборка) ===
+    if video_running:
+        vs = VIDEO_MAKER_STATUS
+        v_total = vs.get('total', 0) or 1
+        v_done = vs.get('done', 0)
+        v_pct = int(100 * v_done / v_total)
+        v_current = vs.get('current') or {}
+        v_folder = v_current.get('folder', '—')
+        video_progress_html = f"""
+        <div class="card" style="border-left:4px solid #6f42c1">
+            <h2 style="margin:0 0 8px 0">🎬 Идёт сборка видео</h2>
+            <div class="progress-bar">
+                <div class="progress-bar-inner" style="width:{v_pct}%">{v_pct}% ({v_done}/{v_total})</div>
+            </div>
+            <p class="hint" style="margin:6px 0 0 0">
+                Сейчас: <code>{v_folder}</code>
+                · <a href="/admin/make_videos_status">открыть полный прогресс</a>
+                · <a href="/admin/make_videos_stop">⏹ остановить</a>
+            </p>
+        </div>
+        """
+    else:
+        video_progress_html = ''
+
     cards_html = ""
     for i, ad in enumerate(ads, 1):
         ad_id = ad['id']
@@ -1591,9 +1624,10 @@ def admin_queue():
 
         if not VIDEO_MAKER_AVAILABLE:
             make_video_btn = (
-                '<a class="btn btn-gray" '
-                'style="font-size:13px;padding:6px 10px;text-align:center" '
-                'title="moviepy не установлен">🎬 В видео (нет moviepy)</a>'
+                f'<a href="/admin/make_videos_status" class="btn btn-gray" '
+                f'style="font-size:13px;padding:6px 10px;text-align:center" '
+                f'title="{MOVIEPY_IMPORT_ERROR or "moviepy не установлен"}">'
+                f'🎬 В видео (нет moviepy)</a>'
             )
         elif video_running:
             make_video_btn = (
@@ -1649,7 +1683,9 @@ def admin_queue():
 
     if not VIDEO_MAKER_AVAILABLE:
         video_top_btn = (
-            '<a class="btn btn-gray" title="moviepy не установлен">🎬 Создать видео (нет moviepy)</a>'
+            f'<a href="/admin/make_videos_status" class="btn btn-gray" '
+            f'title="{MOVIEPY_IMPORT_ERROR or "moviepy не установлен"}">'
+            f'🎬 Видео недоступно (причина)</a>'
         )
     elif video_running:
         video_top_btn = (
@@ -1667,6 +1703,7 @@ def admin_queue():
     return BASE_STYLE + f"""
     <div class="card">
         <h1>📋 Очередь на публикацию ({len(ads)})</h1>
+        {video_progress_html}
         <p class="hint">Порядок публикации = порядок карточек. Меняйте кнопками ⬆️/⬇️.</p>
         {summary_html}
         <a href="/admin" class="btn">← Назад</a>
@@ -1678,6 +1715,13 @@ def admin_queue():
         <a href="/admin/queue_clear" class="btn btn-red" onclick="return confirm('Удалить ВСЮ очередь и все папки?')">🗑️ Очистить всю очередь</a>
     </div>
     {cards_html}
+    <script>
+        // Автообновление страницы очереди, пока идёт сборка видео
+        const videoRunning = {'true' if video_running else 'false'};
+        if (videoRunning) {{
+            setTimeout(() => location.reload(), 4000);
+        }}
+    </script>
     """
 
 
@@ -1853,7 +1897,11 @@ def admin_ad_detail(ad_id):
             photos_html = f'<p style="color:red">Ошибка: {e}</p>'
 
     if not VIDEO_MAKER_AVAILABLE:
-        make_video_btn = '<a class="btn btn-gray" title="moviepy не установлен">🎬 В видео (нет moviepy)</a>'
+        make_video_btn = (
+            f'<a href="/admin/make_videos_status" class="btn btn-gray" '
+            f'title="{MOVIEPY_IMPORT_ERROR or "moviepy не установлен"}">'
+            f'🎬 В видео (нет moviepy)</a>'
+        )
     elif video_maker_is_running():
         make_video_btn = '<a class="btn btn-gray" title="Сейчас идёт сборка видео">🎬 В видео (занято)</a>'
     else:
@@ -2297,18 +2345,7 @@ def admin_publish_one():
 @require_admin
 def admin_make_videos():
     if not VIDEO_MAKER_AVAILABLE:
-        return BASE_STYLE + """
-        <div class="card">
-            <h1>❌ moviepy не установлен</h1>
-            <div class="error-msg">
-                Установите пакет: <code>pip install moviepy imageio-ffmpeg</code><br>
-                или добавьте в <code>requirements.txt</code>:
-                <pre>moviepy==1.0.3
-imageio==2.31.6
-imageio-ffmpeg==0.4.9</pre>
-            </div>
-            <a href="/admin/queue" class="btn">← К очереди</a>
-        </div>"""
+        return redirect('/admin/make_videos_status')
 
     if video_maker_is_running():
         return redirect('/admin/make_videos_status')
@@ -2324,7 +2361,7 @@ imageio-ffmpeg==0.4.9</pre>
 @require_admin
 def admin_make_video_one(ad_id):
     if not VIDEO_MAKER_AVAILABLE:
-        return redirect('/admin/queue')
+        return redirect('/admin/make_videos_status')
 
     if video_maker_is_running():
         return redirect('/admin/make_videos_status')
@@ -2355,6 +2392,34 @@ def admin_make_videos_status():
     done = s.get('done', 0)
     pct = int(100 * done / total) if total else 0
 
+    # === Если moviepy не установлен — показываем причину и инструкцию ===
+    if not VIDEO_MAKER_AVAILABLE:
+        err = (MOVIEPY_IMPORT_ERROR or 'moviepy не установлен').replace('<', '&lt;')
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>❌ Сборка видео недоступна</h1>
+            <div class="error-msg">
+                <b>Причина:</b>
+                <pre style="background:#fff;padding:10px;border-radius:5px;margin-top:8px;
+                            white-space:pre-wrap;word-break:break-all;font-size:12px">{err}</pre>
+            </div>
+            <h2>Что делать</h2>
+            <p>Скорее всего, пакет <code>moviepy</code> не установлен в контейнере, или
+            падает при импорте (например, <code>execstack</code> на хостинге).</p>
+            <p>Проверьте <code>requirements.txt</code> — там должны быть:</p>
+            <pre style="background:#f8f9fa;padding:10px;border-radius:5px">moviepy==1.0.3
+imageio==2.31.6
+imageio-ffmpeg==0.4.9</pre>
+            <p>После изменения пересоберите контейнер
+            (<code>docker compose build --no-cache &amp;&amp; docker compose up -d</code>)
+            или обратитесь к администратору хостинга.</p>
+            <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+            <a href="/admin/diag" class="btn">🩺 Диагностика</a>
+            <a href="/admin/queue" class="btn">📋 К очереди</a>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
+
     status_class = 'status-on' if running else 'status-off'
     status_text = '🟢 РАБОТАЕТ' if running else '🔴 НЕ ЗАПУЩЕНО'
 
@@ -2382,10 +2447,11 @@ def admin_make_videos_status():
             st = d.get('status', '')
             icon = '✅' if st == 'ok' else '⏭️' if st == 'skip' else '❌'
             color = '#28a745' if st == 'ok' else '#fd7e14' if st == 'skip' else '#dc3545'
+            reason = str(d.get('reason', '')).replace('<', '&lt;')
             rows += (f"<tr><td style='color:{color};font-weight:bold'>{icon}</td>"
                      f"<td>{d.get('id', '')}</td>"
                      f"<td><code>{d.get('folder', '')}</code></td>"
-                     f"<td style='font-size:12px'>{d.get('reason', '')}</td></tr>")
+                     f"<td style='font-size:12px'>{reason}</td></tr>")
         if not rows:
             rows = "<tr><td colspan='4' style='text-align:center;color:#999'>Нет данных</td></tr>"
         report_html = f"""
@@ -2427,6 +2493,7 @@ def admin_make_videos_status():
     <div class="card">
         <h1>🎬 Создание видео из фото</h1>
         <p>Состояние: <span class="{status_class}">{status_text}</span></p>
+        <p>moviepy: <b>v{MOVIEPY_VERSION or '?'}</b></p>
         <p>Лог: <code>{s.get('log', '—')}</code></p>
         {current_html}
         {progress_html}
@@ -2459,8 +2526,10 @@ def admin_diag():
         lines.append(f"{icon} {msg}")
 
     add(True, "Flask импортирован")
-    add(VIDEO_MAKER_AVAILABLE,
-        f"video_maker (moviepy): {'OK' if VIDEO_MAKER_AVAILABLE else 'НЕ УСТАНОВЛЕН'}")
+    if VIDEO_MAKER_AVAILABLE:
+        add(True, f"video_maker (moviepy): OK, v{MOVIEPY_VERSION or '?'}")
+    else:
+        add(False, f"video_maker (moviepy): НЕ УСТАНОВЛЕН — {MOVIEPY_IMPORT_ERROR}")
     add(IMPORT_FOLDER_AVAILABLE,
         f"import_folder: {'OK' if IMPORT_FOLDER_AVAILABLE else 'НЕТ'}")
     add(bool(TOKEN), f"MAX TOKEN: {'есть' if TOKEN else 'НЕТ'}")
@@ -2547,7 +2616,7 @@ def admin_diag():
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🩺 Диагностика</h1>
-        <p>Версия: <b>diag-v2</b> · {datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S МСК')}</p>
+        <p>Версия: <b>diag-v3</b> · {datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S МСК')}</p>
         <p>Python: <code>{sys.version.split()[0]}</code> · PID: <code>{os.getpid()}</code></p>
         <p>Потоков: <b>{threading.active_count()}</b></p>
         <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
@@ -2626,7 +2695,7 @@ def webhook():
                 return jsonify({"ok": True}), 200
             if user_id and text == '/make_videos':
                 if not VIDEO_MAKER_AVAILABLE:
-                    api.send_message(user_id, "❌ moviepy не установлен")
+                    api.send_message(user_id, f"❌ moviepy недоступен: {MOVIEPY_IMPORT_ERROR}")
                     return jsonify({"ok": True}), 200
                 if video_maker_is_running():
                     api.send_message(user_id, "ℹ️ Сборка видео уже идёт")
