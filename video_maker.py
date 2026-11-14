@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 # === Ленивый импорт moviepy (чтобы app.py не падал, если пакета нет) ===
 MOVIEPY_AVAILABLE = False
+MOVIEPY_IMPORT_ERROR = None   # причина, почему не загрузился
+MOVIEPY_VERSION = None        # какая версия стоит
+
 try:
     from moviepy.editor import (
         ImageClip, AudioFileClip, CompositeVideoClip,
@@ -27,9 +30,16 @@ try:
     )
     from moviepy.video.fx.all import gaussian_blur
     MOVIEPY_AVAILABLE = True
-    logger.info('✅ moviepy загружен')
-except ImportError as e:
-    logger.warning(f'⚠️ moviepy недоступен: {e}. Кнопка «Создать видео» не будет работать.')
+    try:
+        import moviepy
+        MOVIEPY_VERSION = getattr(moviepy, '__version__', '?')
+    except Exception:
+        MOVIEPY_VERSION = '?'
+    logger.info(f'✅ moviepy загружен (v{MOVIEPY_VERSION})')
+except Exception as e:
+    MOVIEPY_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    logger.warning(f'⚠️ moviepy недоступен: {MOVIEPY_IMPORT_ERROR}. Кнопка «Создать видео» не будет работать.')
+    logger.debug(traceback.format_exc())
 
 from PIL import Image
 
@@ -268,7 +278,7 @@ def process_one_folder(
     удаляет исходные фото (если delete_photos_after=True).
     """
     if not MOVIEPY_AVAILABLE:
-        return False, 'moviepy не установлен (pip install moviepy)'
+        return False, f'moviepy не установлен: {MOVIEPY_IMPORT_ERROR or "unknown"}'
 
     if progress_cb is None:
         progress_cb = lambda m: logger.info(m)
@@ -360,7 +370,6 @@ def process_one_folder(
     if audio_clip:
         try:
             if final_video.duration < audio_clip.duration:
-                # Зацикливаем видео
                 looped = final_video
                 while looped.duration < audio_clip.duration:
                     looped = concatenate_videoclips([looped, final_video], method="compose")
@@ -421,7 +430,6 @@ def process_one_folder(
                         deleted += 1
                 except Exception:
                     pass
-            # Убираем .orig-файлы
             for f in list(os.listdir(folder_path)):
                 if '.orig.' in f:
                     try:
@@ -491,7 +499,8 @@ def process_queue_videos(
     if not MOVIEPY_AVAILABLE:
         report['details'].append({
             'id': None, 'folder': '(все)',
-            'status': 'error', 'reason': 'moviepy не установлен'
+            'status': 'error',
+            'reason': f'moviepy не установлен: {MOVIEPY_IMPORT_ERROR or "unknown"}'
         })
         return report
 
@@ -541,7 +550,6 @@ def process_queue_videos(
 
         photos = _list_photos(media_path)
         if not photos:
-            # Уже видео? Или пусто?
             has_video = any(f.lower().endswith(('.mp4', '.mov', '.webm'))
                             for f in os.listdir(media_path))
             if has_video:
