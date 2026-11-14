@@ -46,8 +46,8 @@ def _ensure_moviepy():
     print("📦 moviepy не найден — устанавливаю через pip...")
     try:
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-cache-dir",
-             "moviepy==1.0.3", "imageio==2.31.6"],
+    [sys.executable, "-m", "pip", "install", "--no-cache-dir",
+     "moviepy==1.0.3", "imageio==2.31.6", "imageio-ffmpeg==0.4.9"],
             check=True,
             timeout=300,
             stdout=subprocess.PIPE,
