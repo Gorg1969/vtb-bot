@@ -3,8 +3,8 @@
 # Серверная сборка видео из фото папки.
 #
 # - Работает без GUI.
-# - Использует moviepy + системный ffmpeg (FFMPEG_BINARY=/usr/bin/ffmpeg).
-# - Безопасный импорт размытия (gaussian_blur / blur / fallback).
+# - moviepy + системный ffmpeg (FFMPEG_BINARY=/usr/bin/ffmpeg).
+# - Размытие через resize (без gaussian_blur — работает на любой версии).
 # - Zoom-эффект + размытие фона + опционально логотип/музыка/сжатие.
 # - После сборки удаляет исходные фото.
 # ============================================================
@@ -24,7 +24,6 @@ os.environ.setdefault('IMAGEIO_FFMPEG_EXE', '/usr/bin/ffmpeg')
 MOVIEPY_AVAILABLE = False
 MOVIEPY_IMPORT_ERROR = None
 MOVIEPY_VERSION = None
-BLUR_FX = None
 
 try:
     from moviepy.editor import (
@@ -42,27 +41,6 @@ except Exception as e:
     MOVIEPY_IMPORT_ERROR = f"{type(e).__name__}: {e}"
     logger.warning(f'⚠️ moviepy недоступен: {MOVIEPY_IMPORT_ERROR}')
     logger.debug(traceback.format_exc())
-
-# === Безопасный импорт размытия (разные версии moviepy) ===
-if MOVIEPY_AVAILABLE:
-    try:
-        from moviepy.video.fx import gaussian_blur
-        BLUR_FX = gaussian_blur
-    except ImportError:
-        try:
-            from moviepy.video.fx.all import gaussian_blur
-            BLUR_FX = gaussian_blur
-        except ImportError:
-            try:
-                from moviepy.video.fx import blur
-                BLUR_FX = blur
-            except ImportError:
-                try:
-                    from moviepy.video.fx.all import blur
-                    BLUR_FX = blur
-                except ImportError:
-                    BLUR_FX = None
-                    logger.warning('⚠️ Не удалось импортировать размытие, будет использован простой ресайз')
 
 from PIL import Image
 
@@ -161,22 +139,23 @@ def _get_video_size(folder: str, images: List[str],
         return (1080, 1920)
 
 
-def _apply_blur(clip, radius: int = DEFAULT_BLUR_RADIUS):
-    """Безопасное размытие: BLUR_FX или fallback через resize."""
-    if BLUR_FX is not None:
-        try:
-            return clip.fx(BLUR_FX, radius)
-        except Exception as e:
-            logger.warning(f'⚠️ BLUR_FX не сработал: {e}')
+def _apply_blur(clip):
+    """
+    Размытие БЕЗ gaussian_blur — работает на любой версии moviepy.
+    Уменьшаем клип в 10 раз → возвращаем к исходному размеру.
+    Визуально: мягкое размытие, как размытый фон под фото.
+    """
     try:
-        small = clip.resize(newsize=(max(2, clip.w // 10), max(2, clip.h // 10)))
-        return small.resize(newsize=(clip.w, clip.h))
+        w, h = clip.size
+        small_w = max(2, w // 10)
+        small_h = max(2, h // 10)
+        small = clip.resize(newsize=(small_w, small_h))
+        return small.resize(newsize=(w, h))
     except Exception:
         return clip
 
 
-def _resize_with_blur(clip, target_size: Tuple[int, int],
-                      blur_radius: int = DEFAULT_BLUR_RADIUS):
+def _resize_with_blur(clip, target_size: Tuple[int, int]):
     try:
         cw, ch = clip.size
         tw, th = target_size
@@ -188,7 +167,7 @@ def _resize_with_blur(clip, target_size: Tuple[int, int],
 
         resized = clip.resize(newsize=(nw, nh))
         bg = clip.resize(newsize=target_size)
-        bg = _apply_blur(bg, blur_radius)
+        bg = _apply_blur(bg)
 
         return CompositeVideoClip([bg, resized.set_position('center')], size=target_size)
     except Exception as e:
@@ -273,7 +252,6 @@ def process_one_folder(
     fps: int = DEFAULT_FPS,
     target_size: Optional[Tuple[int, int]] = None,
     max_size_mb: float = DEFAULT_MAX_SIZE_MB,
-    blur_radius: int = DEFAULT_BLUR_RADIUS,
     logo_path: Optional[str] = None,
     logo_opacity: float = 0.6,
     logo_scale: float = 0.15,
@@ -334,7 +312,7 @@ def process_one_folder(
     for i, path in enumerate(sequence):
         try:
             clip = ImageClip(path).set_duration(duration)
-            clip = _resize_with_blur(clip, size, blur_radius)
+            clip = _resize_with_blur(clip, size)
             clip = _apply_zoom(clip, duration, zoom_factor=1.15)
             clips.append(clip)
         except Exception as e:
@@ -568,7 +546,6 @@ def process_queue_videos(
                 fps=kwargs.get('fps', DEFAULT_FPS),
                 target_size=kwargs.get('target_size'),
                 max_size_mb=kwargs.get('max_size_mb', DEFAULT_MAX_SIZE_MB),
-                blur_radius=kwargs.get('blur_radius', DEFAULT_BLUR_RADIUS),
                 logo_path=kwargs.get('logo_path'),
                 logo_opacity=kwargs.get('logo_opacity', 0.6),
                 logo_scale=kwargs.get('logo_scale', 0.15),
