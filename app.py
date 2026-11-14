@@ -33,28 +33,7 @@ from PIL import Image  # для поворота фото
 from flask import (Flask, request, jsonify, send_file, redirect)
 
 # ============================================================
-# АВТОУСТАНОВКА moviepy (обходит кэш Dockerfile на Bothost)
-# ============================================================
-
-    print("📦 moviepy не найден — устанавливаю через pip...")
-    try:
-        subprocess.run(
-    [sys.executable, "-m", "pip", "install", "--no-cache-dir",
-     "moviepy==1.0.3", "imageio==2.31.6", "imageio-ffmpeg==0.4.9"],
-            check=True,
-            timeout=300,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        import importlib
-        importlib.invalidate_caches()
-        print("✅ moviepy установлен")
-        return True
-    except Exception as e:
-        print(f"❌ Не удалось установить moviepy: {e}")
-        return False
-
-_ensure_moviepy()
+# moviepy больше не используется — сборка видео через OpenCV
 # ============================================================
 
 from config import (TOKEN, BASE_URL, SECRET_KEY, PORT, DATA_DIR, PUBLIC_URL,
