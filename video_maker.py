@@ -18,8 +18,8 @@ from typing import Optional, Dict, List, Tuple, Callable
 
 logger = logging.getLogger(__name__)
 
-os.environ.setdefault('FFMPEG_BINARY', '/usr/bin/ffmpeg')
-os.environ.setdefault('IMAGEIO_FFMPEG_EXE', '/usr/bin/ffmpeg')
+#os.environ.setdefault('FFMPEG_BINARY', '/usr/bin/ffmpeg')
+#os.environ.setdefault('IMAGEIO_FFMPEG_EXE', '/usr/bin/ffmpeg')
 
 MOVIEPY_AVAILABLE = False
 MOVIEPY_IMPORT_ERROR = None
