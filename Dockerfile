@@ -1,6 +1,6 @@
 # ============================================================
 # Dockerfile для vtb-bot (Bothost)
-# python:3.11-slim + Chromium (Playwright) + OpenCV + ONNX Runtime
+# python:3.11-slim + Chromium (Playwright) + OpenCV + ffmpeg
 # Без torch — закраска номеров через ONNX (YOLO)
 # ============================================================
 
@@ -11,7 +11,8 @@ ENV PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive \
     TZ=Europe/Moscow \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    FFMPEG_BINARY=/usr/bin/ffmpeg
 
 # === Системные зависимости ===
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,11 +25,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 libasound2 libatspi2.0-0 \
     fonts-liberation fonts-dejavu-core sqlite3 \
     libgl1 libglib2.0-0 libsm6 libxrender-dev \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # === Python-зависимости ===
+# cache-bust: 2026-11-14-16
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
         Flask==3.0.0 \
@@ -40,7 +43,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
         pytz==2023.3 \
         python-dotenv==1.0.0 \
         opencv-python-headless==4.8.1.78 \
-        numpy==1.26.3 && \
+        numpy==1.26.3 \
+        moviepy==1.0.3 \
+        imageio==2.31.6 \
+        && \
     rm -rf /root/.cache/pip /tmp/* /var/tmp/*
 
 # === Chromium для Playwright ===
