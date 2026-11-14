@@ -28,28 +28,23 @@ from functools import wraps
 from datetime import datetime, timedelta
 import pytz
 
-from PIL import Image  # для поворота фото
+from PIL import Image
 
 from flask import (Flask, request, jsonify, send_file, redirect)
 
-# === Создание видео (OpenCV) ===
+# === Создание видео через OpenCV (без moviepy) ===
 try:
     from video_maker import (process_queue_videos, process_one_folder,
-                             MOVIEPY_AVAILABLE,
-                             MOVIEPY_IMPORT_ERROR,
-                             MOVIEPY_VERSION)
+                             MOVIEPY_AVAILABLE, MOVIEPY_IMPORT_ERROR, MOVIEPY_VERSION)
     VIDEO_MAKER_AVAILABLE = MOVIEPY_AVAILABLE
 except Exception as e:
     VIDEO_MAKER_AVAILABLE = False
     MOVIEPY_IMPORT_ERROR = f"{type(e).__name__}: {e}"
     MOVIEPY_VERSION = None
-    _import_logger = logging.getLogger(__name__)
-    _import_logger.warning(f'⚠️ video_maker недоступен: {MOVIEPY_IMPORT_ERROR}')
+    logging.getLogger(__name__).warning(f'⚠️ video_maker недоступен: {MOVIEPY_IMPORT_ERROR}')
     def process_queue_videos(*a, **k):
         return {'total': 0, 'ok': 0, 'failed': 1, 'skipped': 0,
-                'details': [{'id': None, 'folder': '(все)',
-                             'status': 'error',
-                             'reason': 'video_maker недоступен'}]}
+                'details': [{'id': None, 'folder': '(все)', 'status': 'error', 'reason': 'video_maker недоступен'}]}
     def process_one_folder(*a, **k):
         return False, 'video_maker недоступен'
 
@@ -731,7 +726,9 @@ def stop_video_maker():
         return False
     VIDEO_MAKER_STOP[0] = True
     return True
-    # ============================================================
+
+
+# ============================================================
 # Стили
 # ============================================================
 
@@ -1179,3 +1176,1542 @@ def admin_import_folder():
         }});
     </script>
     """
+
+
+@app.route('/admin/parser_status')
+@require_admin
+def admin_parser_status():
+    log_path = '/tmp/parser_subprocess.log'
+    running = parser_is_running()
+    log_tail, log_size = '', 0
+    if os.path.exists(log_path):
+        try:
+            log_size = os.path.getsize(log_path)
+            with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                log_tail = ''.join(f.readlines()[-200:])
+        except Exception as e:
+            log_tail = f'⚠️ Не удалось прочитать лог: {e}'
+    if not log_tail:
+        log_tail = '(лог пуст)'
+    status_class = 'status-on' if running else 'status-off'
+    status_text = '🟢 РАБОТАЕТ' if running else '🔴 ОСТАНОВЛЕН'
+    threads_count = threading.active_count()
+
+    parser_stop_btn = (
+        '<a href="/admin/stop_parser" class="btn btn-red" '
+        'onclick="return confirm(\'Остановить парсер?\')">⏹ СТОП парсера</a>'
+        if running else
+        '<a href="/admin/run_parser?limit=300" class="btn btn-green" '
+        'onclick="return confirm(\'Запустить парсер (300)?\')">🚀 Запустить парсер</a>'
+    )
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🚀 Статус парсера</h1>
+        <p>Состояние: <span class="{status_class}">{status_text}</span></p>
+        <p>Лог: <code>{log_path}</code> ({log_size} байт)</p>
+        <p>🧵 Активных потоков: <b>{threads_count}</b></p>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+        <a href="/admin/parser_status" class="btn">🔄 Обновить</a>
+        {parser_stop_btn}
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
+    </div>
+    <div class="card">
+        <h2>📜 Последние 200 строк лога</h2>
+        <pre class="log">{log_tail}</pre>
+    </div>
+    """
+
+
+@app.route('/admin/settings', methods=['GET', 'POST'])
+@require_admin
+def admin_settings():
+    saved = False
+    if request.method == 'POST':
+        for s in SECTIONS:
+            bot_db.set_setting(f"chat_id_{s['name']}",
+                               (request.form.get(f"chat_id_{s['name']}") or '').strip())
+        bot_db.set_setting('schedule_start', (request.form.get('schedule_start') or '06:00').strip())
+        bot_db.set_setting('schedule_end', (request.form.get('schedule_end') or '20:00').strip())
+        dl = (request.form.get('daily_limit') or '150').strip()
+        try:
+            int(dl)
+        except ValueError:
+            dl = '150'
+        bot_db.set_setting('daily_limit', dl)
+        saved = True
+    sections = get_sections_from_db(bot_db)
+    schedule = get_schedule_from_db(bot_db)
+    chat_fields = "".join(f"""
+        <div class="form-row">
+            <label>{s.get('title', s['name'])}:</label>
+            <input type="text" name="chat_id_{s['name']}" value="{s['chat_id']}" placeholder="-00000000000000">
+        </div>""" for s in sections)
+    saved_msg = '<div class="success-msg">✅ Настройки сохранены</div>' if saved else ''
+    return BASE_STYLE + f"""
+    <div class="card"><h1>⚙️ Настройки</h1><a href="/admin" class="btn">← Назад</a></div>
+    <form method="POST">
+        <div class="card"><h2>📢 chat_id групп MAX</h2>{chat_fields}</div>
+        <div class="card">
+            <h2>⏰ Расписание (МСК)</h2>
+            <div class="form-row"><label>Начало:</label><input type="text" name="schedule_start" value="{schedule['start']}"></div>
+            <div class="form-row"><label>Конец:</label><input type="text" name="schedule_end" value="{schedule['end']}"></div>
+            <div class="form-row"><label>Лимит/день:</label><input type="text" name="daily_limit" value="{schedule['daily_limit']}"></div>
+        </div>
+        {saved_msg}
+        <div class="card">
+            <button type="submit" class="btn btn-green">💾 Сохранить</button>
+            <a href="/admin" class="btn btn-gray">Отмена</a>
+        </div>
+    </form>
+    """
+
+
+# ============================================================
+# АДМИНКА — Отчёты по публикациям
+# ============================================================
+
+HTML_TABLE_LIMIT = 500
+EXCEL_EXPORT_LIMIT = 100000
+
+
+def _parse_period_from_request():
+    def _valid_date(s):
+        if not s:
+            return None
+        try:
+            datetime.strptime(s, '%Y-%m-%d')
+            return s
+        except Exception:
+            return None
+
+    if request.args.get('all') == '1':
+        return None, None, True, 'Все публикации'
+
+    date_from = _valid_date(request.args.get('from', ''))
+    date_to = _valid_date(request.args.get('to', ''))
+
+    if date_from or date_to:
+        if date_from and date_to and date_from == date_to:
+            label = f'за {date_from}'
+        elif date_from and date_to:
+            label = f'с {date_from} по {date_to}'
+        elif date_from:
+            label = f'с {date_from}'
+        else:
+            label = f'по {date_to}'
+        return date_from, date_to, False, label
+
+    today = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d')
+    return today, today, False, f'за {today} (сегодня)'
+
+
+@app.route('/admin/today')
+@require_admin
+def admin_today():
+    date_from, date_to, is_all_time, period_label = _parse_period_from_request()
+
+    if is_all_time:
+        total_count = bot_db.count_publications()
+        pubs = bot_db.get_publications_full(limit=HTML_TABLE_LIMIT)
+    else:
+        total_count = bot_db.count_publications(date_from, date_to)
+        pubs = bot_db.get_publications_full(date_from, date_to,
+                                            limit=HTML_TABLE_LIMIT)
+
+    available_dates = bot_db.get_available_dates()
+
+    rows_html = ""
+    for i, p in enumerate(pubs, 1):
+        max_cell = f'<a href="{p["max_post_url"]}" target="_blank">🔗 MAX</a>' \
+                   if p.get('max_post_url') else '—'
+        src_cell = f'<a href="{p["source_url"]}" target="_blank">🔗 Источник</a>' \
+                   if p.get('source_url') and str(p['source_url']).startswith('http') else '—'
+        rows_html += (f"<tr><td>{i}</td><td>{p.get('date','')}</td>"
+                      f"<td>{p.get('time','')}</td><td>{max_cell}</td>"
+                      f"<td>{src_cell}</td><td>{p.get('title','')}</td>"
+                      f"<td>{p.get('code','')}</td><td>{p.get('price','') or ''}</td></tr>")
+    if not rows_html:
+        rows_html = "<tr><td colspan='8' style='text-align:center;color:#999'>За выбранный период ничего не опубликовано</td></tr>"
+
+    if is_all_time:
+        export_qs = 'all=1'
+    else:
+        qs_parts = []
+        if date_from:
+            qs_parts.append(f'from={date_from}')
+        if date_to:
+            qs_parts.append(f'to={date_to}')
+        export_qs = '&'.join(qs_parts)
+
+    now_msk = datetime.now(MOSCOW_TZ)
+    today_str = now_msk.strftime('%Y-%m-%d')
+    yesterday = (now_msk - timedelta(days=1)).strftime('%Y-%m-%d')
+    week_ago = (now_msk - timedelta(days=7)).strftime('%Y-%m-%d')
+    month_ago = (now_msk - timedelta(days=30)).strftime('%Y-%m-%d')
+
+    limit_warn = ''
+    if total_count > len(pubs):
+        limit_warn = (
+            f'<div class="warn">⚠️ Показаны последние {len(pubs)} '
+            f'из {total_count} строк. Полный список — в Excel-экспорте.</div>'
+        )
+
+    datalist_options = "".join(
+        f'<option value="{d}">' for d in available_dates[:90]
+    )
+
+    max_links_js = ",".join(
+        f'"{p["max_post_url"]}"' for p in pubs if p.get('max_post_url')
+    )
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>📅 Опубликовано: {period_label}</h1>
+        <p>Найдено: <span class="counter-big">{total_count}</span>
+           {f' · показано: {len(pubs)}' if total_count > len(pubs) else ''}</p>
+
+        <form method="GET" action="/admin/today" class="period-form">
+            <div>
+                <label>С даты (МСК)</label>
+                <input type="date" name="from" value="{date_from or ''}" list="dates-list">
+            </div>
+            <div>
+                <label>По дату (МСК)</label>
+                <input type="date" name="to" value="{date_to or ''}" list="dates-list">
+            </div>
+            <div>
+                <button type="submit" class="btn">🔎 Показать</button>
+            </div>
+            <div>
+                <a href="/admin/today" class="btn btn-gray">Сегодня</a>
+            </div>
+        </form>
+        <datalist id="dates-list">{datalist_options}</datalist>
+
+        <div class="quick-links">
+            <a href="/admin/today" class="btn">📅 Сегодня</a>
+            <a href="/admin/today?from={yesterday}&to={yesterday}" class="btn">📅 Вчера</a>
+            <a href="/admin/today?from={week_ago}&to={today_str}" class="btn">📅 7 дней</a>
+            <a href="/admin/today?from={month_ago}&to={today_str}" class="btn">📅 30 дней</a>
+            <a href="/admin/today?all=1" class="btn btn-orange">📚 Всё время</a>
+        </div>
+
+        {limit_warn}
+
+        <div style="margin-top:15px">
+            <a href="/admin" class="btn btn-gray">← Назад</a>
+            <a href="/admin/today?{export_qs.replace('&', '&amp;')}" class="btn">🔄 Обновить</a>
+            <a href="/api/today/export?{export_qs.replace('&', '&amp;')}" class="btn btn-green">📥 Скачать Excel</a>
+            <button class="btn btn-orange" onclick="copyMaxLinks()">📋 Копировать ссылки MAX</button>
+        </div>
+        <p class="hint">
+            Даты берутся по московскому времени. Excel-экспорт отдаёт полный список
+            за выбранный период (до {EXCEL_EXPORT_LIMIT} строк).
+        </p>
+    </div>
+    <div class="card"><div style="max-height:600px;overflow-y:auto">
+        <table><thead><tr><th>№</th><th>Дата</th><th>Время (МСК)</th>
+        <th>Ссылка на пост</th><th>Ссылка-источник</th>
+        <th>Название</th><th>Код</th><th>Цена</th></tr></thead>
+        <tbody id="todayTable">{rows_html}</tbody></table>
+    </div></div>
+    <script>
+        const allMaxLinks = [{max_links_js}];
+        function copyMaxLinks() {{
+            if (allMaxLinks.length === 0) {{ alert('Нет ссылок для копирования'); return; }}
+            navigator.clipboard.writeText(allMaxLinks.join('\\n')).then(
+                () => alert('✅ Скопировано ' + allMaxLinks.length + ' ссылок'),
+                () => alert('❌ Не удалось скопировать'));
+        }}
+    </script>
+    """
+
+
+@app.route('/api/today')
+@require_admin
+def api_today():
+    date_from, date_to, is_all_time, period_label = _parse_period_from_request()
+    if is_all_time:
+        pubs = bot_db.get_publications_full(limit=EXCEL_EXPORT_LIMIT)
+    else:
+        pubs = bot_db.get_publications_full(date_from, date_to,
+                                            limit=EXCEL_EXPORT_LIMIT)
+    resp = jsonify({'success': True, 'period': period_label,
+                    'publications': pubs, 'count': len(pubs)})
+    resp.headers['Content-Type'] = 'application/json; charset=utf-8'
+    return resp
+
+
+@app.route('/api/today/export')
+@require_admin
+def api_today_export():
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
+    date_from, date_to, is_all_time, period_label = _parse_period_from_request()
+
+    if is_all_time:
+        pubs = bot_db.get_publications_full(limit=EXCEL_EXPORT_LIMIT)
+    else:
+        pubs = bot_db.get_publications_full(date_from, date_to,
+                                            limit=EXCEL_EXPORT_LIMIT)
+
+    today = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    if is_all_time:
+        fname_part = 'all_time'
+    elif date_from and date_to and date_from == date_to:
+        fname_part = date_from
+    elif date_from and date_to:
+        fname_part = f'{date_from}_{date_to}'
+    elif date_from:
+        fname_part = f'from_{date_from}'
+    else:
+        fname_part = date_from or 'today'
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Отчет"
+    headers = ['№', 'Дата', 'Время (МСК)', 'Ссылка на пост',
+               'Ссылка (источник)', 'Название', 'Код предложения', 'Цена в лизинге']
+    header_font = Font(bold=True, size=11, color="FFFFFF")
+    header_fill = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin = Border(left=Side(style="thin", color="D0D0D0"), right=Side(style="thin", color="D0D0D0"),
+                  top=Side(style="thin", color="D0D0D0"), bottom=Side(style="thin", color="D0D0D0"))
+    title = ws.cell(row=1, column=1,
+                    value=f"Отчет по публикациям — {period_label}")
+    title.font = Font(bold=True, size=14)
+    title.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells('A1:H1')
+    ws.row_dimensions[1].height = 30
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=2, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = thin
+    ws.row_dimensions[2].height = 25
+    link_font = Font(color="0563C1", underline="single", size=10)
+    text_font = Font(size=10)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    for i, p in enumerate(pubs, 1):
+        r = i + 2
+        vals = [i, p.get('date',''), p.get('time',''), p.get('max_post_url',''),
+                p.get('source_url',''), p.get('title',''), p.get('code',''), p.get('price','')]
+        for col, val in enumerate(vals, 1):
+            cell = ws.cell(row=r, column=col, value=val)
+            cell.font = text_font
+            cell.border = thin
+            cell.alignment = center if col in (1, 2, 3) else left
+            if col in (4, 5) and val and str(val).startswith('http'):
+                cell.font = link_font
+                cell.hyperlink = val
+    widths = {'A': 5, 'B': 12, 'C': 12, 'D': 45, 'E': 55, 'F': 35, 'G': 22, 'H': 18}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = 'A3'
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(buf, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                     as_attachment=True,
+                     download_name=f"Отчет_{fname_part}_{today}.xlsx")
+
+
+# ============================================================
+# ОЧЕРЕДЬ
+# ============================================================
+
+@app.route('/admin/queue')
+@require_admin
+def admin_queue():
+    ads = bot_db.get_all_pending_ads()
+    video_running = video_maker_is_running()
+
+    if video_running:
+        vs = VIDEO_MAKER_STATUS
+        v_total = vs.get('total', 0) or 1
+        v_done = vs.get('done', 0)
+        v_pct = int(100 * v_done / v_total)
+        v_current = vs.get('current') or {}
+        v_folder = v_current.get('folder', '—')
+        video_progress_html = f"""
+        <div class="card" style="border-left:4px solid #6f42c1">
+            <h2 style="margin:0 0 8px 0">🎬 Идёт сборка видео</h2>
+            <div class="progress-bar">
+                <div class="progress-bar-inner" style="width:{v_pct}%">{v_pct}% ({v_done}/{v_total})</div>
+            </div>
+            <p class="hint" style="margin:6px 0 0 0">
+                Сейчас: <code>{v_folder}</code>
+                · <a href="/admin/make_videos_status">открыть полный прогресс</a>
+                · <a href="/admin/make_videos_stop">⏹ остановить</a>
+            </p>
+        </div>
+        """
+    else:
+        video_progress_html = ''
+
+    cards_html = ""
+    for i, ad in enumerate(ads, 1):
+        ad_id = ad['id']
+        media_path = ad.get('media_path') or ''
+        title = ad.get('title') or '—'
+        category = ad.get('category') or '—'
+        chat_id = ad.get('chat_id') or '—'
+        price = ad.get('price') or '—'
+        code = ad.get('code') or '—'
+        city = ad.get('city') or '—'
+        year = ad.get('year') or '—'
+        mileage = ad.get('mileage') or '—'
+        source_url = ad.get('source_url') or ''
+        created = ad.get('created_at') or ''
+        photos_html = ""
+        if media_path and os.path.exists(media_path):
+            try:
+                files = sorted(os.listdir(media_path))
+                photos, videos = [], []
+                for f in files:
+                    if '.orig.' in f:
+                        continue
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in IMAGE_EXTS:
+                        photos.append(f)
+                    elif ext in VIDEO_EXTS:
+                        videos.append(f)
+                if videos:
+                    for v in videos[:1]:
+                        photos_html += f'''
+                        <div style="position:relative;display:inline-block;margin:2px">
+                            <div style="width:120px;height:90px;background:#000;border-radius:4px;display:flex;align-items:center;justify-content:center;color:white;font-size:32px">🎬</div>
+                            <a href="/admin/queue_photo_delete/{ad_id}/{v}" style="position:absolute;top:2px;right:2px;background:rgba(220,53,69,0.9);color:white;padding:2px 6px;border-radius:3px;font-size:11px;text-decoration:none;cursor:pointer;font-weight:bold;line-height:1" onclick="event.stopPropagation();return confirm('Удалить видео?');" title="Удалить">✕</a>
+                        </div>'''
+                elif photos:
+                    for pf in photos[:5]:
+                        photos_html += f'''
+                        <div style="position:relative;display:inline-block;margin:2px">
+                            <img src="/admin/queue_photo/{ad_id}/{pf}" style="width:120px;height:90px;object-fit:cover;border-radius:4px;cursor:pointer;display:block" onclick="window.open(this.src, '_blank')">
+                            <a href="/admin/queue_photo_rotate/{ad_id}/{pf}" style="position:absolute;top:2px;right:28px;background:rgba(0,123,255,0.9);color:white;padding:2px 6px;border-radius:3px;font-size:11px;text-decoration:none;cursor:pointer;font-weight:bold;line-height:1" onclick="event.stopPropagation();return confirm('Повернуть фото на 45°?');" title="Повернуть 45°">🔄</a>
+                            <a href="/admin/queue_photo_delete/{ad_id}/{pf}" style="position:absolute;top:2px;right:2px;background:rgba(220,53,69,0.9);color:white;padding:2px 6px;border-radius:3px;font-size:11px;text-decoration:none;cursor:pointer;font-weight:bold;line-height:1" onclick="event.stopPropagation();return confirm('Удалить это фото?');" title="Удалить">✕</a>
+                        </div>'''
+            except Exception as e:
+                photos_html = f'<span style="color:#999">Ошибка: {e}</span>'
+        else:
+            photos_html = '<span style="color:#dc3545">❌ Папка не найдена</span>'
+        text_preview = ''
+        if media_path:
+            info_path = os.path.join(media_path, 'info.txt')
+            if os.path.exists(info_path):
+                try:
+                    with open(info_path, 'r', encoding='utf-8') as f:
+                        text_preview = f.read()[:300].replace('\n', '<br>')
+                except Exception:
+                    text_preview = '⚠️ Не читается'
+            else:
+                text_preview = '⚠️ Нет info.txt'
+        up_disabled = (i == 1)
+        down_disabled = (i == len(ads))
+        up_style = 'font-size:13px;padding:6px 10px;text-align:center'
+        down_style = 'font-size:13px;padding:6px 10px;text-align:center'
+        if up_disabled: up_style += ';pointer-events:none;opacity:0.4'
+        if down_disabled: down_style += ';pointer-events:none;opacity:0.4'
+
+        if not VIDEO_MAKER_AVAILABLE:
+            make_video_btn = (
+                f'<a href="/admin/make_videos_status" class="btn btn-gray" '
+                f'style="font-size:13px;padding:6px 10px;text-align:center" '
+                f'title="{MOVIEPY_IMPORT_ERROR or "video_maker недоступен"}">'
+                f'🎬 В видео (нет сборки)</a>'
+            )
+        elif video_running:
+            make_video_btn = (
+                '<a class="btn btn-gray" '
+                'style="font-size:13px;padding:6px 10px;text-align:center" '
+                'title="Сейчас идёт сборка видео">🎬 В видео (занято)</a>'
+            )
+        else:
+            make_video_btn = (
+                f'<a href="/admin/make_video/{ad_id}" '
+                'class="btn btn-purple" '
+                'style="font-size:13px;padding:6px 10px;text-align:center" '
+                'onclick="return confirm(\'Собрать видео из фото этой папки? '
+                'Исходные фото будут удалены.\')">🎬 В видео</a>'
+            )
+
+        cards_html += f'''
+        <div class="card" id="ad_{ad_id}" style="padding:15px">
+            <div style="display:flex;gap:15px;flex-wrap:wrap">
+                <div style="flex:0 0 140px">
+                    <div style="background:#f8f9fa;padding:8px;border-radius:5px;text-align:center;font-weight:bold;font-size:20px">#{i}</div>
+                    <div style="font-size:11px;color:#666;margin-top:5px;text-align:center">ID {ad_id}</div>
+                </div>
+                <div style="flex:0 0 400px">{photos_html}</div>
+                <div style="flex:1;min-width:300px">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:bold">{title}</p>
+                    <p style="margin:0 0 4px 0;font-size:13px;color:#555">📂 <b>{category}</b> → <code>{chat_id}</code></p>
+                    <p style="margin:0 0 4px 0;font-size:13px;color:#555">💰 {price} ₽ · 📋 {code} · 📍 {city} · 📅 {year} · 🛣️ {mileage} км</p>
+                    <p style="margin:8px 0 4px 0;font-size:12px;color:#666">
+                        <a href="{source_url}" target="_blank">🔗 Источник</a> · <a href="/admin/ad_detail/{ad_id}">👁️ Детали</a> · <span style="color:#999">создано: {created}</span>
+                    </p>
+                    <details style="margin-top:8px"><summary style="cursor:pointer;font-size:13px;color:#007bff">Показать текст поста</summary>
+                        <div style="background:#f8f9fa;padding:10px;border-radius:5px;margin-top:5px;font-size:12px;line-height:1.5;max-height:200px;overflow-y:auto">{text_preview}</div>
+                    </details>
+                </div>
+                <div style="flex:0 0 180px;display:flex;flex-direction:column;gap:5px">
+                    <a href="/admin/queue_move/{ad_id}/up" class="btn" style="{up_style}">⬆️ Вверх</a>
+                    <a href="/admin/queue_move/{ad_id}/down" class="btn" style="{down_style}">⬇️ Вниз</a>
+                    {make_video_btn}
+                    <a href="/admin/publish_ad/{ad_id}" class="btn btn-orange" style="font-size:13px;padding:6px 10px;text-align:center" onclick="return confirm('Опубликовать это объявление СЕЙЧАС?')">📤 Опубликовать</a>
+                    <a href="/admin/queue_delete/{ad_id}" class="btn btn-red" style="font-size:13px;padding:6px 10px;text-align:center" onclick="return confirm('Удалить объявление #{i}?')">🗑️ Удалить</a>
+                </div>
+            </div>
+        </div>'''
+    if not cards_html:
+        cards_html = ('<div class="card"><p style="text-align:center;color:#999;font-size:16px">Очередь пуста. Запустите парсер или импортируйте папки.</p>'
+                      '<div style="text-align:center;margin-top:15px">'
+                      '<a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Парсер (5)</a>'
+                      '<a href="/admin/import_folder" class="btn btn-green">📥 Импорт папок</a>'
+                      '</div></div>')
+    summary = bot_db.get_queue_category_summary()
+    summary_html = f'<p class="hint">📊 По категориям: {" · ".join(f"<b>{cat}</b>: {cnt}" for cat, cnt in summary.items())}</p>' if summary else ''
+
+    if not VIDEO_MAKER_AVAILABLE:
+        video_top_btn = (
+            f'<a href="/admin/make_videos_status" class="btn btn-gray" '
+            f'title="{MOVIEPY_IMPORT_ERROR or "video_maker недоступен"}">'
+            f'🎬 Видео недоступно (причина)</a>'
+        )
+    elif video_running:
+        video_top_btn = (
+            '<a href="/admin/make_videos_status" class="btn btn-purple">🎬 К прогрессу</a>'
+            '<a href="/admin/make_videos_stop" class="btn btn-red" '
+            'onclick="return confirm(\'Остановить сборку видео?\')">⏹ Стоп видео</a>'
+        )
+    else:
+        video_top_btn = (
+            '<a href="/admin/make_videos" class="btn btn-purple" '
+            'onclick="return confirm(\'Собрать видео из фото ВСЕЙ очереди? '
+            'Исходные фото будут удалены.\')">🎬 Создать видео</a>'
+        )
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>📋 Очередь на публикацию ({len(ads)})</h1>
+        {video_progress_html}
+        <p class="hint">Порядок публикации = порядок карточек. Меняйте кнопками ⬆️/⬇️.</p>
+        {summary_html}
+        <a href="/admin" class="btn">← Назад</a>
+        <a href="/admin/queue" class="btn btn-gray">🔄 Обновить</a>
+        <a href="/admin/queue_resort" class="btn" onclick="return confirm('Пересчитать порядок: перемешать категории?')">🔀 Перемешать по категориям</a>
+        <a href="/admin/import_folder" class="btn btn-green">📥 Импорт папок</a>
+        <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
+        {video_top_btn}
+        <a href="/admin/queue_clear" class="btn btn-red" onclick="return confirm('Удалить ВСЮ очередь и все папки?')">🗑️ Очистить всю очередь</a>
+    </div>
+    {cards_html}
+    <script>
+        const videoRunning = {'true' if video_running else 'false'};
+        if (videoRunning) {{
+            setTimeout(() => location.reload(), 4000);
+        }}
+    </script>
+    """
+
+
+@app.route('/admin/queue_photo/<int:ad_id>/<path:filename>')
+@require_admin
+def admin_queue_photo(ad_id, filename):
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return 'Not found', 404
+    media_path = ad.get('media_path')
+    if not media_path or not os.path.exists(media_path):
+        return 'Not found', 404
+    safe_name = os.path.basename(filename)
+    file_path = os.path.join(media_path, safe_name)
+    if not os.path.exists(file_path):
+        return 'Not found', 404
+    ext = os.path.splitext(safe_name)[1].lower()
+    mimetype = {'.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
+                '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp'}.get(ext, 'image/jpeg')
+    return send_file(file_path, mimetype=mimetype)
+
+
+@app.route('/admin/queue_photo_delete/<int:ad_id>/<path:filename>')
+@require_admin
+def admin_queue_photo_delete(ad_id, filename):
+    ok, message, remaining = bot_db.delete_ad_photo(ad_id, filename, keep_min=1)
+    if ok:
+        logger.info(f'🗑️ Файл удалён: {filename} (осталось {remaining})')
+        try:
+            ad = bot_db.get_ad_by_id(ad_id)
+            if ad and ad.get('media_path'):
+                mp = ad['media_path']
+                base, ext = os.path.splitext(os.path.join(mp, os.path.basename(filename)))
+                orig = base + '.orig' + ext
+                if os.path.exists(orig):
+                    os.remove(orig)
+                    logger.info(f'🗑️ Удалён оригинал: {orig}')
+        except Exception as e:
+            logger.warning(f'⚠️ Не удалить .orig: {e}')
+    else:
+        logger.warning(f'⚠️ Не удалось удалить {filename}: {message}')
+    ref = request.referrer or ''
+    if f'/admin/ad_detail/{ad_id}' in ref:
+        return redirect(f'/admin/ad_detail/{ad_id}')
+    return redirect('/admin/queue')
+
+
+@app.route('/admin/queue_delete/<int:ad_id>')
+@require_admin
+def admin_queue_delete(ad_id):
+    bot_db.delete_ad(ad_id, delete_files=True)
+    return redirect('/admin/queue')
+
+
+@app.route('/admin/queue_move/<int:ad_id>/<direction>')
+@require_admin
+def admin_queue_move(ad_id, direction):
+    bot_db.move_ad(ad_id, direction)
+    return redirect('/admin/queue')
+
+
+@app.route('/admin/queue_resort')
+@require_admin
+def admin_queue_resort():
+    try:
+        count = bot_db.resort_queue_by_categories()
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>🔀 Очередь перемежена</h1>
+            <p>Обработано записей: <b>{count}</b></p>
+            <a href="/admin/queue" class="btn">📋 К очереди</a>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>"""
+    except Exception as e:
+        logger.exception(f'❌ Ошибка перемежения: {e}')
+        return BASE_STYLE + f'<div class="card"><h1>❌ Ошибка</h1><div class="error-msg">{e}</div><a href="/admin/queue" class="btn">← К очереди</a></div>'
+
+
+@app.route('/admin/queue_clear')
+@require_admin
+def admin_queue_clear():
+    ads = bot_db.get_all_pending_ads()
+    deleted_folders, deleted_records = 0, 0
+    for ad in ads:
+        media_path = ad.get('media_path')
+        if media_path and os.path.exists(media_path):
+            try:
+                shutil.rmtree(media_path)
+                deleted_folders += 1
+            except Exception as e:
+                logger.warning(f'⚠️ Не удалить {media_path}: {e}')
+        bot_db.delete_ad(ad['id'], delete_files=False)
+        deleted_records += 1
+    logger.info(f'🗑️ Очередь очищена: {deleted_records} записей, {deleted_folders} папок')
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🗑️ Очередь очищена</h1>
+        <p>Удалено записей: <b>{deleted_records}</b></p>
+        <p>Удалено папок: <b>{deleted_folders}</b></p>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>"""
+
+
+@app.route('/admin/ad_detail/<int:ad_id>')
+@require_admin
+def admin_ad_detail(ad_id):
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return BASE_STYLE + '<div class="card"><h1>❌ Не найдено</h1><a href="/admin/queue" class="btn">← К очереди</a></div>'
+    media_path = ad.get('media_path') or ''
+    text = ''
+    photos_html = ''
+    photos_count = 0
+    videos_count = 0
+    can_delete = False
+    if media_path and os.path.exists(media_path):
+        info_path = os.path.join(media_path, 'info.txt')
+        if os.path.exists(info_path):
+            try:
+                with open(info_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+            except Exception as e:
+                text = f'⚠️ Ошибка чтения: {e}'
+        try:
+            files = sorted(os.listdir(media_path))
+            photos, videos = [], []
+            for f in files:
+                if '.orig.' in f:
+                    continue
+                ext = os.path.splitext(f)[1].lower()
+                if ext in IMAGE_EXTS:
+                    photos.append(f)
+                elif ext in VIDEO_EXTS:
+                    videos.append(f)
+            photos_count = len(photos)
+            videos_count = len(videos)
+            total_media = photos_count + videos_count
+            can_delete = (total_media > 1)
+            for vf in videos:
+                badge = f'<a href="/admin/queue_photo_delete/{ad_id}/{vf}" class="photo-del" onclick="return confirm(\'Удалить это видео?\')" title="Удалить видео">🗑️</a>' if can_delete else '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
+                photos_html += f'<div class="photo-wrap"><video src="/admin/queue_photo/{ad_id}/{vf}" controls style="width:400px;height:auto;border-radius:6px;display:block"></video>{badge}</div>'
+            for pf in photos:
+                rotate_btn = (
+                    f'<a href="/admin/queue_photo_rotate/{ad_id}/{pf}" '
+                    f'class="photo-rotate" '
+                    f'onclick="return confirm(\'Повернуть фото на 45°?\')" '
+                    f'title="Повернуть на 45°">🔄</a>'
+                )
+                reset_btn = (
+                    f'<a href="/admin/queue_photo_reset/{ad_id}/{pf}" '
+                    f'class="photo-reset" '
+                    f'onclick="return confirm(\'Вернуть фото к исходному виду?\')" '
+                    f'title="Сбросить поворот">↩️</a>'
+                )
+                delete_btn = (
+                    f'<a href="/admin/queue_photo_delete/{ad_id}/{pf}" '
+                    f'class="photo-del" '
+                    f'onclick="return confirm(\'Удалить это фото?\')" '
+                    f'title="Удалить это фото">🗑️</a>'
+                    if can_delete else
+                    '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
+                )
+                photos_html += (
+                    f'<div class="photo-wrap">'
+                    f'<img src="/admin/queue_photo/{ad_id}/{pf}" '
+                    f'style="width:300px;height:auto;border-radius:6px;cursor:pointer;display:block" '
+                    f'onclick="window.open(this.src, \'_blank\')">'
+                    f'{rotate_btn}{reset_btn}{delete_btn}'
+                    f'</div>'
+                )
+        except Exception as e:
+            photos_html = f'<p style="color:red">Ошибка: {e}</p>'
+
+    if not VIDEO_MAKER_AVAILABLE:
+        make_video_btn = (
+            f'<a href="/admin/make_videos_status" class="btn btn-gray" '
+            f'title="{MOVIEPY_IMPORT_ERROR or "video_maker недоступен"}">'
+            f'🎬 В видео (нет сборки)</a>'
+        )
+    elif video_maker_is_running():
+        make_video_btn = '<a class="btn btn-gray" title="Сейчас идёт сборка видео">🎬 В видео (занято)</a>'
+    else:
+        make_video_btn = (
+            f'<a href="/admin/make_video/{ad_id}" class="btn btn-purple" '
+            'onclick="return confirm(\'Собрать видео из фото этой папки? '
+            'Исходные фото будут удалены.\')">🎬 В видео</a>'
+        )
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>👁️ Предпросмотр #{ad_id}</h1>
+        <a href="/admin/queue" class="btn">← К очереди</a>
+        {make_video_btn}
+        <a href="/admin/publish_ad/{ad_id}" class="btn btn-orange" onclick="return confirm('Опубликовать сейчас?')">📤 Опубликовать сейчас</a>
+        <a href="/admin/queue_delete/{ad_id}" class="btn btn-red" onclick="return confirm('Удалить всё объявление?')">🗑️ Удалить всё</a>
+    </div>
+    <div class="card">
+        <h2>🎬 Медиа (фото: {photos_count}, видео: {videos_count})</h2>
+        <p class="hint">🔄 — повернуть на 45° · ↩️ — сбросить поворот · 🗑️ — удалить. {'Последнее удалить нельзя.' if not can_delete else ''}</p>
+        <div>{photos_html or '<p style="color:#999">Нет медиа</p>'}</div>
+    </div>
+    <div class="card">
+        <h2>📝 Текст поста (info.txt)</h2>
+        <pre style="background:#f8f9fa;padding:15px;border-radius:5px;white-space:pre-wrap;font-size:13px;line-height:1.6">{text}</pre>
+    </div>
+    <div class="card">
+        <h2>📊 Метаданные</h2>
+        <table>
+            <tr><td>ID</td><td>{ad_id}</td></tr>
+            <tr><td>Категория</td><td>{ad.get('category', '')}</td></tr>
+            <tr><td>chat_id</td><td>{ad.get('chat_id', '')}</td></tr>
+            <tr><td>Название</td><td>{ad.get('title', '')}</td></tr>
+            <tr><td>Код</td><td>{ad.get('code', '')}</td></tr>
+            <tr><td>Цена</td><td>{ad.get('price', '')}</td></tr>
+            <tr><td>Город</td><td>{ad.get('city', '')}</td></tr>
+            <tr><td>Год</td><td>{ad.get('year', '')}</td></tr>
+            <tr><td>Пробег</td><td>{ad.get('mileage', '')}</td></tr>
+            <tr><td>Папка</td><td><code>{media_path}</code></td></tr>
+            <tr><td>Источник</td><td><a href="{ad.get('source_url', '')}" target="_blank">🔗 Открыть</a></td></tr>
+            <tr><td>Создано</td><td>{ad.get('created_at', '')}</td></tr>
+            <tr><td>sort_order</td><td>{ad.get('sort_order', '')}</td></tr>
+        </table>
+    </div>"""
+
+
+# ============================================================
+# ПОВОРОТ ФОТО
+# ============================================================
+
+def _rotate_image_file(file_path: str, angle: float = 45.0) -> bool:
+    try:
+        base, ext = os.path.splitext(file_path)
+        orig_path = base + '.orig' + ext
+
+        if not os.path.exists(orig_path):
+            shutil.copy2(file_path, orig_path)
+            logger.info(f'💾 Сохранён оригинал: {orig_path}')
+
+        img = Image.open(file_path)
+
+        if img.mode in ('RGBA', 'LA', 'P'):
+            bg = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            if img.mode == 'RGBA':
+                bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        rotated = img.rotate(-angle, expand=True, resample=Image.BICUBIC,
+                             fillcolor=(255, 255, 255))
+        rotated.save(file_path, 'JPEG', quality=90, optimize=True)
+        img.close()
+        rotated.close()
+
+        logger.info(f'🔄 Повёрнуто на {angle}°: {file_path}')
+        return True
+    except Exception as e:
+        logger.exception(f'❌ Ошибка поворота {file_path}: {e}')
+        return False
+
+
+@app.route('/admin/queue_photo_rotate/<int:ad_id>/<path:filename>')
+@require_admin
+def admin_queue_photo_rotate(ad_id, filename):
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return 'Not found', 404
+    media_path = ad.get('media_path')
+    if not media_path or not os.path.exists(media_path):
+        return 'Not found', 404
+
+    safe_name = os.path.basename(filename)
+    file_path = os.path.join(media_path, safe_name)
+    if not os.path.exists(file_path):
+        return 'Not found', 404
+    if '.orig.' in safe_name:
+        return 'Cannot rotate original', 400
+
+    ok = _rotate_image_file(file_path, 45.0)
+    logger.info(f'🔄 rotate {safe_name}: {"OK" if ok else "FAIL"}')
+
+    ref = request.referrer or ''
+    if f'/admin/ad_detail/{ad_id}' in ref:
+        return redirect(f'/admin/ad_detail/{ad_id}')
+    return redirect('/admin/queue')
+
+
+@app.route('/admin/queue_photo_reset/<int:ad_id>/<path:filename>')
+@require_admin
+def admin_queue_photo_reset(ad_id, filename):
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return 'Not found', 404
+    media_path = ad.get('media_path')
+    if not media_path or not os.path.exists(media_path):
+        return 'Not found', 404
+
+    safe_name = os.path.basename(filename)
+    file_path = os.path.join(media_path, safe_name)
+    if not os.path.exists(file_path):
+        return 'Not found', 404
+
+    base, ext = os.path.splitext(file_path)
+    orig_path = base + '.orig' + ext
+    if not os.path.exists(orig_path):
+        logger.info(f'ℹ️ Нет оригинала для {safe_name} — сброс не нужен')
+        ref = request.referrer or ''
+        if f'/admin/ad_detail/{ad_id}' in ref:
+            return redirect(f'/admin/ad_detail/{ad_id}')
+        return redirect('/admin/queue')
+
+    try:
+        shutil.move(orig_path, file_path)
+        logger.info(f'↩️ Сброшен поворот: {safe_name}')
+    except Exception as e:
+        logger.error(f'❌ Ошибка сброса {safe_name}: {e}')
+
+    ref = request.referrer or ''
+    if f'/admin/ad_detail/{ad_id}' in ref:
+        return redirect(f'/admin/ad_detail/{ad_id}')
+    return redirect('/admin/queue')
+
+
+# ============================================================
+# ПУБЛИКАЦИЯ, ОЧИСТКА
+# ============================================================
+
+@app.route('/admin/publish_ad/<int:ad_id>')
+@require_admin
+def admin_publish_ad(ad_id):
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return BASE_STYLE + '<div class="card"><h1>❌ Не найдено</h1><a href="/admin/queue" class="btn">← К очереди</a></div>'
+    if ad.get('status') != 'pending':
+        return BASE_STYLE + f'<div class="card"><h1>⚠️ Объявление уже не в очереди</h1><p>Статус: <b>{ad.get("status")}</b></p><a href="/admin/queue" class="btn">← К очереди</a></div>'
+    logger.info(f'📤 Публикация # {ad_id}: {ad.get("folder_name")}')
+    try:
+        ok, message, post_link = publish_one_ad(ad)
+        if ok:
+            link_html = f'<p>🔗 <a href="{post_link}" target="_blank">{post_link}</a></p>' if post_link else ''
+            return BASE_STYLE + f"""
+            <div class="card">
+                <h1>✅ Опубликовано</h1>
+                <p><b>{ad.get('title', '')}</b></p>
+                <p>Категория: <code>{ad.get('category', '')}</code></p>
+                {link_html}
+                <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+                <a href="/admin/queue" class="btn">📋 К очереди</a>
+                <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
+                <a href="/admin" class="btn btn-gray">← В админку</a>
+            </div>"""
+        else:
+            bot_db.mark_ad_failed(ad['id'], message)
+            return BASE_STYLE + f"""
+            <div class="card">
+                <h1>❌ Ошибка публикации</h1>
+                <p><b>{ad.get('title', '')}</b></p>
+                <div class="error-msg">{message}</div>
+                <a href="/admin/queue" class="btn">← К очереди</a>
+                <a href="/admin/publish_ad/{ad_id}" class="btn btn-orange">Попробовать ещё</a>
+            </div>"""
+    except Exception as e:
+        logger.exception(f'❌ Ошибка публикации: {e}')
+        bot_db.mark_ad_failed(ad['id'], str(e))
+        return BASE_STYLE + f'<div class="card"><h1>❌ Ошибка</h1><div class="error-msg">{e}</div><a href="/admin/queue" class="btn">← К очереди</a></div>'
+
+
+@app.route('/admin/clear_all')
+@require_admin
+def admin_clear_all():
+    result = {'parsed_ads_deleted': 0, 'publications_deleted': 0,
+              'settings_deleted': 0, 'folders_deleted': 0, 'folder_errors': 0}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM parsed_ads")
+        result['parsed_ads_deleted'] = c.fetchone()[0]
+        c.execute("DELETE FROM parsed_ads")
+        c.execute("SELECT COUNT(*) FROM publications")
+        result['publications_deleted'] = c.fetchone()[0]
+        c.execute("DELETE FROM publications")
+        c.execute("SELECT COUNT(*) FROM settings")
+        result['settings_deleted'] = c.fetchone()[0]
+        c.execute("DELETE FROM settings")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.exception(f'❌ Ошибка очистки БД: {e}')
+    for folder in [OUTPUT_DIR, IMPORT_DIR]:
+        try:
+            if os.path.exists(folder):
+                for item in os.listdir(folder):
+                    item_path = os.path.join(folder, item)
+                    if os.path.isdir(item_path):
+                        try:
+                            shutil.rmtree(item_path)
+                            result['folders_deleted'] += 1
+                        except Exception as e:
+                            result['folder_errors'] += 1
+                            logger.warning(f'⚠️ Не удалить {item_path}: {e}')
+        except Exception as e:
+            logger.exception(f'❌ Ошибка очистки {folder}: {e}')
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🗑️ Полная очистка выполнена</h1>
+        <table>
+            <tr><th>Что</th><th>Удалено</th></tr>
+            <tr><td>Очередь парсинга</td><td><b>{result['parsed_ads_deleted']}</b></td></tr>
+            <tr><td>Журнал публикаций</td><td><b>{result['publications_deleted']}</b></td></tr>
+            <tr><td>Настройки</td><td><b>{result['settings_deleted']}</b></td></tr>
+            <tr><td>Папки с медиа</td><td><b>{result['folders_deleted']}</b></td></tr>
+        </table>
+        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>"""
+
+
+@app.route('/admin/check_paths')
+@require_admin
+def admin_check_paths():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, folder_name, media_path FROM parsed_ads")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    result = {'total': len(rows), 'exists': 0, 'missing': 0, 'missing_details': []}
+    for r in rows:
+        mp = r.get('media_path')
+        if mp and os.path.exists(mp):
+            result['exists'] += 1
+        else:
+            result['missing'] += 1
+            result['missing_details'].append({'id': r['id'], 'folder': r.get('folder_name'), 'path': mp})
+    return jsonify(result)
+
+
+@app.route('/admin/cleanup_orphans')
+@require_admin
+def admin_cleanup_orphans():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, folder_name, media_path FROM parsed_ads")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    deleted = 0
+    for r in rows:
+        mp = r.get('media_path')
+        if not mp or not os.path.exists(mp):
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM parsed_ads WHERE id = ?", (r['id'],))
+            conn.commit()
+            conn.close()
+            deleted += 1
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🧹 Очистка завершена</h1>
+        <p>Удалено «мёртвых» записей: <b>{deleted}</b> из <b>{len(rows)}</b></p>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>"""
+
+
+# ============================================================
+# Парсер
+# ============================================================
+
+_PARSER_PROC = [None]
+
+
+def parser_is_running() -> bool:
+    proc = _PARSER_PROC[0]
+    if proc is None:
+        return False
+    if proc.poll() is not None:
+        _PARSER_PROC[0] = None
+        return False
+    return True
+
+
+def stop_parser() -> tuple:
+    proc = _PARSER_PROC[0]
+    if proc is None or proc.poll() is not None:
+        _PARSER_PROC[0] = None
+        return False, 'Парсер не запущен'
+
+    pid = proc.pid
+    logger.info(f'⏹ Попытка остановки парсера PID={pid}')
+
+    try:
+        proc.terminate()
+    except Exception as e:
+        logger.warning(f'⚠️ terminate() не сработал: {e}')
+
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        logger.warning(f'⚠️ PID={pid} не завершился за 10 сек, применяем kill()')
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception as e:
+            logger.error(f'❌ kill() не сработал: {e}')
+            return False, f'Не удалось остановить процесс: {e}'
+    except Exception as e:
+        logger.warning(f'⚠️ Ошибка wait(): {e}')
+
+    _PARSER_PROC[0] = None
+    logger.info(f'✅ Парсер PID={pid} остановлен')
+    return True, f'Парсер PID={pid} остановлен'
+
+
+@app.route('/admin/stop_parser')
+@require_admin
+def admin_stop_parser():
+    ok, message = stop_parser()
+    color = '#28a745' if ok else '#6c757d'
+    icon = '⏹' if ok else 'ℹ️'
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>{icon} {'Парсер остановлен' if ok else 'Парсер не запущен'}</h1>
+        <p style="color:{color};font-weight:bold">{message}</p>
+        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+        <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
+        <a href="/admin/run_parser?limit=300" class="btn btn-green"
+           onclick="return confirm('Запустить парсер (300)?')">🚀 Запустить заново</a>
+        <a href="/admin/queue" class="btn">📋 Очередь</a>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+    </div>"""
+
+
+@app.route('/admin/run_parser')
+@require_admin
+def admin_run_parser():
+    limit = int(request.args.get('limit', 50))
+    if parser_is_running():
+        return BASE_STYLE + '<div class="card"><h1>⚠️ Парсер уже запущен</h1><p>Дождитесь завершения или нажмите «СТОП парсера».</p><a href="/admin" class="btn btn-gray">← В админку</a><a href="/admin/parser_status" class="btn">🚀 Статус парсера</a><a href="/admin/stop_parser" class="btn btn-red">⏹ СТОП парсера</a></div>'
+    log_path = '/tmp/parser_subprocess.log'
+    try:
+        log_file = open(log_path, 'a', encoding='utf-8')
+        proc = subprocess.Popen([sys.executable, '-u', '-m', 'parser_runner', '--limit', str(limit)],
+                                stdout=log_file, stderr=subprocess.STDOUT,
+                                cwd=os.path.dirname(os.path.abspath(__file__)), bufsize=1)
+        _PARSER_PROC[0] = proc
+        logger.info(f'🚀 Парсер запущен PID={proc.pid}, лимит={limit}, лог={log_path}')
+        def _close_log_when_done():
+            proc.wait()
+            try:
+                log_file.close()
+            except Exception:
+                pass
+        threading.Thread(target=_close_log_when_done, daemon=True).start()
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>🚀 Парсер запущен (отдельный процесс)</h1>
+            <p>PID: <b>{proc.pid}</b></p>
+            <p>Лимит: <b>{limit}</b></p>
+            <p>Лог: <code>{log_path}</code></p>
+            <a href="/admin/parser_status" class="btn">🚀 Смотреть прогресс</a>
+            <a href="/admin/stop_parser" class="btn btn-red"
+               onclick="return confirm('Остановить парсер?')">⏹ СТОП парсера</a>
+            <a href="/admin/queue" class="btn">📋 Очередь</a>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>"""
+    except Exception as e:
+        logger.exception(f'❌ Не удалось запустить парсер: {e}')
+        return BASE_STYLE + f'<div class="card"><h1>❌ Ошибка</h1><div class="error-msg">{e}</div><a href="/admin" class="btn btn-gray">← В админку</a></div>'
+
+
+@app.route('/admin/publish_one')
+@require_admin
+def admin_publish_one():
+    ads = bot_db.get_pending_ads(limit=1)
+    if not ads:
+        return BASE_STYLE + '<div class="card"><h1>⚠️ Очередь пуста</h1><a href="/admin/run_parser?limit=5" class="btn btn-green">🚀 Парсер (5)</a><a href="/admin/import_folder" class="btn btn-green">📥 Импорт папок</a><a href="/admin/queue" class="btn">📋 Очередь</a><a href="/admin" class="btn btn-gray">← В админку</a></div>'
+    ad = ads[0]
+    logger.info(f'📤 Публикация: {ad.get("folder_name")}')
+    try:
+        ok, message, post_link = publish_one_ad(ad)
+        if ok:
+            link_html = f'<p>🔗 <a href="{post_link}" target="_blank">{post_link}</a></p>' if post_link else ''
+            return BASE_STYLE + f"""
+            <div class="card">
+                <h1>✅ Опубликовано</h1>
+                <p><b>{ad.get('title', '')}</b></p>
+                <p>Категория: <code>{ad.get('category', '')}</code></p>
+                {link_html}
+                <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+                <a href="/admin/publish_one" class="btn btn-orange">📤 Опубликовать ещё 1</a>
+                <a href="/admin/queue" class="btn">📋 К очереди</a>
+                <a href="/admin/today" class="btn">📅 Опубликовано сегодня</a>
+                <a href="/admin" class="btn btn-gray">← В админку</a>
+            </div>"""
+        else:
+            bot_db.mark_ad_failed(ad['id'], message)
+            return BASE_STYLE + f"""
+            <div class="card">
+                <h1>❌ Ошибка публикации</h1>
+                <p><b>{ad.get('title', '')}</b></p>
+                <div class="error-msg">{message}</div>
+                <a href="/admin/publish_one" class="btn btn-orange">Попробовать ещё</a>
+                <a href="/admin/queue" class="btn">← К очереди</a>
+                <a href="/admin" class="btn btn-gray">← В админку</a>
+            </div>"""
+    except Exception as e:
+        logger.exception(f'❌ Ошибка публикации: {e}')
+        bot_db.mark_ad_failed(ad['id'], str(e))
+        return BASE_STYLE + f'<div class="card"><h1>❌ Ошибка</h1><div class="error-msg">{e}</div><a href="/admin" class="btn btn-gray">← В админку</a></div>'
+
+
+# ============================================================
+# СОЗДАНИЕ ВИДЕО ИЗ ФОТО (OpenCV)
+# ============================================================
+
+@app.route('/admin/make_videos')
+@require_admin
+def admin_make_videos():
+    if not VIDEO_MAKER_AVAILABLE:
+        return redirect('/admin/make_videos_status')
+
+    if video_maker_is_running():
+        return redirect('/admin/make_videos_status')
+
+    ok, message = start_video_maker()
+    if not ok:
+        return BASE_STYLE + f'<div class="card"><h1>⚠️ {message}</h1><a href="/admin/queue" class="btn">← К очереди</a></div>'
+
+    return redirect('/admin/make_videos_status')
+
+
+@app.route('/admin/make_video/<int:ad_id>')
+@require_admin
+def admin_make_video_one(ad_id):
+    if not VIDEO_MAKER_AVAILABLE:
+        return redirect('/admin/make_videos_status')
+
+    if video_maker_is_running():
+        return redirect('/admin/make_videos_status')
+
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return BASE_STYLE + '<div class="card"><h1>❌ Не найдено</h1><a href="/admin/queue" class="btn">← К очереди</a></div>'
+
+    start_video_maker(only_ids=[ad_id])
+    return redirect('/admin/make_videos_status')
+
+
+@app.route('/admin/make_videos_stop')
+@require_admin
+def admin_make_videos_stop():
+    ok = stop_video_maker()
+    if ok:
+        logger.info('⏹ Запрошена остановка video_maker')
+    return redirect('/admin/make_videos_status')
+
+
+@app.route('/admin/make_videos_status')
+@require_admin
+def admin_make_videos_status():
+    s = VIDEO_MAKER_STATUS
+    running = s.get('running', False)
+    total = s.get('total', 0)
+    done = s.get('done', 0)
+    pct = int(100 * done / total) if total else 0
+
+    if not VIDEO_MAKER_AVAILABLE:
+        err = (MOVIEPY_IMPORT_ERROR or 'video_maker недоступен').replace('<', '&lt;')
+        return BASE_STYLE + f"""
+        <div class="card">
+            <h1>❌ Сборка видео недоступна</h1>
+            <div class="error-msg">
+                <b>Причина:</b>
+                <pre style="background:#fff;padding:10px;border-radius:5px;margin-top:8px;
+                            white-space:pre-wrap;word-break:break-all;font-size:12px">{err}</pre>
+            </div>
+            <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+            <a href="/admin/diag" class="btn">🩺 Диагностика</a>
+            <a href="/admin/queue" class="btn">📋 К очереди</a>
+            <a href="/admin" class="btn btn-gray">← В админку</a>
+        </div>
+        """
+
+    status_class = 'status-on' if running else 'status-off'
+    status_text = '🟢 РАБОТАЕТ' if running else '🔴 НЕ ЗАПУЩЕНО'
+
+    progress_html = f"""
+    <div class="progress-bar">
+        <div class="progress-bar-inner" style="width:{pct}%">{pct}% ({done}/{total})</div>
+    </div>
+    """
+
+    current = s.get('current')
+    if current:
+        current_html = (
+            f"<p>📁 Сейчас: <b>#{current.get('index', '?')}</b> "
+            f"<code>{current.get('folder', '—')}</code> "
+            f"(ID {current.get('id', '—')})</p>"
+        )
+    else:
+        current_html = ""
+
+    report_html = ''
+    rep = s.get('report')
+    if rep:
+        rows = ''
+        for d in rep.get('details', []):
+            st = d.get('status', '')
+            icon = '✅' if st == 'ok' else '⏭️' if st == 'skip' else '❌'
+            color = '#28a745' if st == 'ok' else '#fd7e14' if st == 'skip' else '#dc3545'
+            reason = str(d.get('reason', '')).replace('<', '&lt;')
+            rows += (f"<tr><td style='color:{color};font-weight:bold'>{icon}</td>"
+                     f"<td>{d.get('id', '')}</td>"
+                     f"<td><code>{d.get('folder', '')}</code></td>"
+                     f"<td style='font-size:12px'>{reason}</td></tr>")
+        if not rows:
+            rows = "<tr><td colspan='4' style='text-align:center;color:#999'>Нет данных</td></tr>"
+        report_html = f"""
+        <div class="card">
+            <h2>📋 Результат</h2>
+            <div class="stats" style="margin:15px 0">
+                <div class="stat"><div>Всего</div><div class="num">{rep.get('total', 0)}</div></div>
+                <div class="stat"><div>OK</div><div class="num" style="color:#28a745">{rep.get('ok', 0)}</div></div>
+                <div class="stat"><div>Ошибок</div><div class="num" style="color:#dc3545">{rep.get('failed', 0)}</div></div>
+                <div class="stat"><div>Пропущено</div><div class="num" style="color:#fd7e14">{rep.get('skipped', 0)}</div></div>
+            </div>
+            <div style="max-height:500px;overflow-y:auto">
+                <table>
+                    <thead><tr><th>Статус</th><th>ID</th><th>Папка</th><th>Результат</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>
+        """
+
+    if running:
+        buttons = (
+            '<a href="/admin/make_videos_status" class="btn btn-gray">🔄 Обновить</a>'
+            '<a href="/admin/make_videos_stop" class="btn btn-red" '
+            'onclick="return confirm(\'Остановить сборку видео?\')">⏹ Стоп</a>'
+            '<a href="/admin/queue" class="btn">📋 К очереди</a>'
+        )
+    else:
+        buttons = (
+            '<a href="/admin/make_videos" class="btn btn-purple" '
+            'onclick="return confirm(\'Запустить сборку для всей очереди?\')">🎬 Запустить заново</a>'
+            '<a href="/admin/queue" class="btn">📋 К очереди</a>'
+            '<a href="/admin" class="btn btn-gray">← В админку</a>'
+        )
+
+    auto_refresh = '<meta http-equiv="refresh" content="3">' if running else ''
+
+    return auto_refresh + BASE_STYLE + f"""
+    <div class="card">
+        <h1>🎬 Создание видео из фото (OpenCV)</h1>
+        <p>Состояние: <span class="{status_class}">{status_text}</span></p>
+        <p>Движок: <b>{MOVIEPY_VERSION or 'OpenCV'}</b></p>
+        <p>Лог: <code>{s.get('log', '—')}</code></p>
+        {current_html}
+        {progress_html}
+        <div style="margin-top:15px">
+            {buttons}
+        </div>
+        <p class="hint">
+            Скрипт проходит по всем pending-объявлениям, собирает видео из фото
+            (zoom-эффект + размытие фона) и удаляет исходные фото.
+        </p>
+    </div>
+    {report_html}
+    """
+
+
+# ============================================================
+# ДИАГНОСТИКА
+# ============================================================
+
+@app.route('/admin/diag')
+@require_admin
+def admin_diag():
+    import traceback
+    lines = []
+
+    def add(ok, msg):
+        icon = '✅' if ok else '❌'
+        lines.append(f"{icon} {msg}")
+
+    add(True, "Flask импортирован")
+    if VIDEO_MAKER_AVAILABLE:
+        add(True, f"video_maker (OpenCV): OK, v{MOVIEPY_VERSION or '?'}")
+    else:
+        add(False, f"video_maker: НЕ УСТАНОВЛЕН — {MOVIEPY_IMPORT_ERROR}")
+    add(IMPORT_FOLDER_AVAILABLE,
+        f"import_folder: {'OK' if IMPORT_FOLDER_AVAILABLE else 'НЕТ'}")
+    add(bool(TOKEN), f"MAX TOKEN: {'есть' if TOKEN else 'НЕТ'}")
+    add(bool(ADMIN_PASS),
+        f"ADMIN_PASS: {'задан' if ADMIN_PASS else 'НЕ ЗАДАН (вход без пароля)'}")
+
+    try:
+        stats = bot_db.count_by_status()
+        add(True, f"bot_db.count_by_status(): {stats}")
+    except Exception as e:
+        add(False, f"bot_db.count_by_status(): {e}")
+
+    try:
+        sections = get_sections_from_db(bot_db)
+        add(True, f"get_sections_from_db(): {len(sections)} разделов")
+    except Exception as e:
+        add(False, f"get_sections_from_db(): {e}")
+
+    try:
+        schedule = get_schedule_from_db(bot_db)
+        add(True, f"get_schedule_from_db(): {schedule}")
+    except Exception as e:
+        add(False, f"get_schedule_from_db(): {e}")
+
+    try:
+        ap = get_autopublish_status()
+        add(True, f"get_autopublish_status(): {ap.get('status_message')}")
+    except Exception as e:
+        add(False, f"get_autopublish_status(): {e}")
+
+    try:
+        pr = parser_is_running()
+        add(True, f"parser_is_running(): {pr}")
+    except Exception as e:
+        add(False, f"parser_is_running(): {e}")
+
+    try:
+        vr = video_maker_is_running()
+        add(True, f"video_maker_is_running(): {vr}")
+    except Exception as e:
+        add(False, f"video_maker_is_running(): {e}")
+
+    admin_render_error = None
+    try:
+        with app.test_request_context('/admin'):
+            _ = admin_page.__wrapped__() if hasattr(admin_page, '__wrapped__') else admin_page()
+        add(True, "admin_page() рендерится без ошибок")
+    except Exception as e:
+        admin_render_error = traceback.format_exc()
+        add(False, f"admin_page() УПАЛ: {type(e).__name__}: {e}")
+
+    queue_render_error = None
+    try:
+        with app.test_request_context('/admin/queue'):
+            _ = admin_queue.__wrapped__() if hasattr(admin_queue, '__wrapped__') else admin_queue()
+        add(True, "admin_queue() рендерится без ошибок")
+    except Exception as e:
+        queue_render_error = traceback.format_exc()
+        add(False, f"admin_queue() УПАЛ: {type(e).__name__}: {e}")
+
+    video_status_error = None
+    try:
+        with app.test_request_context('/admin/make_videos_status'):
+            _ = admin_make_videos_status.__wrapped__() if hasattr(admin_make_videos_status, '__wrapped__') else admin_make_videos_status()
+        add(True, "admin_make_videos_status() рендерится без ошибок")
+    except Exception as e:
+        video_status_error = traceback.format_exc()
+        add(False, f"admin_make_videos_status() УПАЛ: {type(e).__name__}: {e}")
+
+    lines_html = "<br>".join(lines)
+
+    errors_html = ""
+    for name, tb in [('admin_page', admin_render_error),
+                     ('admin_queue', queue_render_error),
+                     ('admin_make_videos_status', video_status_error)]:
+        if tb:
+            errors_html += f"""
+            <div class="card">
+                <h2>❌ Traceback: {name}</h2>
+                <pre class="log">{tb}</pre>
+            </div>
+            """
+
+    return BASE_STYLE + f"""
+    <div class="card">
+        <h1>🩺 Диагностика</h1>
+        <p>Версия: <b>diag-v4</b> · {datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S МСК')}</p>
+        <p>Python: <code>{sys.version.split()[0]}</code> · PID: <code>{os.getpid()}</code></p>
+        <p>Потоков: <b>{threading.active_count()}</b></p>
+        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+        <div style="font-family:monospace;font-size:13px;line-height:1.8">{lines_html}</div>
+        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+        <a href="/admin" class="btn">← В админку</a>
+        <a href="/admin/diag" class="btn btn-gray">🔄 Обновить</a>
+        <a href="/health" class="btn">/health</a>
+    </div>
+    {errors_html}
+    """
+
+
+# ============================================================
+# Webhook MAX
+# ============================================================
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        data = request.get_json()
+        logger.info(f'📩 WEBHOOK: {data}')
+        if not data:
+            return jsonify({"ok": True}), 200
+        if data.get('update_type') == 'message_created':
+            message = data.get('message', {})
+            sender = message.get('sender', {})
+            body = message.get('body', {})
+            user_id = sender.get('user_id')
+            text = (body.get('text') or '').strip()
+            logger.info(f'📨 user_id={user_id}, text={text[:100]}')
+            if user_id and not is_allowed_user(user_id):
+                logger.warning(f'⛔ Игнор user_id={user_id}')
+                return jsonify({"ok": True}), 200
+            if user_id and text == '/start':
+                api.send_message(user_id,
+                    "🏠 **VTB Bot**\n\n"
+                    f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
+                    f"📋 **Очередь:**\n{PUBLIC_URL}/admin/queue\n\n"
+                    f"🎬 **Создание видео:**\n{PUBLIC_URL}/admin/make_videos_status\n\n"
+                    f"📥 **Импорт папок:**\n{PUBLIC_URL}/admin/import_folder\n\n"
+                    f"📅 **Опубликовано:**\n{PUBLIC_URL}/admin/today\n\n"
+                    f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
+                    f"🚀 **Статус парсера:**\n{PUBLIC_URL}/admin/parser_status\n\n"
+                    "🔒 Пароль спросит браузер.")
+                return jsonify({"ok": True}), 200
+            if user_id and text == '/status':
+                stats = bot_db.count_by_status()
+                ap_status = get_autopublish_status()
+                parser_running = parser_is_running()
+                video_running = video_maker_is_running()
+                api.send_message(user_id,
+                    f"📊 **Статус:**\n"
+                    f"⏳ В очереди: {stats.get('pending', 0)}\n"
+                    f"✅ Опубликовано: {stats.get('published', 0)}\n"
+                    f"❌ Ошибок: {stats.get('failed', 0)}\n\n"
+                    f"🕒 Автопубликация: {ap_status['status_message']}\n"
+                    f"📅 Сегодня: {ap_status['today_count']}/{ap_status['daily_limit']}\n"
+                    f"🚀 Парсер: {'🟢 РАБОТАЕТ' if parser_running else '🔴 ОСТАНОВЛЕН'}\n"
+                    f"🎬 Видео-сборка: {'🟢 РАБОТАЕТ' if video_running else '🔴 НЕ ЗАПУЩЕНО'}")
+                return jsonify({"ok": True}), 200
+            if user_id and text == '/myid':
+                api.send_message(user_id, f"Твой user_id: `{user_id}`")
+                return jsonify({"ok": True}), 200
+            if user_id and text == '/autopublish_on':
+                start_auto_publish()
+                api.send_message(user_id, "✅ Автопубликация включена")
+                return jsonify({"ok": True}), 200
+            if user_id and text == '/autopublish_off':
+                stop_auto_publish()
+                api.send_message(user_id, "🛑 Автопубликация выключена")
+                return jsonify({"ok": True}), 200
+            if user_id and text == '/stop_parser':
+                ok, message = stop_parser()
+                api.send_message(user_id, f"{'⏹' if ok else 'ℹ️'} {message}")
+                return jsonify({"ok": True}), 200
+            if user_id and text == '/make_videos':
+                if not VIDEO_MAKER_AVAILABLE:
+                    api.send_message(user_id, f"❌ Видео недоступно: {MOVIEPY_IMPORT_ERROR}")
+                    return jsonify({"ok": True}), 200
+                if video_maker_is_running():
+                    api.send_message(user_id, "ℹ️ Сборка видео уже идёт")
+                    return jsonify({"ok": True}), 200
+                start_video_maker()
+                api.send_message(user_id, "🎬 Запущена сборка видео из фото очереди")
+                return jsonify({"ok": True}), 200
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        logger.exception(f'❌ webhook: {e}')
+        return jsonify({"ok": False}), 500
+
+
+# ============================================================
+# Запуск
+# ============================================================
+
+def init_autopublish():
+    enabled = bot_db.get_setting('autopublish_enabled', '0')
+    if enabled == '1':
+        logger.info('🔁 Автопубликация была включена — запускаем поток')
+        start_auto_publish()
+    else:
+        logger.info('ℹ️ Автопубликация выключена')
+
+
+if __name__ == '__main__':
+    logger.info(f'🚀 Запуск vtb-bot на порту {PORT}')
+    logger.info(f'   TOKEN: {"✅" if TOKEN else "❌"}')
+    logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
+    logger.info(f'   ADMIN_USER: {ADMIN_USER}')
+    logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌"}')
+    logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌"}')
+    logger.info(f'   IMPORT_FOLDER: {"✅" if IMPORT_FOLDER_AVAILABLE else "❌"}')
+    logger.info(f'   VIDEO_MAKER (OpenCV): {"✅" if VIDEO_MAKER_AVAILABLE else "❌"}')
+    init_autopublish()
+    app.run(host='0.0.0.0', port=PORT, threaded=True)
