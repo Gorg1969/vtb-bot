@@ -35,13 +35,6 @@ from flask import (Flask, request, jsonify, send_file, redirect)
 # ============================================================
 # АВТОУСТАНОВКА moviepy (обходит кэш Dockerfile на Bothost)
 # ============================================================
-def _ensure_moviepy():
-    """Проверяет moviepy и ставит его через pip, если нет."""
-    try:
-        import moviepy  # noqa: F401
-        return True
-    except ImportError:
-        pass
 
     print("📦 moviepy не найден — устанавливаю через pip...")
     try:
