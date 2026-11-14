@@ -28,7 +28,7 @@ from functools import wraps
 from datetime import datetime, timedelta
 import pytz
 
-from PIL import Image  # === ДОБАВЛЕНО: ПОВОРОТ ФОТО ===
+from PIL import Image  # для поворота фото
 
 from flask import (Flask, request, jsonify, send_file, redirect)
 
@@ -39,6 +39,23 @@ from config import (TOKEN, BASE_URL, SECRET_KEY, PORT, DATA_DIR, PUBLIC_URL,
 from db import BotDB
 from sheets_client import SheetsClient
 from parser_runner import run_parser
+
+# === Создание видео из фото (moviepy) ===
+try:
+    from video_maker import (process_queue_videos, process_one_folder,
+                             MOVIEPY_AVAILABLE)
+    VIDEO_MAKER_AVAILABLE = MOVIEPY_AVAILABLE
+except ImportError as e:
+    VIDEO_MAKER_AVAILABLE = False
+    logger_init = logging.getLogger(__name__)
+    logger_init.warning(f'⚠️ video_maker недоступен: {e}')
+    def process_queue_videos(*a, **k):
+        return {'total': 0, 'ok': 0, 'failed': 1, 'skipped': 0,
+                'details': [{'id': None, 'folder': '(все)',
+                             'status': 'error',
+                             'reason': 'video_maker недоступен'}]}
+    def process_one_folder(*a, **k):
+        return False, 'video_maker недоступен'
 
 try:
     from import_folder import import_zip, IMPORT_DIR
@@ -364,7 +381,7 @@ def publish_one_ad(ad: dict) -> tuple:
     all_files = sorted(os.listdir(media_path))
     photos, videos = [], []
     for f in all_files:
-        if '.orig.' in f:  # === ДОБАВЛЕНО: не отправляем оригиналы ===
+        if '.orig.' in f:
             continue
         ext = os.path.splitext(f)[1].lower()
         if ext in IMAGE_EXTS:
@@ -628,6 +645,91 @@ def get_autopublish_status():
 
 
 # ============================================================
+# Создание видео из фото (фоновый поток + статус)
+# ============================================================
+
+VIDEO_MAKER_THREAD = [None]
+VIDEO_MAKER_STOP = [False]
+VIDEO_MAKER_STATUS = {
+    'running': False,
+    'total': 0,
+    'done': 0,
+    'ok': 0,
+    'failed': 0,
+    'current': None,
+    'log': '—',
+    'started_at': None,
+    'finished_at': None,
+    'report': None,
+}
+
+
+def video_maker_is_running() -> bool:
+    return VIDEO_MAKER_STATUS.get('running', False)
+
+
+def _video_progress_cb(state: dict):
+    VIDEO_MAKER_STATUS.update({
+        'total': state.get('total', 0),
+        'done': state.get('done', 0),
+        'ok': state.get('ok', 0),
+        'failed': state.get('failed', 0),
+        'current': state.get('current'),
+        'log': state.get('log', '—'),
+    })
+
+
+def _run_video_maker(only_ids=None):
+    try:
+        VIDEO_MAKER_STATUS.update({
+            'running': True,
+            'total': 0, 'done': 0, 'ok': 0, 'failed': 0,
+            'current': None, 'log': '▶️ Старт',
+            'started_at': datetime.now().isoformat(),
+            'finished_at': None,
+            'report': None,
+        })
+        report = process_queue_videos(
+            bot_db,
+            only_ids=only_ids,
+            stop_flag=lambda: VIDEO_MAKER_STOP[0],
+            progress_cb=_video_progress_cb,
+        )
+        VIDEO_MAKER_STATUS['report'] = report
+        VIDEO_MAKER_STATUS['log'] = (
+            f"🏁 Готово. OK: {report.get('ok', 0)}, "
+            f"ошибок: {report.get('failed', 0)}, "
+            f"пропущено: {report.get('skipped', 0)}"
+        )
+        logger.info(f'🎬 video_maker завершён: {VIDEO_MAKER_STATUS["log"]}')
+    except Exception as e:
+        logger.exception(f'❌ Ошибка video_maker: {e}')
+        VIDEO_MAKER_STATUS['log'] = f'❌ Ошибка: {e}'
+    finally:
+        VIDEO_MAKER_STATUS['running'] = False
+        VIDEO_MAKER_STATUS['finished_at'] = datetime.now().isoformat()
+        VIDEO_MAKER_THREAD[0] = None
+        VIDEO_MAKER_STOP[0] = False
+
+
+def start_video_maker(only_ids=None):
+    if video_maker_is_running():
+        return False, 'Уже запущено'
+    VIDEO_MAKER_STOP[0] = False
+    t = threading.Thread(target=_run_video_maker, args=(only_ids,), daemon=True)
+    t.start()
+    VIDEO_MAKER_THREAD[0] = t
+    return True, 'Запущено'
+
+
+def stop_video_maker():
+    if not video_maker_is_running():
+        return False
+    VIDEO_MAKER_STOP[0] = True
+    return True
+
+
+# ============================================================
 # Стили
 # ============================================================
 
@@ -642,6 +744,7 @@ BASE_STYLE = """
     .btn-orange { background: #fd7e14; }
     .btn-red { background: #dc3545; }
     .btn-gray { background: #6c757d; }
+    .btn-purple { background: #6f42c1; }
     .btn:hover { opacity: 0.9; }
     .stats { display: flex; gap: 20px; flex-wrap: wrap; }
     .stat { background: #f8f9fa; padding: 15px 20px; border-radius: 5px; }
@@ -673,7 +776,6 @@ BASE_STYLE = """
                         background: rgba(108,117,125,0.7); color: white;
                         padding: 4px 8px; border-radius: 4px; font-size: 12px;
                         font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
-    /* === ДОБАВЛЕНО: ПОВОРОТ ФОТО === */
     .photo-rotate { position: absolute; top: 8px; right: 44px;
                     background: rgba(0,123,255,0.9); color: white;
                     padding: 4px 8px; border-radius: 4px; font-size: 12px;
@@ -694,6 +796,11 @@ BASE_STYLE = """
     .period-form label { font-size: 12px; color: #666; margin-bottom: 4px; }
     .quick-links { margin: 10px 0; }
     .quick-links .btn { font-size: 13px; padding: 7px 12px; }
+    .progress-bar { width: 100%; height: 24px; background: #e9ecef; border-radius: 6px;
+                    overflow: hidden; margin: 10px 0; }
+    .progress-bar-inner { height: 100%; background: linear-gradient(90deg, #28a745, #20c997);
+                          transition: width 0.3s; color: white; text-align: center;
+                          font-size: 13px; font-weight: bold; line-height: 24px; }
 </style>
 """
 
@@ -785,6 +892,8 @@ def admin_page():
     schedule = get_schedule_from_db(bot_db)
     ap_status = get_autopublish_status()
     parser_running = parser_is_running()
+    video_running = video_maker_is_running()
+
     rows = "".join(
         f"<tr><td>{s.get('title', s['name'])}</td><td>{s['url']}</td>"
         f"<td>{s.get('key_in_title') or '—'}</td><td>{s['chat_id']}</td>"
@@ -811,12 +920,26 @@ def admin_page():
     )
     parser_stop_btn = (
         '<a href="/admin/stop_parser" class="btn btn-red" '
-        'onclick="return confirm(\'Остановить парсер? Текущая карточка будет обработана, '
-        'но новые загружаться не будут.\')">⏹ СТОП парсера</a>'
+        'onclick="return confirm(\'Остановить парсер?\')">⏹ СТОП парсера</a>'
         if parser_running else
         '<a href="/admin/run_parser?limit=300" class="btn btn-green" '
         'onclick="return confirm(\'Запустить парсер (300)?\')">🚀 Запустить парсер</a>'
     )
+
+    video_status_html = (
+        '<span class="status-on">🟢 РАБОТАЕТ</span>'
+        if video_running else
+        '<span class="status-off">🔴 НЕ ЗАПУЩЕНО</span>'
+    )
+    video_btn = (
+        '<a href="/admin/make_videos_status" class="btn btn-purple">🎬 К прогрессу</a>'
+        if video_running else
+        '<a href="/admin/make_videos" class="btn btn-purple" '
+        'onclick="return confirm(\'Собрать видео из фото для ВСЕЙ очереди? Исходные фото будут удалены.\')">🎬 Создать видео</a>'
+    )
+    if not VIDEO_MAKER_AVAILABLE:
+        video_btn = ('<a href="/admin/make_videos" class="btn btn-gray" '
+                     'title="moviepy не установлен">🎬 Создать видео (moviepy не установлен)</a>')
 
     return BASE_STYLE + f"""
     <div class="card">
@@ -829,6 +952,7 @@ def admin_page():
         <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
         <a href="/setup_webhook" class="btn btn-gray">🔄 Вебхук</a>
         {parser_stop_btn}
+        {video_btn}
     </div>
     {import_warn}
     <div class="card">
@@ -840,7 +964,6 @@ def admin_page():
             <a href="/admin/today?from={month_ago}" class="btn">📅 За 30 дней</a>
             <a href="/admin/today?all=1" class="btn btn-orange">📚 Всё время</a>
         </div>
-        <p class="hint">Можно выбрать произвольный период на странице отчёта.</p>
     </div>
     <div class="card">
         <h2>🕒 Автопубликация</h2>
@@ -849,20 +972,24 @@ def admin_page():
         <a href="/admin/toggle_autopublish" class="btn {'btn-red' if ap_status['enabled'] else 'btn-green'}" onclick="return confirm('Переключить автопубликацию?')">
             {'⏹ Выключить' if ap_status['enabled'] else '▶ Включить'}
         </a>
-        <a href="/admin" class="btn btn-gray">🔄 Обновить</a>
     </div>
     <div class="card">
-        <h2>🚀 Парсинг (дедуп ВКЛ)</h2>
+        <h2>🚀 Парсинг</h2>
         <p>Статус: {parser_status_html}</p>
         <a href="/admin/run_parser?limit=5" class="btn btn-green">Тест (5)</a>
         <a href="/admin/run_parser?limit=50" class="btn btn-green">50</a>
         <a href="/admin/run_parser?limit=300" class="btn btn-green">300</a>
         {parser_stop_btn}
-        <p class="hint">Парсер запускается в отдельном процессе.</p>
+    </div>
+    <div class="card">
+        <h2>🎬 Создание видео из фото</h2>
+        <p>Статус: {video_status_html}</p>
+        <p class="hint">Собирает zoom-видео из всех фото в папках очереди и удаляет исходные фото.</p>
+        {video_btn}
+        <a href="/admin/queue" class="btn">📋 К очереди</a>
     </div>
     <div class="card">
         <h2>📥 Импорт готовых папок</h2>
-        <p>Загрузите ZIP с одной головной папкой.</p>
         <a href="/admin/import_folder" class="btn">📥 Перейти к импорту</a>
     </div>
     <div class="card">
@@ -1061,8 +1188,7 @@ def admin_parser_status():
 
     parser_stop_btn = (
         '<a href="/admin/stop_parser" class="btn btn-red" '
-        'onclick="return confirm(\'Остановить парсер? Текущая карточка будет обработана.\')">'
-        '⏹ СТОП парсера</a>'
+        'onclick="return confirm(\'Остановить парсер?\')">⏹ СТОП парсера</a>'
         if running else
         '<a href="/admin/run_parser?limit=300" class="btn btn-green" '
         'onclick="return confirm(\'Запустить парсер (300)?\')">🚀 Запустить парсер</a>'
@@ -1134,19 +1260,11 @@ def admin_settings():
 # АДМИНКА — Отчёты по публикациям
 # ============================================================
 
-HTML_TABLE_LIMIT = 500          # сколько строк максимум в HTML
-EXCEL_EXPORT_LIMIT = 100000     # сколько строк максимум в Excel
+HTML_TABLE_LIMIT = 500
+EXCEL_EXPORT_LIMIT = 100000
 
 
 def _parse_period_from_request():
-    """
-    Возвращает (date_from, date_to, is_all_time, period_label).
-    Приоритет:
-      1) all=1 → всё время (date_from=None, date_to=None, is_all_time=True)
-      2) from/to из query-строки
-      3) по умолчанию — сегодня
-    Валидируем формат YYYY-MM-DD.
-    """
     def _valid_date(s):
         if not s:
             return None
@@ -1245,13 +1363,11 @@ def admin_today():
         <form method="GET" action="/admin/today" class="period-form">
             <div>
                 <label>С даты (МСК)</label>
-                <input type="date" name="from"
-                       value="{date_from or ''}" list="dates-list">
+                <input type="date" name="from" value="{date_from or ''}" list="dates-list">
             </div>
             <div>
                 <label>По дату (МСК)</label>
-                <input type="date" name="to"
-                       value="{date_to or ''}" list="dates-list">
+                <input type="date" name="to" value="{date_to or ''}" list="dates-list">
             </div>
             <div>
                 <button type="submit" class="btn">🔎 Показать</button>
@@ -1299,9 +1415,7 @@ def admin_today():
         }}
     </script>
     """
-
-
-@app.route('/api/today')
+    @app.route('/api/today')
 @require_admin
 def api_today():
     date_from, date_to, is_all_time, period_label = _parse_period_from_request()
@@ -1402,6 +1516,8 @@ def api_today_export():
 @require_admin
 def admin_queue():
     ads = bot_db.get_all_pending_ads()
+    video_running = video_maker_is_running()
+
     cards_html = ""
     for i, ad in enumerate(ads, 1):
         ad_id = ad['id']
@@ -1422,7 +1538,7 @@ def admin_queue():
                 files = sorted(os.listdir(media_path))
                 photos, videos = [], []
                 for f in files:
-                    if '.orig.' in f:  # === ДОБАВЛЕНО: не показываем оригиналы ===
+                    if '.orig.' in f:
                         continue
                     ext = os.path.splitext(f)[1].lower()
                     if ext in IMAGE_EXTS:
@@ -1465,6 +1581,29 @@ def admin_queue():
         down_style = 'font-size:13px;padding:6px 10px;text-align:center'
         if up_disabled: up_style += ';pointer-events:none;opacity:0.4'
         if down_disabled: down_style += ';pointer-events:none;opacity:0.4'
+
+        # === Кнопка "В видео" ===
+        if not VIDEO_MAKER_AVAILABLE:
+            make_video_btn = (
+                '<a class="btn btn-gray" '
+                'style="font-size:13px;padding:6px 10px;text-align:center" '
+                'title="moviepy не установлен">🎬 В видео (нет moviepy)</a>'
+            )
+        elif video_running:
+            make_video_btn = (
+                '<a class="btn btn-gray" '
+                'style="font-size:13px;padding:6px 10px;text-align:center" '
+                'title="Сейчас идёт сборка видео">🎬 В видео (занято)</a>'
+            )
+        else:
+            make_video_btn = (
+                f'<a href="/admin/make_video/{ad_id}" '
+                'class="btn btn-purple" '
+                'style="font-size:13px;padding:6px 10px;text-align:center" '
+                'onclick="return confirm(\'Собрать видео из фото этой папки? '
+                'Исходные фото будут удалены.\')">🎬 В видео</a>'
+            )
+
         cards_html += f'''
         <div class="card" id="ad_{ad_id}" style="padding:15px">
             <div style="display:flex;gap:15px;flex-wrap:wrap">
@@ -1487,6 +1626,7 @@ def admin_queue():
                 <div style="flex:0 0 180px;display:flex;flex-direction:column;gap:5px">
                     <a href="/admin/queue_move/{ad_id}/up" class="btn" style="{up_style}">⬆️ Вверх</a>
                     <a href="/admin/queue_move/{ad_id}/down" class="btn" style="{down_style}">⬇️ Вниз</a>
+                    {make_video_btn}
                     <a href="/admin/publish_ad/{ad_id}" class="btn btn-orange" style="font-size:13px;padding:6px 10px;text-align:center" onclick="return confirm('Опубликовать это объявление СЕЙЧАС?')">📤 Опубликовать</a>
                     <a href="/admin/queue_delete/{ad_id}" class="btn btn-red" style="font-size:13px;padding:6px 10px;text-align:center" onclick="return confirm('Удалить объявление #{i}?')">🗑️ Удалить</a>
                 </div>
@@ -1500,6 +1640,25 @@ def admin_queue():
                       '</div></div>')
     summary = bot_db.get_queue_category_summary()
     summary_html = f'<p class="hint">📊 По категориям: {" · ".join(f"<b>{cat}</b>: {cnt}" for cat, cnt in summary.items())}</p>' if summary else ''
+
+    # === Верхние кнопки видео ===
+    if not VIDEO_MAKER_AVAILABLE:
+        video_top_btn = (
+            '<a class="btn btn-gray" title="moviepy не установлен">🎬 Создать видео (нет moviepy)</a>'
+        )
+    elif video_running:
+        video_top_btn = (
+            '<a href="/admin/make_videos_status" class="btn btn-purple">🎬 К прогрессу</a>'
+            '<a href="/admin/make_videos_stop" class="btn btn-red" '
+            'onclick="return confirm(\'Остановить сборку видео?\')">⏹ Стоп видео</a>'
+        )
+    else:
+        video_top_btn = (
+            '<a href="/admin/make_videos" class="btn btn-purple" '
+            'onclick="return confirm(\'Собрать видео из фото ВСЕЙ очереди? '
+            'Исходные фото будут удалены.\')">🎬 Создать видео</a>'
+        )
+
     return BASE_STYLE + f"""
     <div class="card">
         <h1>📋 Очередь на публикацию ({len(ads)})</h1>
@@ -1510,6 +1669,7 @@ def admin_queue():
         <a href="/admin/queue_resort" class="btn" onclick="return confirm('Пересчитать порядок: перемешать категории?')">🔀 Перемешать по категориям</a>
         <a href="/admin/import_folder" class="btn btn-green">📥 Импорт папок</a>
         <a href="/admin/parser_status" class="btn">🚀 Статус парсера</a>
+        {video_top_btn}
         <a href="/admin/queue_clear" class="btn btn-red" onclick="return confirm('Удалить ВСЮ очередь и все папки?')">🗑️ Очистить всю очередь</a>
     </div>
     {cards_html}
@@ -1541,7 +1701,6 @@ def admin_queue_photo_delete(ad_id, filename):
     ok, message, remaining = bot_db.delete_ad_photo(ad_id, filename, keep_min=1)
     if ok:
         logger.info(f'🗑️ Файл удалён: {filename} (осталось {remaining})')
-        # === ДОБАВЛЕНО: удаляем и .orig-файл, если он есть ===
         try:
             ad = bot_db.get_ad_by_id(ad_id)
             if ad and ad.get('media_path'):
@@ -1642,7 +1801,7 @@ def admin_ad_detail(ad_id):
             files = sorted(os.listdir(media_path))
             photos, videos = [], []
             for f in files:
-                if '.orig.' in f:  # === ДОБАВЛЕНО: не показываем оригиналы ===
+                if '.orig.' in f:
                     continue
                 ext = os.path.splitext(f)[1].lower()
                 if ext in IMAGE_EXTS:
@@ -1657,7 +1816,6 @@ def admin_ad_detail(ad_id):
                 badge = f'<a href="/admin/queue_photo_delete/{ad_id}/{vf}" class="photo-del" onclick="return confirm(\'Удалить это видео?\')" title="Удалить видео">🗑️</a>' if can_delete else '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
                 photos_html += f'<div class="photo-wrap"><video src="/admin/queue_photo/{ad_id}/{vf}" controls style="width:400px;height:auto;border-radius:6px;display:block"></video>{badge}</div>'
             for pf in photos:
-                # === ДОБАВЛЕНО: кнопки поворота и сброса ===
                 rotate_btn = (
                     f'<a href="/admin/queue_photo_rotate/{ad_id}/{pf}" '
                     f'class="photo-rotate" '
@@ -1688,10 +1846,23 @@ def admin_ad_detail(ad_id):
                 )
         except Exception as e:
             photos_html = f'<p style="color:red">Ошибка: {e}</p>'
+
+    if not VIDEO_MAKER_AVAILABLE:
+        make_video_btn = '<a class="btn btn-gray" title="moviepy не установлен">🎬 В видео (нет moviepy)</a>'
+    elif video_maker_is_running():
+        make_video_btn = '<a class="btn btn-gray" title="Сейчас идёт сборка видео">🎬 В видео (занято)</a>'
+    else:
+        make_video_btn = (
+            f'<a href="/admin/make_video/{ad_id}" class="btn btn-purple" '
+            'onclick="return confirm(\'Собрать видео из фото этой папки? '
+            'Исходные фото будут удалены.\')">🎬 В видео</a>'
+        )
+
     return BASE_STYLE + f"""
     <div class="card">
         <h1>👁️ Предпросмотр #{ad_id}</h1>
         <a href="/admin/queue" class="btn">← К очереди</a>
+        {make_video_btn}
         <a href="/admin/publish_ad/{ad_id}" class="btn btn-orange" onclick="return confirm('Опубликовать сейчас?')">📤 Опубликовать сейчас</a>
         <a href="/admin/queue_delete/{ad_id}" class="btn btn-red" onclick="return confirm('Удалить всё объявление?')">🗑️ Удалить всё</a>
     </div>
@@ -1725,17 +1896,10 @@ def admin_ad_detail(ad_id):
 
 
 # ============================================================
-# ПОВОРОТ ФОТО (роуты + утилита)
+# ПОВОРОТ ФОТО
 # ============================================================
 
 def _rotate_image_file(file_path: str, angle: float = 45.0) -> bool:
-    """
-    Поворачивает изображение на angle градусов по часовой стрелке,
-    расширяя холст, чтобы углы не обрезались. Фон — белый (для JPEG).
-    Исходник при первом повороте сохраняется в <name>.orig<ext>,
-    чтобы можно было откатиться.
-    Возвращает True при успехе.
-    """
     try:
         base, ext = os.path.splitext(file_path)
         orig_path = base + '.orig' + ext
@@ -1756,7 +1920,6 @@ def _rotate_image_file(file_path: str, angle: float = 45.0) -> bool:
         elif img.mode != 'RGB':
             img = img.convert('RGB')
 
-        # PIL rotate — против часовой; для «по часовой» берём -angle.
         rotated = img.rotate(-angle, expand=True, resample=Image.BICUBIC,
                              fillcolor=(255, 255, 255))
         rotated.save(file_path, 'JPEG', quality=90, optimize=True)
@@ -1773,7 +1936,6 @@ def _rotate_image_file(file_path: str, angle: float = 45.0) -> bool:
 @app.route('/admin/queue_photo_rotate/<int:ad_id>/<path:filename>')
 @require_admin
 def admin_queue_photo_rotate(ad_id, filename):
-    """Поворачивает фото на 45° по часовой стрелке."""
     ad = bot_db.get_ad_by_id(ad_id)
     if not ad:
         return 'Not found', 404
@@ -1785,7 +1947,6 @@ def admin_queue_photo_rotate(ad_id, filename):
     file_path = os.path.join(media_path, safe_name)
     if not os.path.exists(file_path):
         return 'Not found', 404
-
     if '.orig.' in safe_name:
         return 'Cannot rotate original', 400
 
@@ -1801,7 +1962,6 @@ def admin_queue_photo_rotate(ad_id, filename):
 @app.route('/admin/queue_photo_reset/<int:ad_id>/<path:filename>')
 @require_admin
 def admin_queue_photo_reset(ad_id, filename):
-    """Возвращает фото к исходному состоянию (если был поворот)."""
     ad = bot_db.get_ad_by_id(ad_id)
     if not ad:
         return 'Not found', 404
@@ -1834,6 +1994,10 @@ def admin_queue_photo_reset(ad_id, filename):
         return redirect(f'/admin/ad_detail/{ad_id}')
     return redirect('/admin/queue')
 
+
+# ============================================================
+# ПУБЛИКАЦИЯ, ОЧИСТКА
+# ============================================================
 
 @app.route('/admin/publish_ad/<int:ad_id>')
 @require_admin
@@ -1991,10 +2155,6 @@ def parser_is_running() -> bool:
 
 
 def stop_parser() -> tuple:
-    """
-    Останавливает парсер, если он запущен.
-    Возвращает (ok: bool, message: str).
-    """
     proc = _PARSER_PROC[0]
     if proc is None or proc.poll() is not None:
         _PARSER_PROC[0] = None
@@ -2125,6 +2285,165 @@ def admin_publish_one():
 
 
 # ============================================================
+# СОЗДАНИЕ ВИДЕО ИЗ ФОТО
+# ============================================================
+
+@app.route('/admin/make_videos')
+@require_admin
+def admin_make_videos():
+    if not VIDEO_MAKER_AVAILABLE:
+        return BASE_STYLE + """
+        <div class="card">
+            <h1>❌ moviepy не установлен</h1>
+            <div class="error-msg">
+                Установите пакет: <code>pip install moviepy imageio-ffmpeg</code><br>
+                или добавьте в <code>requirements.txt</code>:
+                <pre>moviepy==1.0.3
+imageio==2.31.6
+imageio-ffmpeg==0.4.9</pre>
+            </div>
+            <a href="/admin/queue" class="btn">← К очереди</a>
+        </div>"""
+
+    if video_maker_is_running():
+        return redirect('/admin/make_videos_status')
+
+    ok, message = start_video_maker()
+    if not ok:
+        return BASE_STYLE + f'<div class="card"><h1>⚠️ {message}</h1><a href="/admin/queue" class="btn">← К очереди</a></div>'
+
+    return redirect('/admin/make_videos_status')
+
+
+@app.route('/admin/make_video/<int:ad_id>')
+@require_admin
+def admin_make_video_one(ad_id):
+    if not VIDEO_MAKER_AVAILABLE:
+        return redirect('/admin/queue')
+
+    if video_maker_is_running():
+        return redirect('/admin/make_videos_status')
+
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return BASE_STYLE + '<div class="card"><h1>❌ Не найдено</h1><a href="/admin/queue" class="btn">← К очереди</a></div>'
+
+    start_video_maker(only_ids=[ad_id])
+    return redirect('/admin/make_videos_status')
+
+
+@app.route('/admin/make_videos_stop')
+@require_admin
+def admin_make_videos_stop():
+    ok = stop_video_maker()
+    if ok:
+        logger.info('⏹ Запрошена остановка video_maker')
+    return redirect('/admin/make_videos_status')
+
+
+@app.route('/admin/make_videos_status')
+@require_admin
+def admin_make_videos_status():
+    s = VIDEO_MAKER_STATUS
+    running = s.get('running', False)
+    total = s.get('total', 0)
+    done = s.get('done', 0)
+    pct = int(100 * done / total) if total else 0
+
+    status_class = 'status-on' if running else 'status-off'
+    status_text = '🟢 РАБОТАЕТ' if running else '🔴 НЕ ЗАПУЩЕНО'
+
+    # === Прогресс-бар ===
+    progress_html = f"""
+    <div class="progress-bar">
+        <div class="progress-bar-inner" style="width:{pct}%">{pct}% ({done}/{total})</div>
+    </div>
+    """
+
+    # === Текущее объявление ===
+    current = s.get('current')
+    if current:
+        current_html = (
+            f"<p>📁 Сейчас: <b>#{current.get('index', '?')}</b> "
+            f"<code>{current.get('folder', '—')}</code> "
+            f"(ID {current.get('id', '—')})</p>"
+        )
+    else:
+        current_html = ""
+
+    # === Таблица отчёта ===
+    report_html = ''
+    rep = s.get('report')
+    if rep:
+        rows = ''
+        for d in rep.get('details', []):
+            st = d.get('status', '')
+            icon = '✅' if st == 'ok' else '⏭️' if st == 'skip' else '❌'
+            color = '#28a745' if st == 'ok' else '#fd7e14' if st == 'skip' else '#dc3545'
+            rows += (f"<tr><td style='color:{color};font-weight:bold'>{icon}</td>"
+                     f"<td>{d.get('id', '')}</td>"
+                     f"<td><code>{d.get('folder', '')}</code></td>"
+                     f"<td style='font-size:12px'>{d.get('reason', '')}</td></tr>")
+        if not rows:
+            rows = "<tr><td colspan='4' style='text-align:center;color:#999'>Нет данных</td></tr>"
+        report_html = f"""
+        <div class="card">
+            <h2>📋 Результат</h2>
+            <div class="stats" style="margin:15px 0">
+                <div class="stat"><div>Всего</div><div class="num">{rep.get('total', 0)}</div></div>
+                <div class="stat"><div>OK</div><div class="num" style="color:#28a745">{rep.get('ok', 0)}</div></div>
+                <div class="stat"><div>Ошибок</div><div class="num" style="color:#dc3545">{rep.get('failed', 0)}</div></div>
+                <div class="stat"><div>Пропущено</div><div class="num" style="color:#fd7e14">{rep.get('skipped', 0)}</div></div>
+            </div>
+            <div style="max-height:500px;overflow-y:auto">
+                <table>
+                    <thead><tr><th>Статус</th><th>ID</th><th>Папка</th><th>Результат</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>
+        """
+
+    # === Кнопки ===
+    if running:
+        buttons = (
+            '<a href="/admin/make_videos_status" class="btn btn-gray">🔄 Обновить</a>'
+            '<a href="/admin/make_videos_stop" class="btn btn-red" '
+            'onclick="return confirm(\'Остановить сборку видео?\')">⏹ Стоп</a>'
+            '<a href="/admin/queue" class="btn">📋 К очереди</a>'
+        )
+    else:
+        buttons = (
+            '<a href="/admin/make_videos" class="btn btn-purple" '
+            'onclick="return confirm(\'Запустить сборку для всей очереди?\')">🎬 Запустить заново</a>'
+            '<a href="/admin/queue" class="btn">📋 К очереди</a>'
+            '<a href="/admin" class="btn btn-gray">← В админку</a>'
+        )
+
+    # === Автообновление страницы, пока идёт сборка ===
+    auto_refresh = '<meta http-equiv="refresh" content="3">' if running else ''
+
+    return auto_refresh + BASE_STYLE + f"""
+    <div class="card">
+        <h1>🎬 Создание видео из фото</h1>
+        <p>Состояние: <span class="{status_class}">{status_text}</span></p>
+        <p>Лог: <code>{s.get('log', '—')}</code></p>
+        {current_html}
+        {progress_html}
+        <div style="margin-top:15px">
+            {buttons}
+        </div>
+        <p class="hint">
+            Скрипт проходит по всем pending-объявлениям, собирает видео из фото
+            (zoom-эффект + размытие фона + сжатие до 2.5 МБ) и удаляет исходные фото.
+            После этого объявление готово к публикации как видео-пост.
+        </p>
+    </div>
+    {report_html}
+    """
+
+
+# ============================================================
 # Webhook MAX
 # ============================================================
 
@@ -2150,6 +2469,7 @@ def webhook():
                     "🏠 **VTB Bot**\n\n"
                     f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
                     f"📋 **Очередь:**\n{PUBLIC_URL}/admin/queue\n\n"
+                    f"🎬 **Создание видео:**\n{PUBLIC_URL}/admin/make_videos_status\n\n"
                     f"📥 **Импорт папок:**\n{PUBLIC_URL}/admin/import_folder\n\n"
                     f"📅 **Опубликовано:**\n{PUBLIC_URL}/admin/today\n\n"
                     f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
@@ -2160,6 +2480,7 @@ def webhook():
                 stats = bot_db.count_by_status()
                 ap_status = get_autopublish_status()
                 parser_running = parser_is_running()
+                video_running = video_maker_is_running()
                 api.send_message(user_id,
                     f"📊 **Статус:**\n"
                     f"⏳ В очереди: {stats.get('pending', 0)}\n"
@@ -2167,7 +2488,8 @@ def webhook():
                     f"❌ Ошибок: {stats.get('failed', 0)}\n\n"
                     f"🕒 Автопубликация: {ap_status['status_message']}\n"
                     f"📅 Сегодня: {ap_status['today_count']}/{ap_status['daily_limit']}\n"
-                    f"🚀 Парсер: {'🟢 РАБОТАЕТ' if parser_running else '🔴 ОСТАНОВЛЕН'}")
+                    f"🚀 Парсер: {'🟢 РАБОТАЕТ' if parser_running else '🔴 ОСТАНОВЛЕН'}\n"
+                    f"🎬 Видео-сборка: {'🟢 РАБОТАЕТ' if video_running else '🔴 НЕ ЗАПУЩЕНО'}")
                 return jsonify({"ok": True}), 200
             if user_id and text == '/myid':
                 api.send_message(user_id, f"Твой user_id: `{user_id}`")
@@ -2183,6 +2505,16 @@ def webhook():
             if user_id and text == '/stop_parser':
                 ok, message = stop_parser()
                 api.send_message(user_id, f"{'⏹' if ok else 'ℹ️'} {message}")
+                return jsonify({"ok": True}), 200
+            if user_id and text == '/make_videos':
+                if not VIDEO_MAKER_AVAILABLE:
+                    api.send_message(user_id, "❌ moviepy не установлен")
+                    return jsonify({"ok": True}), 200
+                if video_maker_is_running():
+                    api.send_message(user_id, "ℹ️ Сборка видео уже идёт")
+                    return jsonify({"ok": True}), 200
+                start_video_maker()
+                api.send_message(user_id, "🎬 Запущена сборка видео из фото очереди")
                 return jsonify({"ok": True}), 200
         return jsonify({"ok": True}), 200
     except Exception as e:
@@ -2211,5 +2543,6 @@ if __name__ == '__main__':
     logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌"}')
     logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌"}')
     logger.info(f'   IMPORT_FOLDER: {"✅" if IMPORT_FOLDER_AVAILABLE else "❌"}')
+    logger.info(f'   VIDEO_MAKER (moviepy): {"✅" if VIDEO_MAKER_AVAILABLE else "❌"}')
     init_autopublish()
     app.run(host='0.0.0.0', port=PORT, threaded=True)
