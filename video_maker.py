@@ -1,13 +1,12 @@
 # video_maker.py
 # ============================================================
-# Серверная сборка видео из фото папки (адаптация reels_maker.py).
+# Серверная сборка видео из фото папки.
 #
 # - Работает без GUI.
-# - Использует moviepy + СИСТЕМНЫЙ ffmpeg (FFMPEG_BINARY=/usr/bin/ffmpeg).
-# - imageio-ffmpeg НЕ используется (на Bothost падает с execstack).
+# - Использует moviepy + системный ffmpeg (FFMPEG_BINARY=/usr/bin/ffmpeg).
+# - Безопасный импорт размытия (gaussian_blur / blur / fallback).
 # - Zoom-эффект + размытие фона + опционально логотип/музыка/сжатие.
-# - После успешной сборки УДАЛЯЕТ исходные фото из папки.
-# - Возвращает отчёт для админки.
+# - После сборки удаляет исходные фото.
 # ============================================================
 
 import os
@@ -19,23 +18,19 @@ from typing import Optional, Dict, List, Tuple, Callable
 
 logger = logging.getLogger(__name__)
 
-# === Ленивый импорт moviepy (чтобы app.py не падал, если пакета нет) ===
+os.environ.setdefault('FFMPEG_BINARY', '/usr/bin/ffmpeg')
+os.environ.setdefault('IMAGEIO_FFMPEG_EXE', '/usr/bin/ffmpeg')
+
 MOVIEPY_AVAILABLE = False
 MOVIEPY_IMPORT_ERROR = None
 MOVIEPY_VERSION = None
-
-# === Принудительно используем системный ffmpeg ===
-# imageio-ffmpeg (который тянет свой бинарник) на Bothost падает с execstack.
-# Через переменную окружения FFMPEG_BINARY moviepy будет искать системный ffmpeg.
-os.environ.setdefault('FFMPEG_BINARY', '/usr/bin/ffmpeg')
-os.environ.setdefault('IMAGEIO_FFMPEG_EXE', '/usr/bin/ffmpeg')
+BLUR_FX = None
 
 try:
     from moviepy.editor import (
         ImageClip, AudioFileClip, CompositeVideoClip,
         concatenate_videoclips, VideoFileClip,
     )
-    from moviepy.video.fx.all import gaussian_blur
     MOVIEPY_AVAILABLE = True
     try:
         import moviepy
@@ -45,14 +40,35 @@ try:
     logger.info(f'✅ moviepy загружен (v{MOVIEPY_VERSION})')
 except Exception as e:
     MOVIEPY_IMPORT_ERROR = f"{type(e).__name__}: {e}"
-    logger.warning(f'⚠️ moviepy недоступен: {MOVIEPY_IMPORT_ERROR}. Кнопка «Создать видео» не будет работать.')
+    logger.warning(f'⚠️ moviepy недоступен: {MOVIEPY_IMPORT_ERROR}')
     logger.debug(traceback.format_exc())
+
+# === Безопасный импорт размытия (разные версии moviepy) ===
+if MOVIEPY_AVAILABLE:
+    try:
+        from moviepy.video.fx import gaussian_blur
+        BLUR_FX = gaussian_blur
+    except ImportError:
+        try:
+            from moviepy.video.fx.all import gaussian_blur
+            BLUR_FX = gaussian_blur
+        except ImportError:
+            try:
+                from moviepy.video.fx import blur
+                BLUR_FX = blur
+            except ImportError:
+                try:
+                    from moviepy.video.fx.all import blur
+                    BLUR_FX = blur
+                except ImportError:
+                    BLUR_FX = None
+                    logger.warning('⚠️ Не удалось импортировать размытие, будет использован простой ресайз')
 
 from PIL import Image
 
 
 # ============================================================
-# Настройки по умолчанию
+# Настройки
 # ============================================================
 
 DEFAULT_DURATION = 3.0
@@ -63,14 +79,9 @@ DEFAULT_MAX_DIMENSION = 1280
 DEFAULT_TARGET_SIZE = (1080, 1920)
 DEFAULT_BLUR_RADIUS = 30
 DEFAULT_OUTPUT_NAME = 'video_ad.mp4'
-QUALITY_PRESET = 'Сбалансированное'
 
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
 
-
-# ============================================================
-# Утилиты
-# ============================================================
 
 def _list_photos(folder: str) -> List[str]:
     photos = []
@@ -151,14 +162,17 @@ def _get_video_size(folder: str, images: List[str],
 
 
 def _apply_blur(clip, radius: int = DEFAULT_BLUR_RADIUS):
-    try:
-        return clip.fx(gaussian_blur, radius)
-    except Exception:
+    """Безопасное размытие: BLUR_FX или fallback через resize."""
+    if BLUR_FX is not None:
         try:
-            small = clip.resize(newsize=(max(2, clip.w // 10), max(2, clip.h // 10)))
-            return small.resize(newsize=(clip.w, clip.h))
-        except Exception:
-            return clip
+            return clip.fx(BLUR_FX, radius)
+        except Exception as e:
+            logger.warning(f'⚠️ BLUR_FX не сработал: {e}')
+    try:
+        small = clip.resize(newsize=(max(2, clip.w // 10), max(2, clip.h // 10)))
+        return small.resize(newsize=(clip.w, clip.h))
+    except Exception:
+        return clip
 
 
 def _resize_with_blur(clip, target_size: Tuple[int, int],
@@ -279,7 +293,7 @@ def process_one_folder(
     if len(photos) < 1:
         return False, 'Нет фото в папке'
     if len(photos) == 1:
-        progress_cb(f'  ⚠️ Только 1 фото — сделаю «видео» из одного кадра')
+        progress_cb('  ⚠️ Только 1 фото — сделаю «видео» из одного кадра')
 
     progress_cb(f'  📸 Фото: {len(photos)}')
 
