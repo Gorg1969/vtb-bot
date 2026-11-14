@@ -23,9 +23,10 @@ opencv-python-headless==4.8.1.78
 numpy==1.26.3
 
 # === Создание видео из фото (moviepy) ===
+# ВАЖНО: imageio-ffmpeg НЕ ставим — на Bothost он падает с execstack.
+# Используем системный ffmpeg (см. Dockerfile) через FFMPEG_BINARY.
 moviepy==1.0.3
 imageio==2.31.6
-imageio-ffmpeg==0.4.9
 
 # ============================================================
 # ВНИМАНИЕ: onnxruntime УДАЛЁН, потому что падает в Bothost
