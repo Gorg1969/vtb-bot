@@ -787,8 +787,6 @@ BASE_STYLE = """
                    text-decoration: none; cursor: pointer; font-weight: bold;
                    box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
     .photo-reset:hover { background: #6c757d; color: white; }
-    /* Кнопки перемещения фото — по бокам от фото, крупные */
-    .photo-nav-wrap { display: flex; align-items: center; justify-content: center; margin: 8px 0; }
     .photo-nav-btn {
         font-size: 20px;
         padding: 8px 14px;
@@ -801,6 +799,7 @@ BASE_STYLE = """
         box-shadow: 0 2px 4px rgba(0,0,0,0.2);
         min-width: 44px;
         text-align: center;
+        display: inline-block;
     }
     .photo-nav-btn:hover { background: #0056b3; }
     .photo-nav-disabled {
@@ -812,8 +811,8 @@ BASE_STYLE = """
         font-weight: bold;
         min-width: 44px;
         text-align: center;
+        display: inline-block;
     }
-    .photo-nav-center { margin: 0 10px; }
     .photo-outer { display: inline-block; margin: 10px; vertical-align: top; }
     .file-drop { border: 2px dashed #007bff; border-radius: 8px; padding: 30px;
                  text-align: center; background: #f8f9fa; margin: 15px 0; cursor: pointer; }
@@ -1860,6 +1859,7 @@ def admin_ad_detail(ad_id):
     photos_html = ''
     photos_count = 0
     videos_count = 0
+    video_files = []
     can_delete = False
     if media_path and os.path.exists(media_path):
         info_path = os.path.join(media_path, 'info.txt')
@@ -1882,6 +1882,7 @@ def admin_ad_detail(ad_id):
                     videos.append(f)
             photos_count = len(photos)
             videos_count = len(videos)
+            video_files = videos
             total_media = photos_count + videos_count
             can_delete = (total_media > 1)
             for vf in videos:
@@ -1889,7 +1890,6 @@ def admin_ad_detail(ad_id):
                 photos_html += f'<div class="photo-wrap"><video src="/admin/queue_photo/{ad_id}/{vf}" controls style="width:400px;height:auto;border-radius:6px;display:block"></video>{badge}</div>'
 
             for idx, pf in enumerate(photos):
-                # Кнопки перемещения СЛЕВА и СПРАВА от фото
                 if idx > 0:
                     move_left_btn = (
                         f'<a href="/admin/queue_photo_move/{ad_id}/{pf}/left" '
@@ -1930,8 +1930,6 @@ def admin_ad_detail(ad_id):
                     if can_delete else
                     '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
                 )
-
-                # Оборачиваем фото в контейнер с кнопками слева и справа
                 photos_html += (
                     f'<div class="photo-outer">'
                     f'<div style="display:flex;align-items:center;justify-content:center;">'
@@ -1964,6 +1962,36 @@ def admin_ad_detail(ad_id):
             'Исходные фото будут удалены.\')">🎬 В видео</a>'
         )
 
+    # === Предпросмотр видео ===
+    video_preview_html = ''
+    if video_files:
+        vf = video_files[0]
+        video_url = f'/admin/queue_photo/{ad_id}/{vf}'
+        gif_path = os.path.join(media_path, 'preview.gif')
+        gif_url = f'/admin/queue_photo/{ad_id}/preview.gif' if os.path.exists(gif_path) else None
+
+        gif_block = ''
+        if gif_url:
+            gif_block = f'''
+            <p class="hint" style="margin-top:15px">🎞️ <b>GIF-превью (первые секунды):</b></p>
+            <img src="{gif_url}" style="max-width:100%;border-radius:8px;border:1px solid #ddd" alt="preview">
+            '''
+
+        video_preview_html = f'''
+        <div class="card" style="border-left:4px solid #6f42c1">
+            <h2>🎬 Видео-пост ({vf})</h2>
+            <p class="hint">Если плеер ниже не работает — используйте GIF-превью или скачайте файл.</p>
+            <video controls preload="metadata" style="width:100%;max-width:500px;border-radius:8px;background:#000">
+                <source src="{video_url}" type="video/mp4">
+                Ваш браузер не поддерживает воспроизведение этого видео.
+            </video>
+            <p style="margin-top:12px">
+                <a href="{video_url}" class="btn btn-green" download>📥 Скачать {vf}</a>
+            </p>
+            {gif_block}
+        </div>
+        '''
+
     return BASE_STYLE + f"""
     <div class="card">
         <h1>👁️ Предпросмотр #{ad_id}</h1>
@@ -1972,8 +2000,9 @@ def admin_ad_detail(ad_id):
         <a href="/admin/publish_ad/{ad_id}" class="btn btn-orange" onclick="return confirm('Опубликовать сейчас?')">📤 Опубликовать сейчас</a>
         <a href="/admin/queue_delete/{ad_id}" class="btn btn-red" onclick="return confirm('Удалить всё объявление?')">🗑️ Удалить всё</a>
     </div>
+    {video_preview_html}
     <div class="card">
-        <h2>🎬 Медиа (фото: {photos_count}, видео: {videos_count})</h2>
+        <h2>📷 Медиа (фото: {photos_count}, видео: {videos_count})</h2>
         <p class="hint">
             ⬅️ / ➡️ — переместить фото влево/вправо (порядок в видео)<br>
             🔄 — повернуть на 45° · ↩️ — сбросить поворот · 🗑️ — удалить
@@ -2726,7 +2755,7 @@ def admin_diag():
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🩺 Диагностика</h1>
-        <p>Версия: <b>diag-v6</b> · {datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S МСК')}</p>
+        <p>Версия: <b>diag-v7</b> · {datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S МСК')}</p>
         <p>Python: <code>{sys.version.split()[0]}</code> · PID: <code>{os.getpid()}</code></p>
         <p>Потоков: <b>{threading.active_count()}</b></p>
         <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
