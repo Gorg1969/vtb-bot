@@ -4,6 +4,7 @@
 # - НЕ требует moviepy.
 # - НЕ требует ffmpeg.
 # - Работает на любом сервере, где есть opencv-python-headless.
+# - Фото заполняют весь кадр (crop-to-fill), с зум-эффектом.
 # ============================================================
 
 import os
@@ -40,25 +41,23 @@ def _list_photos(folder: str) -> List[str]:
     return photos
 
 
-def _resize_with_blur_cv2(img, target_size: Tuple[int, int]) -> np.ndarray:
-    """Масштабирует фото с сохранением пропорций и размытым фоном."""
+def _resize_cover_cv2(img, target_size: Tuple[int, int]) -> np.ndarray:
+    """
+    Масштабирует фото так, чтобы оно ЗАПОЛНИЛО весь кадр (crop-to-fill).
+    Лишнее обрезается по краям. Без размытого фона.
+    """
     tw, th = target_size
     h, w = img.shape[:2]
 
-    # Размытый фон
-    bg = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LINEAR)
-    bg = cv2.GaussianBlur(bg, (51, 51), 0)
-
-    # Основное фото
-    scale = min(tw / w, th / h)
+    # Масштаб, при котором фото точно покрывает целевой прямоугольник
+    scale = max(tw / w, th / h)
     nw, nh = int(w * scale), int(h * scale)
     resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
 
-    # Накладываем по центру
-    x_offset = (tw - nw) // 2
-    y_offset = (th - nh) // 2
-    bg[y_offset:y_offset+nh, x_offset:x_offset+nw] = resized
-    return bg
+    # Центральный кроп до целевого размера
+    x_offset = (nw - tw) // 2
+    y_offset = (nh - th) // 2
+    return resized[y_offset:y_offset+th, x_offset:x_offset+tw]
 
 
 def _apply_kenburns_cv2(img, frames: int, zoom_factor: float = 1.08):
@@ -130,7 +129,8 @@ def process_one_folder(
                 progress_cb(f'  ⚠️ Не прочитать: {os.path.basename(path)}')
                 continue
 
-            base_img = _resize_with_blur_cv2(img, (tw, th))
+            # Заполняем кадр целиком (crop-to-fill), без размытого фона
+            base_img = _resize_cover_cv2(img, (tw, th))
 
             # Zoom-in
             for frame in _apply_kenburns_cv2(base_img, frames_per_photo, zoom_factor=1.08):
@@ -141,7 +141,7 @@ def process_one_folder(
             if i < len(photos) - 1:
                 next_img = cv2.imread(photos[i + 1])
                 if next_img is not None:
-                    next_base = _resize_with_blur_cv2(next_img, (tw, th))
+                    next_base = _resize_cover_cv2(next_img, (tw, th))
                     trans_frames = int(kwargs.get('transition', 0.5) * fps)
                     for j in range(trans_frames):
                         alpha = j / max(1, trans_frames - 1)
