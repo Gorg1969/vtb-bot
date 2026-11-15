@@ -3,8 +3,8 @@
 # Сборка видео из фото через OpenCV (cv2.VideoWriter).
 # - НЕ требует moviepy.
 # - НЕ требует ffmpeg.
-# - Работает на любом сервере, где есть opencv-python-headless.
-# - Фото заполняют весь кадр (crop-to-fill), с зум-эффектом.
+# - Фото заполняют весь кадр (crop-to-fill), без размытия.
+# - Пишет в MP4 (mp4v). Для предпросмотра создаёт GIF первых секунд.
 # ============================================================
 
 import os
@@ -49,12 +49,10 @@ def _resize_cover_cv2(img, target_size: Tuple[int, int]) -> np.ndarray:
     tw, th = target_size
     h, w = img.shape[:2]
 
-    # Масштаб, при котором фото точно покрывает целевой прямоугольник
     scale = max(tw / w, th / h)
     nw, nh = int(w * scale), int(h * scale)
     resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
 
-    # Центральный кроп до целевого размера
     x_offset = (nw - tw) // 2
     y_offset = (nh - th) // 2
     return resized[y_offset:y_offset+th, x_offset:x_offset+tw]
@@ -123,19 +121,23 @@ def process_one_folder(
     try:
         progress_cb(f'  💾 Рендер {len(photos)} фото ({total_frames} кадров) → {os.path.basename(output_path)}')
         processed = 0
+        preview_frames = []  # первые 3 секунды для GIF-превью
+
         for i, path in enumerate(photos):
             img = cv2.imread(path)
             if img is None:
                 progress_cb(f'  ⚠️ Не прочитать: {os.path.basename(path)}')
                 continue
 
-            # Заполняем кадр целиком (crop-to-fill), без размытого фона
             base_img = _resize_cover_cv2(img, (tw, th))
 
             # Zoom-in
             for frame in _apply_kenburns_cv2(base_img, frames_per_photo, zoom_factor=1.08):
                 out.write(frame)
                 processed += 1
+                if len(preview_frames) < fps * 3:  # первые 3 секунды
+                    small = cv2.resize(frame, (tw // 4, th // 4))
+                    preview_frames.append(small)
 
             # Плавный переход (fade) в конце фото (кроме последнего)
             if i < len(photos) - 1:
@@ -148,6 +150,9 @@ def process_one_folder(
                         blended = cv2.addWeighted(base_img, 1 - alpha, next_base, alpha, 0)
                         out.write(blended)
                         processed += 1
+                        if len(preview_frames) < fps * 3:
+                            small = cv2.resize(blended, (tw // 4, th // 4))
+                            preview_frames.append(small)
 
             if (i + 1) % 5 == 0:
                 progress_cb(f'  ⏳ Обработано {i + 1}/{len(photos)} фото')
@@ -162,6 +167,26 @@ def process_one_folder(
         if os.path.exists(output_path):
             os.remove(output_path)
         os.rename(tmp_video_path, output_path)
+
+        # === Генерируем GIF-превью (первые 3 сек) ===
+        preview_path = os.path.join(folder_path, 'preview.gif')
+        try:
+            if preview_frames:
+                gif_frames = []
+                for frame in preview_frames[:int(fps * 2)]:  # 2 секунды
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    gif_frames.append(Image.fromarray(rgb))
+                if gif_frames:
+                    gif_frames[0].save(
+                        preview_path,
+                        save_all=True,
+                        append_images=gif_frames[1:],
+                        duration=int(1000 / fps),
+                        loop=0,
+                    )
+                    progress_cb(f'  🎞️ GIF-превью: {os.path.basename(preview_path)}')
+        except Exception as e:
+            progress_cb(f'  ⚠️ GIF-превью не создано: {e}')
 
         final_size = os.path.getsize(output_path) / (1024 * 1024)
         progress_cb(f'  ✅ Готово: {os.path.basename(output_path)} ({final_size:.1f} МБ)')
@@ -192,127 +217,3 @@ def process_one_folder(
             out.release()
         except Exception:
             pass
-
-
-def process_queue_videos(
-    bot_db,
-    *,
-    only_ids: Optional[List[int]] = None,
-    stop_flag: Optional[Callable[[], bool]] = None,
-    progress_cb: Optional[Callable[[Dict], None]] = None,
-    **kwargs,
-) -> Dict:
-    report = {'total': 0, 'ok': 0, 'failed': 0, 'skipped': 0, 'details': []}
-
-    if only_ids is not None:
-        ads = []
-        for ad_id in only_ids:
-            ad = bot_db.get_ad_by_id(ad_id)
-            if ad:
-                ads.append(ad)
-    else:
-        ads = bot_db.get_all_pending_ads()
-
-    report['total'] = len(ads)
-    if not ads:
-        return report
-
-    if progress_cb:
-        progress_cb({'total': report['total'], 'done': 0, 'ok': 0, 'failed': 0,
-                     'current': None, 'log': '▶️ Старт'})
-
-    for i, ad in enumerate(ads, 1):
-        if stop_flag and stop_flag():
-            report['details'].append({
-                'id': None, 'folder': '(прервано)',
-                'status': 'skip', 'reason': 'Остановлено пользователем'
-            })
-            break
-
-        ad_id = ad['id']
-        media_path = ad.get('media_path') or ''
-        folder_name = ad.get('folder_name') or os.path.basename(media_path) or f'#{ad_id}'
-
-        current = {'id': ad_id, 'folder': folder_name, 'index': i}
-        if progress_cb:
-            progress_cb({'total': report['total'], 'done': i - 1,
-                         'ok': report['ok'], 'failed': report['failed'],
-                         'current': current,
-                         'log': f'📁 [{i}/{report["total"]}] {folder_name}'})
-
-        if not media_path or not os.path.isdir(media_path):
-            report['failed'] += 1
-            report['details'].append({
-                'id': ad_id, 'folder': folder_name,
-                'status': 'error', 'reason': 'Папка не найдена'
-            })
-            continue
-
-        photos = _list_photos(media_path)
-        if not photos:
-            has_video = any(f.lower().endswith(('.mp4', '.mov', '.webm'))
-                            for f in os.listdir(media_path))
-            if has_video:
-                report['skipped'] += 1
-                report['details'].append({
-                    'id': ad_id, 'folder': folder_name,
-                    'status': 'skip', 'reason': 'Видео уже есть — пропуск'
-                })
-            else:
-                report['failed'] += 1
-                report['details'].append({
-                    'id': ad_id, 'folder': folder_name,
-                    'status': 'error', 'reason': 'Нет ни фото, ни видео'
-                })
-            continue
-
-        def _log(msg: str):
-            logger.info(msg)
-            if progress_cb:
-                progress_cb({'total': report['total'], 'done': i - 1,
-                             'ok': report['ok'], 'failed': report['failed'],
-                             'current': current, 'log': msg})
-
-        try:
-            ok, message = process_one_folder(
-                media_path,
-                duration=kwargs.get('duration', DEFAULT_DURATION),
-                fps=kwargs.get('fps', DEFAULT_FPS),
-                target_size=kwargs.get('target_size'),
-                output_name=kwargs.get('output_name', DEFAULT_OUTPUT_NAME),
-                delete_photos_after=kwargs.get('delete_photos_after', True),
-                progress_cb=_log,
-                **kwargs
-            )
-            if ok:
-                report['ok'] += 1
-                report['details'].append({
-                    'id': ad_id, 'folder': folder_name,
-                    'status': 'ok', 'reason': message
-                })
-            else:
-                report['failed'] += 1
-                report['details'].append({
-                    'id': ad_id, 'folder': folder_name,
-                    'status': 'error', 'reason': message
-                })
-        except Exception as e:
-            logger.exception(f'❌ Ошибка обработки {folder_name}: {e}')
-            report['failed'] += 1
-            report['details'].append({
-                'id': ad_id, 'folder': folder_name,
-                'status': 'error', 'reason': str(e)[:300]
-            })
-
-        if progress_cb:
-            progress_cb({'total': report['total'], 'done': i,
-                         'ok': report['ok'], 'failed': report['failed'],
-                         'current': current, 'log': '—'})
-
-    if progress_cb:
-        progress_cb({'total': report['total'], 'done': report['total'],
-                     'ok': report['ok'], 'failed': report['failed'],
-                     'current': None,
-                     'log': f'🏁 Готово. OK: {report["ok"]}, ошибок: {report["failed"]}, пропущено: {report["skipped"]}'})
-
-    return report
