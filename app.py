@@ -787,32 +787,34 @@ BASE_STYLE = """
                    text-decoration: none; cursor: pointer; font-weight: bold;
                    box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
     .photo-reset:hover { background: #6c757d; color: white; }
-    /* Кнопки перемещения фото — теперь внизу, не перекрывают остальные */
-    .photo-move-btn {
-        display: inline-block;
-        margin: 0 4px;
-        padding: 4px 8px;
-        background: #28a745;
+    /* Кнопки перемещения фото — по бокам от фото, крупные */
+    .photo-nav-wrap { display: flex; align-items: center; justify-content: center; margin: 8px 0; }
+    .photo-nav-btn {
+        font-size: 20px;
+        padding: 8px 14px;
+        background: #007bff;
         color: white;
-        border-radius: 4px;
-        font-size: 12px;
+        border-radius: 8px;
         text-decoration: none;
         cursor: pointer;
         font-weight: bold;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        min-width: 44px;
+        text-align: center;
     }
-    .photo-move-btn:hover { background: #218838; }
-    .photo-move-disabled {
-        display: inline-block;
-        margin: 0 4px;
-        padding: 4px 8px;
-        background: #ccc;
-        color: #666;
-        border-radius: 4px;
-        font-size: 12px;
+    .photo-nav-btn:hover { background: #0056b3; }
+    .photo-nav-disabled {
+        font-size: 20px;
+        padding: 8px 14px;
+        background: #e9ecef;
+        color: #adb5bd;
+        border-radius: 8px;
         font-weight: bold;
-        cursor: not-allowed;
+        min-width: 44px;
+        text-align: center;
     }
-    .photo-controls { margin-top: 5px; text-align: center; }
+    .photo-nav-center { margin: 0 10px; }
+    .photo-outer { display: inline-block; margin: 10px; vertical-align: top; }
     .file-drop { border: 2px dashed #007bff; border-radius: 8px; padding: 30px;
                  text-align: center; background: #f8f9fa; margin: 15px 0; cursor: pointer; }
     .file-drop:hover { background: #e9ecef; }
@@ -1887,26 +1889,26 @@ def admin_ad_detail(ad_id):
                 photos_html += f'<div class="photo-wrap"><video src="/admin/queue_photo/{ad_id}/{vf}" controls style="width:400px;height:auto;border-radius:6px;display:block"></video>{badge}</div>'
 
             for idx, pf in enumerate(photos):
-                # Кнопки перемещения — ОТДЕЛЬНЫЙ БЛОК под фото, не поверх
+                # Кнопки перемещения СЛЕВА и СПРАВА от фото
                 if idx > 0:
                     move_left_btn = (
                         f'<a href="/admin/queue_photo_move/{ad_id}/{pf}/left" '
-                        f'class="photo-move-btn" '
+                        f'class="photo-nav-btn" '
                         f'onclick="return confirm(\'Переместить это фото влево?\')" '
                         f'title="Переместить влево">⬅️</a>'
                     )
                 else:
-                    move_left_btn = '<span class="photo-move-disabled" title="Это первое фото">⬅️</span>'
+                    move_left_btn = '<span class="photo-nav-disabled" title="Это первое фото">⬅️</span>'
 
                 if idx < len(photos) - 1:
                     move_right_btn = (
                         f'<a href="/admin/queue_photo_move/{ad_id}/{pf}/right" '
-                        f'class="photo-move-btn" '
+                        f'class="photo-nav-btn" '
                         f'onclick="return confirm(\'Переместить это фото вправо?\')" '
                         f'title="Переместить вправо">➡️</a>'
                     )
                 else:
-                    move_right_btn = '<span class="photo-move-disabled" title="Это последнее фото">➡️</span>'
+                    move_right_btn = '<span class="photo-nav-disabled" title="Это последнее фото">➡️</span>'
 
                 rotate_btn = (
                     f'<a href="/admin/queue_photo_rotate/{ad_id}/{pf}" '
@@ -1929,13 +1931,19 @@ def admin_ad_detail(ad_id):
                     '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
                 )
 
+                # Оборачиваем фото в контейнер с кнопками слева и справа
                 photos_html += (
-                    f'<div class="photo-wrap">'
+                    f'<div class="photo-outer">'
+                    f'<div style="display:flex;align-items:center;justify-content:center;">'
+                    f'{move_left_btn}'
+                    f'<div class="photo-wrap" style="margin:0 10px;">'
                     f'<img src="/admin/queue_photo/{ad_id}/{pf}" '
                     f'style="width:300px;height:auto;border-radius:6px;cursor:pointer;display:block" '
                     f'onclick="window.open(this.src, \'_blank\')">'
                     f'{rotate_btn}{reset_btn}{delete_btn}'
-                    f'<div class="photo-controls">{move_left_btn} {move_right_btn}</div>'
+                    f'</div>'
+                    f'{move_right_btn}'
+                    f'</div>'
                     f'</div>'
                 )
         except Exception as e:
