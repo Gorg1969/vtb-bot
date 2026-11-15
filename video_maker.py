@@ -1,10 +1,10 @@
 # video_maker.py
 # ============================================================
 # Сборка видео из фото через OpenCV (cv2.VideoWriter).
-# - НЕ требует moviepy.
-# - НЕ требует ffmpeg.
-# - Фото заполняют весь кадр (crop-to-fill), без размытия.
-# - Пишет в MP4 (mp4v). Для предпросмотра создаёт GIF первых секунд.
+# - НЕ требует moviepy и ffmpeg.
+# - Размер видео определяется автоматически по первому фото.
+# - Ничего не обрезается, фото занимает весь кадр.
+# - Для предпросмотра создаёт GIF первых секунд.
 # ============================================================
 
 import os
@@ -23,7 +23,8 @@ MOVIEPY_VERSION = f"OpenCV {cv2.__version__}"
 
 DEFAULT_DURATION = 3.0
 DEFAULT_FPS = 25
-DEFAULT_TARGET_SIZE = (1080, 1920)
+# Оставляем None, чтобы размер определялся по фото
+DEFAULT_TARGET_SIZE = None
 DEFAULT_OUTPUT_NAME = 'video_ad.mp4'
 
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
@@ -42,21 +43,14 @@ def _list_photos(folder: str) -> List[str]:
     return photos
 
 
-def _resize_cover_cv2(img, target_size: Tuple[int, int]) -> np.ndarray:
+def _fit_to_canvas(img, target_size: Tuple[int, int]) -> np.ndarray:
     """
-    Масштабирует фото так, чтобы оно ЗАПОЛНИЛО весь кадр (crop-to-fill).
-    Лишнее обрезается по краям. Без размытого фона.
+    Масштабирует фото так, чтобы оно заполнило весь кадр БЕЗ обрезки.
+    Если пропорции не совпадают, фото немного растягивается.
     """
     tw, th = target_size
-    h, w = img.shape[:2]
-
-    scale = max(tw / w, th / h)
-    nw, nh = int(w * scale), int(h * scale)
-    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-
-    x_offset = (nw - tw) // 2
-    y_offset = (nh - th) // 2
-    return resized[y_offset:y_offset+th, x_offset:x_offset+tw]
+    # cv2.resize растянет картинку ровно до (tw, th)
+    return cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
 
 
 def _apply_kenburns_cv2(img, frames: int, zoom_factor: float = 1.08):
@@ -95,10 +89,22 @@ def process_one_folder(
         return False, 'Нет фото в папке'
 
     progress_cb(f'  📸 Фото: {len(photos)}')
-    target_size = target_size or DEFAULT_TARGET_SIZE
-    tw, th = target_size
-    tw = tw + (tw % 2)
-    th = th + (th % 2)
+    
+    # === ОПРЕДЕЛЯЕМ РАЗМЕР ПО ПЕРВОМУ ФОТО ===
+    if target_size is None:
+        first_img = cv2.imread(photos[0])
+        if first_img is None:
+            return False, 'Не удалось прочитать первое фото для определения размера'
+        h, w = first_img.shape[:2]
+        # Для mp4 ширина и высота должны быть кратны 2
+        tw = w + (w % 2)
+        th = h + (h % 2)
+        target_size = (tw, th)
+        progress_cb(f'  📐 Размер видео (по первому фото): {tw}x{th}')
+    else:
+        tw, th = target_size
+        tw = tw + (tw % 2)
+        th = th + (th % 2)
 
     if not output_name.lower().endswith('.mp4'):
         output_name += '.mp4'
@@ -122,7 +128,7 @@ def process_one_folder(
     try:
         progress_cb(f'  💾 Рендер {len(photos)} фото ({total_frames} кадров) → {os.path.basename(output_path)}')
         processed = 0
-        preview_frames = []  # первые 3 секунды для GIF-превью
+        preview_frames = []
 
         for i, path in enumerate(photos):
             img = cv2.imread(path)
@@ -130,21 +136,22 @@ def process_one_folder(
                 progress_cb(f'  ⚠️ Не прочитать: {os.path.basename(path)}')
                 continue
 
-            base_img = _resize_cover_cv2(img, (tw, th))
+            # Подгоняем под размер видео (растягиваем, чтобы не было обрезки)
+            base_img = _fit_to_canvas(img, (tw, th))
 
             # Zoom-in
             for frame in _apply_kenburns_cv2(base_img, frames_per_photo, zoom_factor=1.08):
                 out.write(frame)
                 processed += 1
-                if len(preview_frames) < fps * 3:  # первые 3 секунды
+                if len(preview_frames) < fps * 3:
                     small = cv2.resize(frame, (tw // 4, th // 4))
                     preview_frames.append(small)
 
-            # Плавный переход (fade) в конце фото (кроме последнего)
+            # Плавный переход
             if i < len(photos) - 1:
                 next_img = cv2.imread(photos[i + 1])
                 if next_img is not None:
-                    next_base = _resize_cover_cv2(next_img, (tw, th))
+                    next_base = _fit_to_canvas(next_img, (tw, th))
                     trans_frames = int(kwargs.get('transition', 0.5) * fps)
                     for j in range(trans_frames):
                         alpha = j / max(1, trans_frames - 1)
@@ -174,7 +181,7 @@ def process_one_folder(
         try:
             if preview_frames:
                 gif_frames = []
-                for frame in preview_frames[:int(fps * 2)]:  # 2 секунды
+                for frame in preview_frames[:int(fps * 2)]:
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     gif_frames.append(Image.fromarray(rgb))
                 if gif_frames:
