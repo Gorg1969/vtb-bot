@@ -787,23 +787,32 @@ BASE_STYLE = """
                    text-decoration: none; cursor: pointer; font-weight: bold;
                    box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
     .photo-reset:hover { background: #6c757d; color: white; }
-    /* Кнопки перемещения фото влево/вправо */
-    .photo-move-left { position: absolute; bottom: 8px; left: 8px;
-                       background: rgba(40,167,69,0.9); color: white;
-                       padding: 4px 8px; border-radius: 4px; font-size: 12px;
-                       text-decoration: none; cursor: pointer; font-weight: bold;
-                       box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
-    .photo-move-left:hover { background: #28a745; color: white; }
-    .photo-move-right { position: absolute; bottom: 8px; right: 8px;
-                        background: rgba(40,167,69,0.9); color: white;
-                        padding: 4px 8px; border-radius: 4px; font-size: 12px;
-                        text-decoration: none; cursor: pointer; font-weight: bold;
-                        box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
-    .photo-move-right:hover { background: #28a745; color: white; }
-    .photo-move-disabled { position: absolute; bottom: 8px;
-                           background: rgba(108,117,125,0.5); color: white;
-                           padding: 4px 8px; border-radius: 4px; font-size: 12px;
-                           font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
+    /* Кнопки перемещения фото — теперь внизу, не перекрывают остальные */
+    .photo-move-btn {
+        display: inline-block;
+        margin: 0 4px;
+        padding: 4px 8px;
+        background: #28a745;
+        color: white;
+        border-radius: 4px;
+        font-size: 12px;
+        text-decoration: none;
+        cursor: pointer;
+        font-weight: bold;
+    }
+    .photo-move-btn:hover { background: #218838; }
+    .photo-move-disabled {
+        display: inline-block;
+        margin: 0 4px;
+        padding: 4px 8px;
+        background: #ccc;
+        color: #666;
+        border-radius: 4px;
+        font-size: 12px;
+        font-weight: bold;
+        cursor: not-allowed;
+    }
+    .photo-controls { margin-top: 5px; text-align: center; }
     .file-drop { border: 2px dashed #007bff; border-radius: 8px; padding: 30px;
                  text-align: center; background: #f8f9fa; margin: 15px 0; cursor: pointer; }
     .file-drop:hover { background: #e9ecef; }
@@ -1877,29 +1886,27 @@ def admin_ad_detail(ad_id):
                 badge = f'<a href="/admin/queue_photo_delete/{ad_id}/{vf}" class="photo-del" onclick="return confirm(\'Удалить это видео?\')" title="Удалить видео">🗑️</a>' if can_delete else '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
                 photos_html += f'<div class="photo-wrap"><video src="/admin/queue_photo/{ad_id}/{vf}" controls style="width:400px;height:auto;border-radius:6px;display:block"></video>{badge}</div>'
 
-            # === ФОТО: добавляем кнопки перемещения влево/вправо ===
             for idx, pf in enumerate(photos):
-                # Влево (только если не первый)
+                # Кнопки перемещения — ОТДЕЛЬНЫЙ БЛОК под фото, не поверх
                 if idx > 0:
                     move_left_btn = (
                         f'<a href="/admin/queue_photo_move/{ad_id}/{pf}/left" '
-                        f'class="photo-move-left" '
+                        f'class="photo-move-btn" '
                         f'onclick="return confirm(\'Переместить это фото влево?\')" '
                         f'title="Переместить влево">⬅️</a>'
                     )
                 else:
-                    move_left_btn = '<span class="photo-move-disabled" style="left:8px;" title="Это первое фото">⬅️</span>'
+                    move_left_btn = '<span class="photo-move-disabled" title="Это первое фото">⬅️</span>'
 
-                # Вправо (только если не последнее)
                 if idx < len(photos) - 1:
                     move_right_btn = (
                         f'<a href="/admin/queue_photo_move/{ad_id}/{pf}/right" '
-                        f'class="photo-move-right" '
+                        f'class="photo-move-btn" '
                         f'onclick="return confirm(\'Переместить это фото вправо?\')" '
                         f'title="Переместить вправо">➡️</a>'
                     )
                 else:
-                    move_right_btn = '<span class="photo-move-disabled" style="right:8px;" title="Это последнее фото">➡️</span>'
+                    move_right_btn = '<span class="photo-move-disabled" title="Это последнее фото">➡️</span>'
 
                 rotate_btn = (
                     f'<a href="/admin/queue_photo_rotate/{ad_id}/{pf}" '
@@ -1921,13 +1928,14 @@ def admin_ad_detail(ad_id):
                     if can_delete else
                     '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
                 )
+
                 photos_html += (
                     f'<div class="photo-wrap">'
                     f'<img src="/admin/queue_photo/{ad_id}/{pf}" '
                     f'style="width:300px;height:auto;border-radius:6px;cursor:pointer;display:block" '
                     f'onclick="window.open(this.src, \'_blank\')">'
                     f'{rotate_btn}{reset_btn}{delete_btn}'
-                    f'{move_left_btn}{move_right_btn}'
+                    f'<div class="photo-controls">{move_left_btn} {move_right_btn}</div>'
                     f'</div>'
                 )
         except Exception as e:
@@ -2103,7 +2111,6 @@ def admin_queue_photo_move(ad_id, filename, direction):
         return 'Bad direction', 400
 
     safe_name = os.path.basename(filename)
-    # Получаем список фото, отсортированный (как в редакторе)
     try:
         files = sorted(os.listdir(media_path))
         photos = [f for f in files
@@ -2122,13 +2129,11 @@ def admin_queue_photo_move(ad_id, filename, direction):
     elif direction == 'right' and idx < len(photos) - 1:
         photos[idx + 1], photos[idx] = photos[idx], photos[idx + 1]
     else:
-        # Некуда двигать
         ref = request.referrer or ''
         if f'/admin/ad_detail/{ad_id}' in ref:
             return redirect(f'/admin/ad_detail/{ad_id}')
         return redirect('/admin/queue')
 
-    # Переименовываем в промежуточные имена, чтобы не было коллизий
     tmp_names = []
     for i, old_name in enumerate(photos):
         ext = os.path.splitext(old_name)[1].lower()
@@ -2141,7 +2146,6 @@ def admin_queue_photo_move(ad_id, filename, direction):
             logger.error(f'❌ Не переименовать {old_name} → {tmp_name}: {e}')
             return redirect('/admin/queue')
 
-    # Теперь присваиваем финальные имена photo_1, photo_2, ...
     for i, (tmp_name, old_name) in enumerate(tmp_names, 1):
         ext = os.path.splitext(old_name)[1].lower()
         final_name = f'photo_{i}{ext}'
@@ -2714,7 +2718,7 @@ def admin_diag():
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🩺 Диагностика</h1>
-        <p>Версия: <b>diag-v5</b> · {datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S МСК')}</p>
+        <p>Версия: <b>diag-v6</b> · {datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S МСК')}</p>
         <p>Python: <code>{sys.version.split()[0]}</code> · PID: <code>{os.getpid()}</code></p>
         <p>Потоков: <b>{threading.active_count()}</b></p>
         <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
