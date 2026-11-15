@@ -13,6 +13,7 @@ from typing import Optional, Dict, List, Tuple, Callable
 
 import cv2
 import numpy as np
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +169,7 @@ def process_one_folder(
             os.remove(output_path)
         os.rename(tmp_video_path, output_path)
 
-        # === Генерируем GIF-превью (первые 3 сек) ===
+        # === Генерируем GIF-превью (первые 2 сек) ===
         preview_path = os.path.join(folder_path, 'preview.gif')
         try:
             if preview_frames:
