@@ -787,6 +787,23 @@ BASE_STYLE = """
                    text-decoration: none; cursor: pointer; font-weight: bold;
                    box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
     .photo-reset:hover { background: #6c757d; color: white; }
+    /* Кнопки перемещения фото влево/вправо */
+    .photo-move-left { position: absolute; bottom: 8px; left: 8px;
+                       background: rgba(40,167,69,0.9); color: white;
+                       padding: 4px 8px; border-radius: 4px; font-size: 12px;
+                       text-decoration: none; cursor: pointer; font-weight: bold;
+                       box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
+    .photo-move-left:hover { background: #28a745; color: white; }
+    .photo-move-right { position: absolute; bottom: 8px; right: 8px;
+                        background: rgba(40,167,69,0.9); color: white;
+                        padding: 4px 8px; border-radius: 4px; font-size: 12px;
+                        text-decoration: none; cursor: pointer; font-weight: bold;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
+    .photo-move-right:hover { background: #28a745; color: white; }
+    .photo-move-disabled { position: absolute; bottom: 8px;
+                           background: rgba(108,117,125,0.5); color: white;
+                           padding: 4px 8px; border-radius: 4px; font-size: 12px;
+                           font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.3); line-height: 1; }
     .file-drop { border: 2px dashed #007bff; border-radius: 8px; padding: 30px;
                  text-align: center; background: #f8f9fa; margin: 15px 0; cursor: pointer; }
     .file-drop:hover { background: #e9ecef; }
@@ -1859,7 +1876,31 @@ def admin_ad_detail(ad_id):
             for vf in videos:
                 badge = f'<a href="/admin/queue_photo_delete/{ad_id}/{vf}" class="photo-del" onclick="return confirm(\'Удалить это видео?\')" title="Удалить видео">🗑️</a>' if can_delete else '<span class="photo-del-locked" title="Нельзя удалить последнее">🔒</span>'
                 photos_html += f'<div class="photo-wrap"><video src="/admin/queue_photo/{ad_id}/{vf}" controls style="width:400px;height:auto;border-radius:6px;display:block"></video>{badge}</div>'
-            for pf in photos:
+
+            # === ФОТО: добавляем кнопки перемещения влево/вправо ===
+            for idx, pf in enumerate(photos):
+                # Влево (только если не первый)
+                if idx > 0:
+                    move_left_btn = (
+                        f'<a href="/admin/queue_photo_move/{ad_id}/{pf}/left" '
+                        f'class="photo-move-left" '
+                        f'onclick="return confirm(\'Переместить это фото влево?\')" '
+                        f'title="Переместить влево">⬅️</a>'
+                    )
+                else:
+                    move_left_btn = '<span class="photo-move-disabled" style="left:8px;" title="Это первое фото">⬅️</span>'
+
+                # Вправо (только если не последнее)
+                if idx < len(photos) - 1:
+                    move_right_btn = (
+                        f'<a href="/admin/queue_photo_move/{ad_id}/{pf}/right" '
+                        f'class="photo-move-right" '
+                        f'onclick="return confirm(\'Переместить это фото вправо?\')" '
+                        f'title="Переместить вправо">➡️</a>'
+                    )
+                else:
+                    move_right_btn = '<span class="photo-move-disabled" style="right:8px;" title="Это последнее фото">➡️</span>'
+
                 rotate_btn = (
                     f'<a href="/admin/queue_photo_rotate/{ad_id}/{pf}" '
                     f'class="photo-rotate" '
@@ -1886,6 +1927,7 @@ def admin_ad_detail(ad_id):
                     f'style="width:300px;height:auto;border-radius:6px;cursor:pointer;display:block" '
                     f'onclick="window.open(this.src, \'_blank\')">'
                     f'{rotate_btn}{reset_btn}{delete_btn}'
+                    f'{move_left_btn}{move_right_btn}'
                     f'</div>'
                 )
         except Exception as e:
@@ -1916,7 +1958,10 @@ def admin_ad_detail(ad_id):
     </div>
     <div class="card">
         <h2>🎬 Медиа (фото: {photos_count}, видео: {videos_count})</h2>
-        <p class="hint">🔄 — повернуть на 45° · ↩️ — сбросить поворот · 🗑️ — удалить. {'Последнее удалить нельзя.' if not can_delete else ''}</p>
+        <p class="hint">
+            ⬅️ / ➡️ — переместить фото влево/вправо (порядок в видео)<br>
+            🔄 — повернуть на 45° · ↩️ — сбросить поворот · 🗑️ — удалить
+        </p>
         <div>{photos_html or '<p style="color:#999">Нет медиа</p>'}</div>
     </div>
     <div class="card">
@@ -1944,7 +1989,7 @@ def admin_ad_detail(ad_id):
 
 
 # ============================================================
-# ПОВОРОТ ФОТО
+# ПОВОРОТ И ПЕРЕМЕЩЕНИЕ ФОТО
 # ============================================================
 
 def _rotate_image_file(file_path: str, angle: float = 45.0) -> bool:
@@ -2036,6 +2081,77 @@ def admin_queue_photo_reset(ad_id, filename):
         logger.info(f'↩️ Сброшен поворот: {safe_name}')
     except Exception as e:
         logger.error(f'❌ Ошибка сброса {safe_name}: {e}')
+
+    ref = request.referrer or ''
+    if f'/admin/ad_detail/{ad_id}' in ref:
+        return redirect(f'/admin/ad_detail/{ad_id}')
+    return redirect('/admin/queue')
+
+
+@app.route('/admin/queue_photo_move/<int:ad_id>/<path:filename>/<direction>')
+@require_admin
+def admin_queue_photo_move(ad_id, filename, direction):
+    """Меняет порядок фото, переименовывая файлы (photo_1.jpg, photo_2.jpg, ...)."""
+    ad = bot_db.get_ad_by_id(ad_id)
+    if not ad:
+        return 'Not found', 404
+    media_path = ad.get('media_path')
+    if not media_path or not os.path.exists(media_path):
+        return 'Not found', 404
+
+    if direction not in ('left', 'right'):
+        return 'Bad direction', 400
+
+    safe_name = os.path.basename(filename)
+    # Получаем список фото, отсортированный (как в редакторе)
+    try:
+        files = sorted(os.listdir(media_path))
+        photos = [f for f in files
+                  if '.orig.' not in f and f.lower().endswith(
+                      ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'))]
+    except Exception as e:
+        logger.error(f'❌ Не прочитать папку: {e}')
+        return redirect('/admin/queue')
+
+    if safe_name not in photos:
+        return 'Photo not found in list', 404
+
+    idx = photos.index(safe_name)
+    if direction == 'left' and idx > 0:
+        photos[idx - 1], photos[idx] = photos[idx], photos[idx - 1]
+    elif direction == 'right' and idx < len(photos) - 1:
+        photos[idx + 1], photos[idx] = photos[idx], photos[idx + 1]
+    else:
+        # Некуда двигать
+        ref = request.referrer or ''
+        if f'/admin/ad_detail/{ad_id}' in ref:
+            return redirect(f'/admin/ad_detail/{ad_id}')
+        return redirect('/admin/queue')
+
+    # Переименовываем в промежуточные имена, чтобы не было коллизий
+    tmp_names = []
+    for i, old_name in enumerate(photos):
+        ext = os.path.splitext(old_name)[1].lower()
+        tmp_name = f'__tmp_move_{i}{ext}'
+        try:
+            os.rename(os.path.join(media_path, old_name),
+                      os.path.join(media_path, tmp_name))
+            tmp_names.append((tmp_name, old_name))
+        except Exception as e:
+            logger.error(f'❌ Не переименовать {old_name} → {tmp_name}: {e}')
+            return redirect('/admin/queue')
+
+    # Теперь присваиваем финальные имена photo_1, photo_2, ...
+    for i, (tmp_name, old_name) in enumerate(tmp_names, 1):
+        ext = os.path.splitext(old_name)[1].lower()
+        final_name = f'photo_{i}{ext}'
+        try:
+            os.rename(os.path.join(media_path, tmp_name),
+                      os.path.join(media_path, final_name))
+        except Exception as e:
+            logger.error(f'❌ Не переименовать {tmp_name} → {final_name}: {e}')
+
+    logger.info(f'↔️ Порядок фото изменён для ad_id={ad_id} ({direction})')
 
     ref = request.referrer or ''
     if f'/admin/ad_detail/{ad_id}' in ref:
@@ -2486,7 +2602,7 @@ def admin_make_videos_status():
         </div>
         <p class="hint">
             Скрипт проходит по всем pending-объявлениям, собирает видео из фото
-            (zoom-эффект + размытие фона) и удаляет исходные фото.
+            (zoom-эффект, фото на весь кадр) и удаляет исходные фото.
         </p>
     </div>
     {report_html}
@@ -2598,7 +2714,7 @@ def admin_diag():
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🩺 Диагностика</h1>
-        <p>Версия: <b>diag-v4</b> · {datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S МСК')}</p>
+        <p>Версия: <b>diag-v5</b> · {datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S МСК')}</p>
         <p>Python: <code>{sys.version.split()[0]}</code> · PID: <code>{os.getpid()}</code></p>
         <p>Потоков: <b>{threading.active_count()}</b></p>
         <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
