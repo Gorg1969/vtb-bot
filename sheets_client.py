@@ -1,6 +1,7 @@
 # sheets_client.py
 # ============================================================
 # Клиент Google Apps Script (для дедупа)
+# Дедуп ТОЛЬКО по наличию URL в таблице (без учёта даты).
 # С retry и обходом CDN-редиректа (404 от script.googleusercontent.com)
 # ============================================================
 
@@ -21,6 +22,14 @@ class SheetsClient:
         self._cache_loaded = False
 
     def get_all_urls(self, use_cache: bool = True) -> Set[str]:
+        """
+        Возвращает множество нормализованных URL из Google Sheets.
+        Дедуп работает ТОЛЬКО по наличию URL — дата НЕ учитывается.
+
+        Поддерживает два формата ответа скрипта:
+          - новый: {'urls_flat': [...]} — готовый плоский список;
+          - старый/универсальный: {'urls': [{source_url, max_url, ...}, ...]}.
+        """
         if use_cache and self._cache_loaded:
             return self._cache
 
@@ -70,12 +79,38 @@ class SheetsClient:
                     logger.error(f'❌ Ошибка Sheets: {data}')
                     return set()
 
-                urls = data.get('urls', [])
-                self._cache = {self._normalize(u) for u in urls if u}
+                # === Извлекаем URL: приоритет urls_flat, иначе разбираем urls ===
+                collected: Set[str] = set()
+
+                flat = data.get('urls_flat')
+                if isinstance(flat, list) and flat:
+                    for u in flat:
+                        if u:
+                            collected.add(self._normalize(u))
+
+                # fallback / дополнение: разбираем объекты urls
+                records = data.get('urls')
+                if isinstance(records, list):
+                    for item in records:
+                        if isinstance(item, dict):
+                            src = item.get('source_url')
+                            mx = item.get('max_url')
+                            if src:
+                                collected.add(self._normalize(src))
+                            if mx:
+                                collected.add(self._normalize(mx))
+                        elif isinstance(item, str):
+                            # старый формат: плоский список строк
+                            collected.add(self._normalize(item))
+
+                collected.discard('')
+                self._cache = collected
                 self._cache_loaded = True
+
                 logger.info(
-                    f'✅ Загружено {len(urls)} ссылок '
-                    f'из {len(data.get("sheets", []))} листов'
+                    f'✅ Загружено {len(collected)} уникальных URL '
+                    f'из {len(data.get("sheets", []))} листов '
+                    f'(дедуп по наличию URL, без учёта даты)'
                 )
                 return self._cache
 
@@ -159,7 +194,7 @@ class SheetsClient:
     def _normalize(url: str) -> str:
         if not url:
             return ''
-        n = url.strip()
+        n = str(url).strip()
         n = ' '.join(n.split())
         n = n.lower().rstrip('/')
         n = n.replace('https://www.', 'https://').replace('http://www.', 'http://')
