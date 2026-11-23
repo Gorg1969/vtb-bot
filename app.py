@@ -829,8 +829,6 @@ BASE_STYLE = """
                           font-size: 13px; font-weight: bold; line-height: 24px; }
 </style>
 """
-
-
 # ============================================================
 # Главная
 # ============================================================
@@ -2714,161 +2712,30 @@ def admin_diag():
     admin_render_error = None
     try:
         with app.test_request_context('/admin'):
-            _ = admin_page.__wrapped__() if hasattr(admin_page, '__wrapped__') else admin_page()
-        add(True, "admin_page() рендерится без ошибок")
+            _ = admin_page.__wrapped__()
+        add(True, "admin_page(): рендерится без ошибок")
     except Exception as e:
         admin_render_error = traceback.format_exc()
-        add(False, f"admin_page() УПАЛ: {type(e).__name__}: {e}")
+        add(False, f"admin_page(): {e}")
 
-    queue_render_error = None
-    try:
-        with app.test_request_context('/admin/queue'):
-            _ = admin_queue.__wrapped__() if hasattr(admin_queue, '__wrapped__') else admin_queue()
-        add(True, "admin_queue() рендерится без ошибок")
-    except Exception as e:
-        queue_render_error = traceback.format_exc()
-        add(False, f"admin_queue() УПАЛ: {type(e).__name__}: {e}")
+    if admin_render_error:
+        lines.append("\n--- Traceback ---\n" + admin_render_error)
 
-    video_status_error = None
-    try:
-        with app.test_request_context('/admin/make_videos_status'):
-            _ = admin_make_videos_status.__wrapped__() if hasattr(admin_make_videos_status, '__wrapped__') else admin_make_videos_status()
-        add(True, "admin_make_videos_status() рендерится без ошибок")
-    except Exception as e:
-        video_status_error = traceback.format_exc()
-        add(False, f"admin_make_videos_status() УПАЛ: {type(e).__name__}: {e}")
-
-    lines_html = "<br>".join(lines)
-
-    errors_html = ""
-    for name, tb in [('admin_page', admin_render_error),
-                     ('admin_queue', queue_render_error),
-                     ('admin_make_videos_status', video_status_error)]:
-        if tb:
-            errors_html += f"""
-            <div class="card">
-                <h2>❌ Traceback: {name}</h2>
-                <pre class="log">{tb}</pre>
-            </div>
-            """
-
+    body = "\n".join(lines)
     return BASE_STYLE + f"""
     <div class="card">
         <h1>🩺 Диагностика</h1>
-        <p>Версия: <b>diag-v7</b> · {datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S МСК')}</p>
-        <p>Python: <code>{sys.version.split()[0]}</code> · PID: <code>{os.getpid()}</code></p>
-        <p>Потоков: <b>{threading.active_count()}</b></p>
-        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
-        <div style="font-family:monospace;font-size:13px;line-height:1.8">{lines_html}</div>
-        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
-        <a href="/admin" class="btn">← В админку</a>
-        <a href="/admin/diag" class="btn btn-gray">🔄 Обновить</a>
-        <a href="/health" class="btn">/health</a>
+        <pre class="log">{body}</pre>
+        <a href="/admin" class="btn btn-gray">← В админку</a>
+        <a href="/admin/diag" class="btn">🔄 Обновить</a>
     </div>
-    {errors_html}
     """
-
-
-# ============================================================
-# Webhook MAX
-# ============================================================
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    try:
-        data = request.get_json()
-        logger.info(f'📩 WEBHOOK: {data}')
-        if not data:
-            return jsonify({"ok": True}), 200
-        if data.get('update_type') == 'message_created':
-            message = data.get('message', {})
-            sender = message.get('sender', {})
-            body = message.get('body', {})
-            user_id = sender.get('user_id')
-            text = (body.get('text') or '').strip()
-            logger.info(f'📨 user_id={user_id}, text={text[:100]}')
-            if user_id and not is_allowed_user(user_id):
-                logger.warning(f'⛔ Игнор user_id={user_id}')
-                return jsonify({"ok": True}), 200
-            if user_id and text == '/start':
-                api.send_message(user_id,
-                    "🏠 **VTB Bot**\n\n"
-                    f"🌐 **Админка:**\n{PUBLIC_URL}/admin\n\n"
-                    f"📋 **Очередь:**\n{PUBLIC_URL}/admin/queue\n\n"
-                    f"🎬 **Создание видео:**\n{PUBLIC_URL}/admin/make_videos_status\n\n"
-                    f"📥 **Импорт папок:**\n{PUBLIC_URL}/admin/import_folder\n\n"
-                    f"📅 **Опубликовано:**\n{PUBLIC_URL}/admin/today\n\n"
-                    f"⚙️ **Настройки:**\n{PUBLIC_URL}/admin/settings\n\n"
-                    f"🚀 **Статус парсера:**\n{PUBLIC_URL}/admin/parser_status\n\n"
-                    "🔒 Пароль спросит браузер.")
-                return jsonify({"ok": True}), 200
-            if user_id and text == '/status':
-                stats = bot_db.count_by_status()
-                ap_status = get_autopublish_status()
-                parser_running = parser_is_running()
-                video_running = video_maker_is_running()
-                api.send_message(user_id,
-                    f"📊 **Статус:**\n"
-                    f"⏳ В очереди: {stats.get('pending', 0)}\n"
-                    f"✅ Опубликовано: {stats.get('published', 0)}\n"
-                    f"❌ Ошибок: {stats.get('failed', 0)}\n\n"
-                    f"🕒 Автопубликация: {ap_status['status_message']}\n"
-                    f"📅 Сегодня: {ap_status['today_count']}/{ap_status['daily_limit']}\n"
-                    f"🚀 Парсер: {'🟢 РАБОТАЕТ' if parser_running else '🔴 ОСТАНОВЛЕН'}\n"
-                    f"🎬 Видео-сборка: {'🟢 РАБОТАЕТ' if video_running else '🔴 НЕ ЗАПУЩЕНО'}")
-                return jsonify({"ok": True}), 200
-            if user_id and text == '/myid':
-                api.send_message(user_id, f"Твой user_id: `{user_id}`")
-                return jsonify({"ok": True}), 200
-            if user_id and text == '/autopublish_on':
-                start_auto_publish()
-                api.send_message(user_id, "✅ Автопубликация включена")
-                return jsonify({"ok": True}), 200
-            if user_id and text == '/autopublish_off':
-                stop_auto_publish()
-                api.send_message(user_id, "🛑 Автопубликация выключена")
-                return jsonify({"ok": True}), 200
-            if user_id and text == '/stop_parser':
-                ok, message = stop_parser()
-                api.send_message(user_id, f"{'⏹' if ok else 'ℹ️'} {message}")
-                return jsonify({"ok": True}), 200
-            if user_id and text == '/make_videos':
-                if not VIDEO_MAKER_AVAILABLE:
-                    api.send_message(user_id, f"❌ Видео недоступно: {MOVIEPY_IMPORT_ERROR}")
-                    return jsonify({"ok": True}), 200
-                if video_maker_is_running():
-                    api.send_message(user_id, "ℹ️ Сборка видео уже идёт")
-                    return jsonify({"ok": True}), 200
-                start_video_maker()
-                api.send_message(user_id, "🎬 Запущена сборка видео из фото очереди")
-                return jsonify({"ok": True}), 200
-        return jsonify({"ok": True}), 200
-    except Exception as e:
-        logger.exception(f'❌ webhook: {e}')
-        return jsonify({"ok": False}), 500
 
 
 # ============================================================
 # Запуск
 # ============================================================
 
-def init_autopublish():
-    enabled = bot_db.get_setting('autopublish_enabled', '0')
-    if enabled == '1':
-        logger.info('🔁 Автопубликация была включена — запускаем поток')
-        start_auto_publish()
-    else:
-        logger.info('ℹ️ Автопубликация выключена')
-
-
 if __name__ == '__main__':
-    logger.info(f'🚀 Запуск vtb-bot на порту {PORT}')
-    logger.info(f'   TOKEN: {"✅" if TOKEN else "❌"}')
-    logger.info(f'   SHEETS_URL: {"✅" if SHEETS_URL else "❌"}')
-    logger.info(f'   ADMIN_USER: {ADMIN_USER}')
-    logger.info(f'   ADMIN_PASS: {"✅" if ADMIN_PASS else "❌"}')
-    logger.info(f'   ADMIN_IDS: {ALLOWED_ADMIN_IDS if ALLOWED_ADMIN_IDS else "❌"}')
-    logger.info(f'   IMPORT_FOLDER: {"✅" if IMPORT_FOLDER_AVAILABLE else "❌"}')
-    logger.info(f'   VIDEO_MAKER (OpenCV): {"✅" if VIDEO_MAKER_AVAILABLE else "❌"}')
-    init_autopublish()
-    app.run(host='0.0.0.0', port=PORT, threaded=True)
+    logger.info(f'🚀 Запуск Flask на порту {PORT}')
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
